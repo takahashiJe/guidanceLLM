@@ -1,0 +1,79 @@
+#docker-compose.yml
+
+version: '3.9'
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend/streamlit_app:/app
+    # depends_on:
+    #   - api_gateway
+
+  api_gateway:
+    build:
+      context: .
+      dockerfile: ./backend/api_gateway/Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - rabbitmq
+      - redis
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - REDIS_HOST=redis
+
+  worker:
+    build:
+      context: .
+      dockerfile: ./backend/worker/Dockerfile
+    deploy:
+      #replicas: 4
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RABBITMQ_HOST=rabbitmq
+      - REDIS_HOST=redis
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      - ollama
+      - rabbitmq
+      - redis
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./backend/worker/llm_models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  # Celeryの結果を保存するためのRedis ★★★
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  ollama_data:

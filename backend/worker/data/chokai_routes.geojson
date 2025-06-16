@@ -1,0 +1,101 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "from": "矢島口登山口",
+        "to": "祓川小屋",
+        "difficulty": "初級",
+        "duration_min": 40,
+        "child_friendly": true,
+        "route_name": "矢島口ルート",
+        "segment_name": "登山口〜祓川小屋"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[139.9985, 39.0501], [140.0020, 39.0530]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "from": "祓川小屋",
+        "to": "御田ヶ原",
+        "difficulty": "初級",
+        "duration_min": 50,
+        "child_friendly": true,
+        "route_name": "矢島口ルート",
+        "segment_name": "祓川小屋〜御田ヶ原"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[140.0020, 39.0530], [140.0050, 39.0570]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "from": "御田ヶ原",
+        "to": "七高山",
+        "difficulty": "中級",
+        "duration_min": 70,
+        "child_friendly": false,
+        "route_name": "矢島口ルート",
+        "segment_name": "御田ヶ原〜七高山"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[140.0050, 39.0570], [140.0080, 39.0590]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "from": "七高山",
+        "to": "山頂",
+        "difficulty": "中級",
+        "duration_min": 30,
+        "child_friendly": false,
+        "route_name": "矢島口ルート",
+        "segment_name": "七高山〜山頂"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[140.0080, 39.0590], [140.0100, 39.0615]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "from": "鉾立登山口",
+        "to": "河原宿",
+        "difficulty": "初級",
+        "duration_min": 60,
+        "child_friendly": true,
+        "route_name": "鉾立ルート",
+        "segment_name": "鉾立登山口〜河原宿"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[139.9600, 39.0850], [139.9720, 39.0780]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "from": "河原宿",
+        "to": "七高山",
+        "difficulty": "中級",
+        "duration_min": 80,
+        "child_friendly": false,
+        "route_name": "鉾立ルート",
+        "segment_name": "河原宿〜七高山"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[139.9720, 39.0780], [140.0080, 39.0590]]
+      }
+    }
+  ]
+}
