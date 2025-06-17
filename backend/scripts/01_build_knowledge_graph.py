@@ -1,5 +1,5 @@
 # /backend/scripts/01_build_knowledge_graph.py
-# Graph RAG のための知識グラフ構築スクリプト
+# Graph RAG のための知識グラフ構築スクリプトです
 
 import os
 import json
