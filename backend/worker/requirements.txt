@@ -27,3 +27,6 @@ networkx
 pika
 celery
 redis
+
+# ベクトルDB
+chromadb

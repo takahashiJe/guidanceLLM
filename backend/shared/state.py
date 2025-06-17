@@ -22,3 +22,10 @@ class GraphState(TypedDict):
     tool_outputs: Optional[List[dict]]
     final_answer: Optional[str]
     action_payload: Optional[ActionPayload]
+
+    # クエリ拡張用フィールド
+    original_query: Optional[str] # ユーザーの元の質問
+    expanded_queries: Optional[List[str]] # LLMによって拡張された質問のリスト
+    
+    # ツールからの出力だけでなく、RAGの結果もここに格納
+    context_documents: Optional[List[dict]] # RAGで取得したドキュメント

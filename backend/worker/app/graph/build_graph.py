@@ -1,8 +1,10 @@
 # /backend/app/graph/build_graph.py
 
 from langgraph.graph import StateGraph, END
-from ..shared/state import GraphState
+from shared.state import GraphState
 from .nodes import (
+    query_expansion_node,
+    multi_rag_retrieval_node,
     agent_node,
     tool_executor_node,
     classify_intent_node,
@@ -22,6 +24,8 @@ def build_graph() -> StateGraph:
 
     # --- 1. ノードをすべて登録 ---
     workflow.add_node("classify_intent", classify_intent_node)
+    workflow.add_node("query_expansion", query_expansion_node)
+    workflow.add_node("multi_rag_retrieval", multi_rag_retrieval_node)
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", tool_executor_node)
     workflow.add_node("propose_route", propose_route_node)
@@ -46,7 +50,8 @@ def build_graph() -> StateGraph:
         if intent == "greeting":
             return "simple_response"
         elif intent in ["general_question", "route_request", "plan_visit_request"]:
-            return "agent"
+            # 質問系の意図ならクエリ拡張へ
+            return "query_expansion"
         else:
             return END
 
@@ -55,11 +60,15 @@ def build_graph() -> StateGraph:
         route_after_intent_classification,
         {
             "classify_confirmation": "classify_confirmation",
-            "agent": "agent",
+            "query_expansion": "query_expansion",
             "simple_response": "simple_response",
             END: END
         }
     )
+
+    # クエリ拡張 -> RAG検索 -> エージェント という直列のフロー
+    workflow.add_edge("query_expansion", "multi_rag_retrieval")
+    workflow.add_edge("multi_rag_retrieval", "agent")
 
     # agent -> (tools or END)
     def route_after_agent(state: GraphState):

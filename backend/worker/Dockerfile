@@ -21,8 +21,8 @@ COPY ./backend/shared /app/shared
 # worker自身のコアロジックを含むコードをコピーします。
 COPY ./backend/worker /app/worker
 
-# 7. コンテナ起動時に実行するコマンド
-# ★★★ ここがapi_gatewayとの決定的な違い ★★★
-# uvicorn(Webサーバー)ではなく、Celeryのワーカープロセスを起動します。
-# これにより、コンテナはRabbitMQを監視し、タスクを受け取って処理を開始します。
-CMD ["celery", "-A", "shared.celery_app", "worker", "--loglevel=info"]
+COPY ./backend/worker/entrypoint.sh /entrypoint.sh
+RUN chmod 777 /entrypoint.sh
+
+# CMDではなくENTRYPOINTで起動スクリプトを指定
+ENTRYPOINT ["/entrypoint.sh"]
