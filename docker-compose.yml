@@ -1,7 +1,5 @@
 #docker-compose.yml
 
-version: '3.9'
-
 services:
   frontend:
     build:
@@ -10,8 +8,8 @@ services:
       - "8501:8501"
     volumes:
       - ./frontend/streamlit_app:/app
-    # depends_on:
-    #   - api_gateway
+    depends_on:
+      - api_gateway
 
   api_gateway:
     build:
@@ -25,27 +23,34 @@ services:
     environment:
       - RABBITMQ_HOST=rabbitmq
       - REDIS_HOST=redis
+    volumes:
+      # api_gatewayも開発中はコードを同期させる
+      - ./backend/api_gateway/app:/code/app
+      - ./backend/shared:/code/shared
 
   worker:
     build:
       context: .
       dockerfile: ./backend/worker/Dockerfile
     deploy:
-      #replicas: 4
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
+      replicas: 1 # 開発中は1台で十分
+    env_file:
+      - .env
     runtime: nvidia
+    working_dir: /code
     environment:
+      - PYTHONPATH=/code
       - NVIDIA_VISIBLE_DEVICES=all
       - RABBITMQ_HOST=rabbitmq
       - REDIS_HOST=redis
       - OLLAMA_HOST=http://ollama:11434
-    depends_on:
-      - ollama
-      - rabbitmq
-      - redis
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on: [ollama, rabbitmq, redis, postgres]
+    volumes:
+      - ./backend/worker/app:/code/app
+      - ./backend/shared:/code/shared
+      - ./backend/worker/data:/code/app/data
+      - ./backend/scripts:/code/scripts
 
   ollama:
     image: ollama/ollama:latest
@@ -54,26 +59,28 @@ services:
     volumes:
       - ollama_data:/root/.ollama
       - ./backend/worker/llm_models:/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
+    deploy: { resources: { reservations: { devices: [{capabilities: [gpu]}] } } }
     runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
 
   rabbitmq:
     image: rabbitmq:3-management
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+    ports: ["5672:5672", "15672:15672"]
 
-  # Celeryの結果を保存するためのRedis ★★★
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    ports: ["6379:6379"]
+
+  postgres:
+    image: postgres:15-alpine
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports: ["5432:5432"]
+    volumes: [postgres_data:/var/lib/postgresql/data]
 
 volumes:
   ollama_data:
+  postgres_data:

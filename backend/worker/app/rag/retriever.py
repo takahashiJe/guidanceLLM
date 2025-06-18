@@ -14,7 +14,7 @@ from langchain.schema import Document
 # ベクトル化（Embedding）に使用するモデル。nodes.pyと同じモデルを推奨。
 # 環境変数からOLLAMAのホスト名を取得
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
-EMBEDDINGS_MODEL = "gemma3:27b"
+EMBEDDINGS_MODEL = "nomic-embed-text"
 
 # ベクトルDB（Chroma）の永続化先ディレクトリ。worker/data内に作成するのが管理上望ましい。
 VECTORSTORE_BASE_PATH = "./data/vectorstore"

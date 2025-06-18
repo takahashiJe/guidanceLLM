@@ -2,10 +2,9 @@
 
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_ollama import ChatOllama
 from shared.state import GraphState
-from .tools import available_tools
-from ..rag import retriever # RAGモジュールをインポート
+from app.graph.tools import llm, available_tools
+from app.rag import retriever
 
 # --- Agentのセットアップ ---
 # この部分はアプリケーション起動時に一度だけ実行されるのが望ましい
@@ -25,15 +24,6 @@ prompt = ChatPromptTemplate.from_messages([
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
-llm = ChatOllama(
-        # model="qwen2.5:32b-instruct",
-        model="gemma3:27b-it-qat",
-        # model="gemma3:27b",
-        # model="llama3:70b",
-        # model="elyza-jp-chat",
-        base_url=os.getenv("OLLAMA_HOST", "http://ollama:11434"),
-        temperature=0.7
-    )
 agent = create_tool_calling_agent(llm, available_tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=available_tools, verbose=True)
 

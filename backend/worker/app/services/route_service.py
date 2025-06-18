@@ -7,7 +7,7 @@ from shapely.geometry import Point, LineString
 from typing import Dict, Any, Optional, Tuple, List
 
 # --- 設定項目 ---
-ROUTE_DATA_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'chokai_routes.geojson')
+ROUTE_DATA_PATH = "/code/app/data/chokai_routes.geojson"
 OFF_ROUTE_THRESHOLD_METERS = 30
 CHECKPOINT_PROXIMITY_METERS = 15
 AVERAGE_WALKING_SPEED_KMH = 3.0

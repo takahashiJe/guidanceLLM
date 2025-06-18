@@ -1,4 +1,5 @@
 # /backend/worker/app/tasks.py
+import sys
 import os
 from langchain_core.messages import HumanMessage
 
@@ -8,43 +9,38 @@ from shared.schemas import ChatRequest, UpdateLocationRequest, ChatResponse, Upd
 from shared.state import GraphState
 
 # ワーカー内部のモジュールをインポート
-from .graph.build_graph import compiled_graph
-from .services import memory_service, route_service # DBアクセスやビジネスロジックを担当するサービス
-from .db.session import SessionLocal # DBセッションを直接利用する場合
+from app.graph.build_graph import compiled_graph
+from app.services import memory_service, route_service # DBアクセスやビジネスロジックを担当するサービス
+from app.db.session import SessionLocal # DBセッションを直接利用する場合
 
-@celery_app.task(name="process_chat_message")
+@celery_app.task
 def process_chat_message(request_data: dict) -> dict:
     """
     ユーザーからのチャットメッセージを処理するメインタスク。
     LangGraphを実行し、応答を生します。
     """
     try:
-        # 1. リクエストデータをPydanticモデルに変換
-        request = ChatRequest(**request_data)
-
-        # 2. 短期記憶を取得
-        short_term_memory = memory_service.get_short_term_history(request.user_id)
-        
-        # 2.2 長期記憶を取得（現在のメッセージに関連する過去の会話）
+        request = ChatRequest(**request_data) # リクエストデータをPydanticモデルに変換
+        short_term_memory = memory_service.get_short_term_history(request.user_id) # 短期記憶を取得
         long_term_memory = memory_service.get_long_term_memory(
             user_id=request.user_id, 
             query=request.message
-        )
+        ) # 長期記憶を取得
 
-        # 3. LangGraphの初期状態を作成
+        # LangGraphの初期状態を作成
         initial_state: GraphState = {
             "messages": long_term_memory + short_term_memory + [HumanMessage(content=request.message)],
             "task_status": request.task_status,
-            "language": request.language, # スキーマにlanguageを追加する必要があります
+            "language": request.language,
             "user_id": request.user_id,
-            # その他のキーはNoneで初期化
+            # Noneで初期化
             "intent": None,
             "tool_outputs": None,
             "final_answer": None,
             "action_payload": None,
         }
 
-        # 4. LangGraphを実行
+        # LangGraphを実行
         final_state = compiled_graph.invoke(initial_state)
 
         # 5. 最終的な応答を構築

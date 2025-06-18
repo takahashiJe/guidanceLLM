@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from api_gateway.chat_router import router
+from app import chat_router
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(
@@ -10,7 +10,7 @@ app = FastAPI(
 
 # /api/v1 というプレフィックスでチャットルーターを登録します。
 # これにより、このルーター内のエンドポイントはすべて /api/v1/chat のようになります。
-app.include_router(router, prefix="/api/v1", tags=["Task Endpoints"])
+app.include_router(chat_router.router, prefix="/api/v1", tags=["Task Endpoints"])
 
 @app.get("/", tags=["Root"])
 async def read_root():

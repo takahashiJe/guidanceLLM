@@ -1,14 +1,26 @@
 # /backend/app/graph/tools.py
 
+import os
 import json
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from datetime import date
 from typing import Dict, Any
+from langchain_ollama import ChatOllama
 
 # --- 外部のサービスやRAGモジュールからロジックをインポート ---
-from ..services import route_service, planning_service # (planning_serviceを新設)
-from ..rag import retriever
+from app.services import route_service, planning_service
+from app.rag import retriever
+
+llm = ChatOllama(
+        # model="qwen2.5:32b-instruct",
+        model="gemma3:27b-it-qat",
+        # model="gemma3:27b",
+        # model="llama3:70b",
+        # model="elyza-jp-chat",
+        base_url=os.getenv("OLLAMA_HOST", "http://ollama:11434"),
+        temperature=0.7
+        )
 
 # --- 1. 地名正規化ツール ---
 class NormalizeNamesInput(BaseModel):
@@ -22,7 +34,6 @@ def normalize_location_names(input: NormalizeNamesInput) -> Dict[str, str]:
     known_locations = route_service.get_known_locations()
     
     # このツール内でLLMを呼び出し、正規化を行う
-    from .nodes import llm # nodes.pyからLLMインスタンスをインポート
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import JsonOutputParser
 

@@ -5,8 +5,7 @@ from datetime import date, timedelta
 from typing import Dict, Any
 
 from sqlalchemy.orm import Session
-from ..db.session import SessionLocal
-from ..db.models import VisitPlan
+from app.db import session, models
 
 # 混雑と判断する予約数の閾値
 CONGESTION_THRESHOLD = 10
@@ -16,20 +15,20 @@ def process_visit_plan(user_id: str, spot_name: str, visit_date: date) -> Dict[s
     指定されたスポットと日付の混雑状況を確認し、計画を登録した上で、
     状況に応じたメッセージを返します。
     """
-    db: Session = SessionLocal()
+    db: Session = session.SessionLocal()
     try:
         # 1. 指定されたスポットと日付の既存の計画数をカウント
         existing_plans_count = (
-            db.query(VisitPlan)
+            db.query(models.VisitPlan)
             .filter(
-                VisitPlan.spot_name == spot_name,
-                VisitPlan.visit_date == visit_date
+                models.VisitPlan.spot_name == spot_name,
+                models.VisitPlan.visit_date == visit_date
             )
             .count()
         )
 
         # ★★★ 変更点: 混雑状況に関わらず、まず計画をDBに登録します ★★★
-        new_plan = VisitPlan(
+        new_plan = models.VisitPlan(
             user_id=user_id,
             spot_name=spot_name,
             visit_date=visit_date

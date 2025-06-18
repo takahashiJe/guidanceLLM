@@ -15,7 +15,7 @@ celery_app = Celery(
     'tasks', # アプリケーション名
     broker=broker_url,
     backend=result_backend_url,
-    include=['worker.app.tasks'] # 読み込むタスクモジュールを指定
+    include=['app.tasks'] # 読み込むタスクモジュールを指定
 )
 
 celery_app.conf.update(

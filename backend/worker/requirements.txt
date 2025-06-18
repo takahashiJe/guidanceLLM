@@ -30,3 +30,5 @@ redis
 
 # ベクトルDB
 chromadb
+
+psycopg2-binary

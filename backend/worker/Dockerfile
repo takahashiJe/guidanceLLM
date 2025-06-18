@@ -1,28 +1,32 @@
+#backend/worker/Dockerfile
+
 FROM python:3.12-slim
 
-# 2. 作業ディレクトリの設定
-WORKDIR /app
+RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
 
-# 3. PYTHONPATHの設定
-# /appディレクトリをPythonのモジュール検索パスに追加します。
-ENV PYTHONPATH "${PYTHONPATH}:/app"
+# 作業ディレクトリの設定
+WORKDIR /code
 
-# 4. 依存関係ファイルのコピーとインストール
-# workerは重いライブラリを含むため、このステップには時間がかかります。
+# /codeをPythonの探索パスに追加
+ENV PYTHONPATH "${PYTHONPATH}:/code"
+
+# 依存関係ファイルのコピーとインストール (キャッシュ効率化)
 COPY ./backend/worker/requirements.txt .
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
-# 5. 共有コードのコピー
-# workerもapi_gatewayと同様に、共通のsharedディレクトリをコピーします。
-COPY ./backend/shared /app/shared
+# --- 開発中は以下のCOPY命令はvolumesで上書きされる ---
+# --- 本番イメージ作成時には、これらのコードがイメージに焼き付けられる ---
 
-# 6. アプリケーションコードのコピー
-# worker自身のコアロジックを含むコードをコピーします。
-COPY ./backend/worker /app/worker
+# # 共有コードのコピー
+# COPY ./backend/worker/app /code/app
+# COPY ./backend/shared /code/shared
 
-COPY ./backend/worker/entrypoint.sh /entrypoint.sh
-RUN chmod 777 /entrypoint.sh
+# # データとモデルのコピー
+# COPY ./backend/worker/data /code/app/data
+# COPY ./backend/scripts /code/scripts
 
-# CMDではなくENTRYPOINTで起動スクリプトを指定
-ENTRYPOINT ["/entrypoint.sh"]
+# 起動スクリプトのコピーと権限付与と実行
+COPY ./backend/worker/app/entrypoint.sh /code/entrypoint.sh
+RUN chmod +x /code/entrypoint.sh
+ENTRYPOINT ["/code/entrypoint.sh"]

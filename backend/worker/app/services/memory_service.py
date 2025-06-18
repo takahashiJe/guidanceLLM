@@ -1,5 +1,6 @@
 # /backend/worker/app/services/memory_service.py
 
+import os
 from typing import List, Tuple, Optional, Dict
 from sqlalchemy.orm import Session
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, AIMessageChunk
@@ -8,8 +9,8 @@ from langchain_community.embeddings import OllamaEmbeddings
 from langchain.schema import Document
 
 # DBセッションとモデルをインポート
-from ..db.session import SessionLocal
-from ..db.models import User, Conversation, LocationHistory, ActiveRoute
+from app.db.session import SessionLocal
+from app.db import models
 
 # --- 設定項目 ---
 # 短期記憶として取得する会話の最大数
@@ -19,7 +20,10 @@ LONG_TERM_MEMORY_K = 5
 # ベクトルDBの永続化先ディレクトリ
 VECTORSTORE_PATH = "./vectorstore"
 # ベクトル化に使用するモデル
-EMBEDDINGS = OllamaEmbeddings(model="gemma3:27b")
+EMBEDDINGS = OllamaEmbeddings(
+    model="nomic-embed-text",
+    base_url=os.getenv("OLLAMA_HOST", "http://localhost:11434") # デフォルトはlocalhost
+)
 
 # --- ベクトルデータベースの初期化 ---
 # ChromaDBのインスタンスを一度だけ作成
@@ -27,11 +31,23 @@ vectorstore = Chroma(
     persist_directory=VECTORSTORE_PATH, 
     embedding_function=EMBEDDINGS
 )
+
 retriever = vectorstore.as_retriever(
     search_type="similarity",
     search_kwargs={"k": LONG_TERM_MEMORY_K}
 )
 
+# ==================== ヘルパー関数 ====================
+def get_or_create_user(db: Session, user_id: str) -> models.User:
+    """ユーザーが存在すれば取得し、存在しなければ作成するヘルパー関数。"""
+    user = db.query(models.User).filter(models.User.user_id == user_id).first()
+    if not user:
+        print(f"User '{user_id}' not found. Creating new user.")
+        user = models.User(user_id=user_id)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
 
 # ==================== 短期記憶 (SQL) ====================
 
@@ -42,9 +58,9 @@ def get_short_term_history(user_id: str) -> List[BaseMessage]:
     db: Session = SessionLocal()
     try:
         history_from_db = (
-            db.query(Conversation)
-            .filter(Conversation.user_id == user_id)
-            .order_by(Conversation.created_at.desc())
+            db.query(models.Conversation)
+            .filter(models.Conversation.user_id == user_id)
+            .order_by(models.Conversation.created_at.desc())
             .limit(SHORT_TERM_MEMORY_LIMIT)
             .all()
         )
@@ -71,7 +87,7 @@ def save_short_term_history(user_id: str, messages: List[BaseMessage]):
                 msg = AIMessage(content=str(msg.content))
             
             message_type = "human" if isinstance(msg, HumanMessage) else "ai"
-            db_conversation = Conversation(
+            db_conversation = models.Conversation(
                 user_id=user_id,
                 message_type=message_type,
                 content=str(msg.content)
@@ -137,7 +153,7 @@ def save_location(user_id: str, location: Tuple[float, float]):
     """
     db: Session = SessionLocal()
     try:
-        db_location = LocationHistory(
+        db_location = models.LocationHistory(
             user_id=user_id,
             latitude=location[0],
             longitude=location[1]
@@ -153,7 +169,7 @@ def get_active_route(user_id: str) -> Optional[Dict]:
     """
     db: Session = SessionLocal()
     try:
-        active_route_record = db.query(ActiveRoute).filter(ActiveRoute.user_id == user_id).first()
+        active_route_record = db.query(models.ActiveRoute).filter(models.ActiveRoute.user_id == user_id).first()
         if active_route_record:
             return active_route_record.route_data
         return None
