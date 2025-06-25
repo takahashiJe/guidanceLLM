@@ -106,20 +106,17 @@ def agent_node(state: GraphState) -> dict:
     """
     print("--- 1. Agent Node: Deciding next action ---")
     
-    # Agentを実行して、LLMに次のアクションを決定させる
-    result = agent_executor.invoke({"messages": state["messages"]})
+    # 状態(messages)を渡して、agentに次のアクションを決定させる
+    agent_outcome = agent.invoke(state)
 
-    # Agentがユーザーへの最終応答を生成した場合
-    if "output" in result:
+    # Agentがユーザーへの最終応答を生成した場合 (ToolMessage以外のAIMessage)
+    if not isinstance(agent_outcome, AIMessage) or not agent_outcome.tool_calls:
         print("Agent decided to respond to user.")
-        return {"messages": [AIMessage(content=result["output"])]}
+        return {"messages": [agent_outcome]}
     
     # Agentがツールを呼び出すことを決定した場合
-    # tool_calls属性は LangChain v0.2.x の標準的な出力
-    if "tool_calls" in result and result["tool_calls"]:
-        print(f"Agent wants to call tools: {[tc['name'] for tc in result['tool_calls']]}")
-        # 次のノード(tool_executor_node)が実行できるように、tool_callsをメッセージリストに追加して返す
-        return {"messages": [AIMessage(content="", tool_calls=result["tool_calls"])]}
+    print(f"Agent wants to call tools: {[tc['name'] for tc in agent_outcome.tool_calls]}")
+    return {"messages": [agent_outcome]}
 
     # 想定外の形式の場合は、エラーとして応答する
     print("Agent returned unexpected format.")
