@@ -101,30 +101,50 @@ def multi_rag_retrieval_node(state: GraphState) -> dict:
 
 def agent_node(state: GraphState) -> dict:
     """
-    Agentを実行し、次のアクション（ツール呼び出し or ユーザーへの最終応答）を決定する。
-    このノードはツールの「実行はしない」。どのツールを呼ぶか決定するだけ。
+    Agentを実行し、次のアクションを決定する。
+    Agentが返す様々な型(AgentFinish, AgentAction)を処理し、
+    グラフが扱えるAIMessageに変換するのがこのノードの責務。
     """
     print("--- 1. Agent Node: Deciding next action ---")
     
-    # 状態(messages)を渡して、agentに次のアクションを決定させる
     agent_input = {
         "messages": state["messages"],
         "intermediate_steps": []
     }
     agent_outcome = agent.invoke(agent_input)
 
-    # Agentがユーザーへの最終応答を生成した場合 (ToolMessage以外のAIMessage)
-    if not isinstance(agent_outcome, AIMessage) or not agent_outcome.tool_calls:
-        print("Agent decided to respond to user.")
-        return {"messages": [agent_outcome]}
-    
-    # Agentがツールを呼び出すことを決定した場合
-    print(f"Agent wants to call tools: {[tc['name'] for tc in agent_outcome.tool_calls]}")
-    return {"messages": [agent_outcome]}
+    # ケース1: Agentがツールを呼び出すことを決定した場合 (AgentAction)
+    actions = []
+    if isinstance(agent_outcome, list) and all(isinstance(i, AgentAction) for i in agent_outcome):
+        actions = agent_outcome
+    elif isinstance(agent_outcome, AgentAction):
+        actions = [agent_outcome]
 
-    # 想定外の形式の場合は、エラーとして応答する
-    print("Agent returned unexpected format.")
-    return {"messages": [AIMessage(content="申し訳ありません、予期せぬエラーが発生しました。")]}
+    if actions:
+        # AgentActionを、グラフが扱える「tool_calls属性を持つAIMessage」に変換する
+        tool_calls = [
+            {"name": action.tool, "args": action.tool_input, "id": str(uuid.uuid4())}
+            for action in actions
+        ]
+        ai_message_with_tools = AIMessage(content="", tool_calls=tool_calls)
+        
+        print(f"Agent wants to call tools: {[tc['name'] for tc in tool_calls]}")
+        return {"messages": [ai_message_with_tools]}
+
+    # ケース2: Agentが最終的な応答を返すと決定した場合 (AgentFinish)
+    if isinstance(agent_outcome, AgentFinish):
+        final_answer = agent_outcome.return_values["output"]
+        print("Agent decided to respond to user.")
+        return {"messages": [AIMessage(content=final_answer)]}
+
+    # ケース3: 予期せず直接AIMessageが返ってきた場合
+    if isinstance(agent_outcome, AIMessage):
+         # このケースは通常発生しないはずだが、念のため
+         print("Agent returned a direct AIMessage.")
+         return {"messages": [agent_outcome]}
+
+    # 上記のいずれでもない、想定外の型が返ってきた場合のエラーハンドリング
+    raise ValueError(f"Agent returned unexpected type: {type(agent_outcome)}")
 
 def tools_node(state: GraphState) -> dict:
     """
