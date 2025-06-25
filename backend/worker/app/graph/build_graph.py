@@ -79,7 +79,19 @@ def build_graph() -> StateGraph:
         if agent_decision_message:
             tool_name = agent_decision_message.tool_calls[0]['name']
             if tool_name == "calculate_route":
-                return "propose_route" # ルート計算後は提案ノードへ
+                if isinstance(last_tool_message, ToolMessage):
+                    try:
+                        tool_output = json.loads(last_tool_message.content)
+                        # ★ツールの実行結果(status)に応じて分岐
+                        if tool_output.get("status") in ["error", "outside_area"]:
+                            # 失敗した場合は、その情報を基にAgentに応答を生成させる
+                            return "agent" 
+                        else:
+                            # 成功した場合のみ、ルート提案へ進む
+                            return "propose_route"
+                    except json.JSONDecodeError:
+                        # パースに失敗した場合も安全にagentに戻す
+                        return "agent"
             elif tool_name == "check_and_plan_visit":
                 return "handle_visit_plan" # 訪問計画の結果処理へ
 
