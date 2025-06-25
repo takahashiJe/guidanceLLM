@@ -34,13 +34,18 @@ services:
       dockerfile: ./backend/worker/Dockerfile
     deploy:
       replicas: 1 # 開発中は1台で十分
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # or specify count, e.g., 1
+              capabilities: [gpu]
     env_file:
       - .env
     runtime: nvidia
     working_dir: /code
     environment:
       - PYTHONPATH=/code
-      - NVIDIA_VISIBLE_DEVICES=all
       - RABBITMQ_HOST=rabbitmq
       - REDIS_HOST=redis
       - OLLAMA_HOST=http://ollama:11434
@@ -59,7 +64,13 @@ services:
     volumes:
       - ollama_data:/root/.ollama
       - ./backend/worker/llm_models:/models
-    deploy: { resources: { reservations: { devices: [{capabilities: [gpu]}] } } }
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     runtime: nvidia
 
   rabbitmq:

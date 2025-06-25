@@ -18,6 +18,8 @@ accelerate
 # その他ユーティリティ
 # pydantic は FastAPI に合わせて不要（自動で入る）
 # asyncio は標準ライブラリなので除外
+thefuzz
+python-Levenshtein
 
 # 地理系ツール
 geopandas

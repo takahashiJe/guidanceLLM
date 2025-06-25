@@ -1,77 +1,88 @@
 # /backend/app/graph/tools.py
 
-import os
 import json
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from datetime import date
-from typing import Dict, Any
-from langchain_ollama import ChatOllama
+from typing import Dict, Any, Optional, Tuple
+from thefuzz import process
 
 # --- 外部のサービスやRAGモジュールからロジックをインポート ---
 from app.services import route_service, planning_service
 from app.rag import retriever
 
-llm = ChatOllama(
-        # model="qwen2.5:32b-instruct",
-        model="gemma3:27b-it-qat",
-        # model="gemma3:27b",
-        # model="llama3:70b",
-        # model="elyza-jp-chat",
-        base_url=os.getenv("OLLAMA_HOST", "http://ollama:11434"),
-        temperature=0.7
-        )
-
+# ==============================================================================
 # --- 1. 地名正規化ツール ---
+# ==============================================================================
 class NormalizeNamesInput(BaseModel):
-    user_query: str = Field(description="ルート検索に関するユーザーの元の発言。例: '祓川の駐車場から赤滝まで行きたい'")
+    """normalize_location_namesツールへの入力スキーマ。"""
+    start: str = Field(description="正規化が必要な出発地の名称。")
+    end: str = Field(description="正規化が必要な目的地の名称。")
 
-@tool
-def normalize_location_names(input: NormalizeNamesInput) -> Dict[str, str]:
-    """ユーザーの曖昧な発言から、正式な出発地と目的地の名称を特定する。
-    ルートを計算する前に必ずこのツールを呼び出すこと。"""
-    # サービスから既知の地名リストを取得
+@tool(args_schema=NormalizeNamesInput)
+def normalize_location_names(start: str, end: str) -> Dict[str, str]:
+    """
+    ユーザーが指定した出発地と目的地の名称を、既知の地名リストと照合し、
+    最も可能性の高い正式名称を特定する。「現在地」は特別なキーワードとしてそのまま扱う。
+    """
     known_locations = route_service.get_known_locations()
+    if not known_locations:
+        print("Warning: Known locations list is empty. Returning original names.")
+        return {"start_point": start, "end_point": end}
+
+    end_match = process.extractOne(end, known_locations)
+    best_end_match = end_match[0] if end_match else end
     
-    # このツール内でLLMを呼び出し、正規化を行う
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.output_parsers import JsonOutputParser
+    if start == "現在地":
+        best_start_match = "現在地"
+    else:
+        start_match = process.extractOne(start, known_locations)
+        best_start_match = start_match[0] if start_match else start
 
-    parser = JsonOutputParser()
-    prompt = ChatPromptTemplate.from_template(
-        """ユーザーの発言を分析し、以下の地名リストの中から最も可能性の高い「出発地」と「目的地」を特定してください。
-        もしどちらか一方でも特定できない場合は、該当するフィールドに "不明" と答えてください。
-        JSON形式で {"start_point": "地名", "end_point": "地名"} のように回答してください。
-        
-        地名リスト:
-        {location_list}
-
-        ユーザーの発言: "{query}"
-
-        あなたの回答:
-        """
-        )
-    
-    chain = prompt | llm | parser
-    result = chain.invoke({
-        "location_list": "\n- ".join(known_locations),
-        "query": input.user_query
-    })
+    result = {"start_point": best_start_match, "end_point": best_end_match}
+    print(f"--- Tool: normalize_location_names --- \nInput: start='{start}', end='{end}'\nOutput: {result}")
     return result
 
-
-# --- 2. ルート計算ツール (役割を明確化) ---
+# ==============================================================================
+# --- 2. ルート計算ツール（再設計） ---
+# ==============================================================================
 class CalculateRouteInput(BaseModel):
-    start_point: str = Field(description="normalize_location_namesツールで特定された、正式な出発地の名称。")
-    end_point: str = Field(description="normalize_location_namesツールで特定された、正式な目的地の名称。")
-
-@tool
-def calculate_route(input: CalculateRouteInput) -> Dict[str, Any]:
-    """正規化された正式名称を使い、最適なルートを計算する。"""
-    route_info = route_service.get_route_from_service(
-        start_point=input.start_point,
-        end_point=input.end_point
+    """calculate_routeツールへの入力スキーマ。"""
+    start_point: str = Field(description="正規化された出発地の名称。「現在地」という文字列も含む。")
+    end_point: str = Field(description="正規化された目的地の名称。")
+    current_location: Optional[Tuple[float, float]] = Field(
+        None, description="ユーザーの現在地の緯度・経度。出発地が「現在地」の場合にのみ必須。"
     )
+
+@tool(args_schema=CalculateRouteInput)
+def calculate_route(
+    start_point: str, 
+    end_point: str, 
+    current_location: Optional[Tuple[float, float]] = None
+) -> Dict[str, Any]:
+    """
+    正規化された出発地と目的地、およびオプションの現在地座標を受け取り、最適なルートを計算する。
+    """
+    print(f"--- Tool: calculate_route ---\nInput: start='{start_point}', end='{end_point}', loc={current_location}")
+    
+    start_coords, end_coords = None, None
+    
+    if start_point == "現在地":
+        if not current_location:
+            return {"status": "error", "message": "現在地が不明です。位置情報を有効にして再度お試しください。"}
+        if not route_service.is_location_within_haraikawa_area(current_location):
+            return {"status": "outside_area", "message": "現在地は道案内サービスの対応エリア外です。お車などで祓川ヒュッテ近辺の駐車場まで移動してください。"}
+        start_coords = current_location
+    else:
+        start_coords = route_service.get_coords_from_location_name(start_point)
+
+    end_coords = route_service.get_coords_from_location_name(end_point)
+
+    if not start_coords or not end_coords:
+        return {"status": "error", "message": "出発地または目的地の座標が見つかりませんでした。"}
+
+    print(f"--- Calculating route from {start_coords} to {end_coords} ---")
+    route_info = route_service.find_route_from_coords(start_coords=start_coords, end_coords=end_coords)
     return route_info
 
 # Graph RAG のためのツール
@@ -108,68 +119,36 @@ def query_knowledge_graph(input: GraphSearchInput) -> str:
     
     return "\n".join(results)
 
-# --- 1. ルート計算ツール ---
-class CalculateRouteInput(BaseModel):
-    start_point: str = Field(description="出発地の名称。例: '祓川駐車場'")
-    end_point: str = Field(description="目的地の名称。例: '鳥海山 山頂'")
-
-@tool
-def calculate_route(input: CalculateRouteInput) -> Dict[str, Any]:
-    """グラフデータとダイクストラ法を使い、出発地から目的地までの最適なルートを計算する。
-    このツールは、ルートの提案が必要な場合にのみ使用する。"""
-    print(f"--- Tool: calculate_route ---")
-    print(f"Input: {input.model_dump_json()}")
-    
-    # 実際の計算ロジックはroute_serviceに委譲
-    route_info = route_service.get_route_from_service(
-        start_point=input.start_point,
-        end_point=input.end_point
-    )
-    
-    print(f"Output: {route_info}")
-    return route_info
-
-
 # --- 2. 知識検索ツール ---
 class KnowledgeSearchInput(BaseModel):
     query: str = Field(description="鳥海山のスポット、コース概要、歴史、文化、自然などに関する一般的な質問に答えるために使用する。")
 
-@tool
-def knowledge_base_search(input: KnowledgeSearchInput) -> str:
+@tool(args_schema=KnowledgeSearchInput)
+def knowledge_base_search(query: str) -> str:
     """鳥海山に関する専門的な知識ベースから関連情報を検索して返す。"""
-    print(f"--- Tool: knowledge_base_search ---")
-    print(f"Input: {input.model_dump_json()}")
-    
-    # 実際のベクトル検索ロジックはrag.retrieverに委譲
-    retrieved_text = retriever.query_rag(input.query)
-    
-    print(f"Output: {retrieved_text[:100]}...") # 長すぎる可能性があるため一部を出力
+    print(f"--- Tool: knowledge_base_search ---\nInput: {query}")
+    retrieved_text = retriever.query_rag(query)
     return retrieved_text
 
 
 # --- 3. 訪問計画ツール ---
 class PlanVisitInput(BaseModel):
-    """訪問計画の確認と登録を行うツールの入力スキーマ"""
     spot_name: str = Field(description="ユーザーが行きたいスポットの名前。")
     visit_date: date = Field(description="ユーザーが行きたい日付。")
     user_id: str = Field(description="操作対象のユーザーID。")
 
-@tool
-def check_and_plan_visit(input: PlanVisitInput) -> Dict[str, Any]:
-    """指定されたスポットと日付の混雑状況をDBで確認する。
-    空いていれば計画を登録し、混雑していれば代替案を提案する。"""
-    print(f"--- Tool: check_and_plan_visit ---")
-    print(f"Input: {input.model_dump_json()}")
-
-    # 実際のDB操作ロジックはplanning_serviceに委譲
-    plan_result = planning_service.process_visit_plan(
-        user_id=input.user_id,
-        spot_name=input.spot_name,
-        visit_date=input.visit_date
-    )
-
-    print(f"Output: {plan_result}")
+@tool(args_schema=PlanVisitInput)
+def check_and_plan_visit(user_id: str, spot_name: str, visit_date: date) -> Dict[str, Any]:
+    """指定されたスポットと日付の混雑状況を確認し、計画を登録する。"""
+    print(f"--- Tool: check_and_plan_visit ---\nInput: user='{user_id}', spot='{spot_name}', date='{visit_date}'")
+    plan_result = planning_service.process_visit_plan(user_id=user_id, spot_name=spot_name, visit_date=visit_date)
     return plan_result
 
 # --- LangChainエージェントが利用可能なツールのリスト ---
-available_tools = [normalize_location_names, calculate_route, knowledge_base_search, check_and_plan_visit, query_knowledge_graph]
+available_tools = [
+    normalize_location_names, 
+    calculate_route, 
+    knowledge_base_search, 
+    check_and_plan_visit, 
+    # query_knowledge_graph # このツールはまだ簡易的なので一旦コメントアウトを推奨
+]

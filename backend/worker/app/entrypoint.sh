@@ -19,4 +19,4 @@ python -m app.init_db_script
 
 # Celery起動
 echo "Starting Celery worker..."
-exec celery -A shared.celery_app worker --loglevel=info
+exec celery -A shared.celery_app worker --loglevel=info -P solo

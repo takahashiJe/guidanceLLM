@@ -19,9 +19,10 @@ def process_chat_message(request_data: dict) -> dict:
     ユーザーからのチャットメッセージを処理するメインタスク。
     LangGraphを実行し、応答を生します。
     """
+    db = SessionLocal()
     try:
         request = ChatRequest(**request_data) # リクエストデータをPydanticモデルに変換
-        short_term_memory = memory_service.get_short_term_history(request.user_id) # 短期記憶を取得
+        short_term_memory = memory_service.get_short_term_history(db, request.user_id) # 短期記憶を取得
         long_term_memory = memory_service.get_long_term_memory(
             user_id=request.user_id, 
             query=request.message
@@ -33,6 +34,7 @@ def process_chat_message(request_data: dict) -> dict:
             "task_status": request.task_status,
             "language": request.language,
             "user_id": request.user_id,
+            "current_location": request.current_location,
             # Noneで初期化
             "intent": None,
             "tool_outputs": None,
@@ -53,23 +55,29 @@ def process_chat_message(request_data: dict) -> dict:
         )
 
         # 6. 更新された会話履歴をDBに保存
-        memory_service.save_short_term_history(request.user_id, final_state["messages"])
+        memory_service.save_short_term_history(db, request.user_id, final_state["messages"])
         memory_service.save_long_term_memory(request.user_id, final_state["messages"])
-        
+        db.commit()
         # 7. 結果を辞書形式で返す (Celeryはシリアライズ可能なデータを返す必要がある)
         return response.model_dump()
 
     except Exception as e:
-        # エラーハンドリング
+        # エラーが発生したらロールバックする
+        db.rollback()
+        # エラーをログに出力し、再raiseしてCeleryにタスクの失敗を通知する
         print(f"Error in process_chat_message: {e}")
-        # Celeryタスク内で例外を再発生させると、Celery側で失敗として扱われる
+        # traceback.print_exc() # さらに詳細なトレースバックが必要な場合
         raise
+    finally:
+        # タスクの成功・失敗に関わらず、必ずセッションを閉じる
+        db.close()
 
-@celery_app.task(name="process_location_update")
+@celery_app.task
 def process_location_update(request_data: dict) -> dict:
     """
     ユーザーの位置情報更新を処理するタスク。
     """
+    db = SessionLocal()
     try:
         request = UpdateLocationRequest(**request_data)
 
@@ -78,12 +86,15 @@ def process_location_update(request_data: dict) -> dict:
             return UpdateLocationResponse().model_dump()
 
         # 1. 位置情報をDBに保存
-        memory_service.save_location(request.user_id, request.current_location)
+        memory_service.save_location(db, request.user_id, request.current_location)
 
         # 2. 案内中のルート情報をDBから取得
-        active_route = memory_service.get_active_route(request.user_id)
+        active_route = memory_service.get_active_route(db, request.user_id)
         if not active_route:
+            db.rollback() # 追加した位置情報を取り消し
             return UpdateLocationResponse().model_dump()
+        
+        db.commit()
         
         # 3. ルート逸脱などをチェック
         progress_status = route_service.check_user_progress(
@@ -99,9 +110,8 @@ def process_location_update(request_data: dict) -> dict:
             system_trigger_message = f"状況: {progress_status['status']}. ユーザーに伝えるべき適切なメッセージを生成してください。"
             initial_state = {
                 "messages": [HumanMessage(content=system_trigger_message)],
-                "task_status": "guiding",
-                # ...
-            }
+                "task_status": "guiding"
+                }
             final_state = compiled_graph.invoke(initial_state)
             intervention_message = final_state["messages"][-1].content
             
@@ -112,5 +122,9 @@ def process_location_update(request_data: dict) -> dict:
             return response.model_dump()
 
     except Exception as e:
+        db.rollback() # エラーが発生したらロールバック
         print(f"Error in process_location_update: {e}")
+        traceback.print_exc() # エラーの詳細なトレースバックを出力
         raise
+    finally:
+        db.close() # 必ずセッションを閉じる
