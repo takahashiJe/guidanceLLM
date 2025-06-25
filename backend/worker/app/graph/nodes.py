@@ -107,7 +107,11 @@ def agent_node(state: GraphState) -> dict:
     print("--- 1. Agent Node: Deciding next action ---")
     
     # 状態(messages)を渡して、agentに次のアクションを決定させる
-    agent_outcome = agent.invoke(state)
+    agent_input = {
+        "messages": state["messages"],
+        "intermediate_steps": []
+    }
+    agent_outcome = agent.invoke(agent_input)
 
     # Agentがユーザーへの最終応答を生成した場合 (ToolMessage以外のAIMessage)
     if not isinstance(agent_outcome, AIMessage) or not agent_outcome.tool_calls:
