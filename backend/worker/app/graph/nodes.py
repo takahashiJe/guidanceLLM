@@ -2,10 +2,13 @@
 
 import os
 import ast 
+import uuid
+import json
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.agents import AgentAction, AgentFinish
 from langchain_ollama import ChatOllama
 from shared.state import GraphState
 from app.graph.tools import available_tools

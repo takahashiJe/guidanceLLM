@@ -2,8 +2,9 @@
 
 from langgraph.graph import StateGraph, END
 from shared.state import GraphState
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from typing import List
+import json
 
 from .nodes import (
     agent_node,
@@ -75,6 +76,7 @@ def build_graph() -> StateGraph:
     def route_after_tool_execution(state: GraphState):
         # どのツールが呼ばれたか特定するために、最新のToolMessageの前のAIMessageを探す
         agent_decision_message = next((msg for msg in reversed(state['messages']) if isinstance(msg, AIMessage) and msg.tool_calls), None)
+        last_tool_message = state['messages'][-1] if state['messages'] else None
         
         if agent_decision_message:
             tool_name = agent_decision_message.tool_calls[0]['name']
