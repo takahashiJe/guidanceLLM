@@ -144,7 +144,9 @@ def query_knowledge_graph(query: str) -> str:
     print(f"--- Tool: query_knowledge_graph ---\nOutput:\n{final_output}")
     return final_output
 
-# --- 2. 知識検索ツール ---
+# ==============================================================================
+# --- 3. 知識検索ツール (ベクトル検索) ---
+# ==============================================================================
 class KnowledgeSearchInput(BaseModel):
     query: str = Field(description="鳥海山のスポット、コース概要、歴史、文化、自然などに関する一般的な質問に答えるために使用する。")
 
@@ -175,24 +177,63 @@ def knowledge_base_search(query: str) -> str:
     return final_output
 
 
-# --- 3. 訪問計画ツール ---
-class PlanVisitInput(BaseModel):
-    spot_name: str = Field(description="ユーザーが行きたいスポットの名前。")
-    visit_date: date = Field(description="ユーザーが行きたい日付。")
+# ==============================================================================
+# --- 4. 訪問計画管理ツール (★今回の実装の核心) ---
+# ==============================================================================
+class ManageVisitPlanInput(BaseModel):
+    """
+    訪問計画を総合的に管理するツールへの入力スキーマ。
+    ユーザーの意図に応じて、AIがactionを選択し、必要な引数を設定する。
+    """
     user_id: str = Field(description="操作対象のユーザーID。")
+    action: Literal["save", "delete", "check_range"] = Field(description="実行する操作の種類。'save'は計画の保存/更新、'delete'は削除、'check_range'は期間内の混雑確認。")
+    spot_name: Optional[str] = Field(None, description="計画の対象となるスポット名。actionが'save'または'check_range'の場合に必要。")
+    visit_date: Optional[date] = Field(None, description="計画する特定の日付。actionが'save'の場合に必要。")
+    start_date: Optional[date] = Field(None, description="混雑状況を確認する期間の開始日。actionが'check_range'の場合に必要。")
+    end_date: Optional[date] = Field(None, description="混雑状況を確認する期間の終了日。actionが'check_range'の場合に必要。")
 
-@tool(args_schema=PlanVisitInput)
-def check_and_plan_visit(user_id: str, spot_name: str, visit_date: date) -> Dict[str, Any]:
-    """指定されたスポットと日付の混雑状況を確認し、計画を登録する。"""
-    print(f"--- Tool: check_and_plan_visit ---\nInput: user='{user_id}', spot='{spot_name}', date='{visit_date}'")
-    plan_result = planning_service.process_visit_plan(user_id=user_id, spot_name=spot_name, visit_date=visit_date)
-    return plan_result
+@tool(args_schema=ManageVisitPlanInput)
+def manage_visit_plan(user_id: str, action: str, spot_name: Optional[str] = None, visit_date: Optional[date] = None, start_date: Optional[date] = None, end_date: Optional[date] = None) -> Dict[str, Any]:
+    """
+    ユーザーの訪問計画を保存、削除、または指定期間の混雑状況を確認する。
+    AIはユーザーの入力（例：「7/15に鳥海湖行きたい」「計画やめる」「来週の空いてる日は？」）を解釈し、
+    このツールの'action'と各引数を適切に設定して呼び出す。
+    """
+    print(f"--- Tool: manage_visit_plan ---\nInput: user='{user_id}', action='{action}', spot='{spot_name}', date='{visit_date}'")
+
+    # --- 場所の検証 ---
+    if spot_name:
+        plannable_spots = planning_spot_service.get_plannable_spots()
+        if spot_name not in plannable_spots:
+            # thefuzzで最も近い候補を提示
+            best_match, score = process.extractOne(spot_name, plannable_spots)
+            if score > 80:
+                return {"status": "invalid_spot", "message": f"「{spot_name}」という場所は計画できませんでした。もしかして「{best_match}」のことですか？"}
+            else:
+                return {"status": "invalid_spot", "message": f"「{spot_name}」という場所は計画できませんでした。"}
+
+    # --- アクションの実行 ---
+    if action == "save":
+        if not all([spot_name, visit_date]):
+            return {"status": "error", "message": "計画の保存には場所と日付の両方が必要です。"}
+        return planning_service.process_plan_creation(user_id, spot_name, visit_date)
+
+    elif action == "delete":
+        return planning_service.process_plan_deletion(user_id)
+
+    elif action == "check_range":
+        if not all([spot_name, start_date, end_date]):
+            return {"status": "error", "message": "期間の混雑確認には場所と開始日、終了日が必要です。"}
+        return planning_service.process_plan_range_check(spot_name, start_date, end_date)
+        
+    else:
+        return {"status": "error", "message": f"不明なアクション: {action}"}
 
 # --- LangChainエージェントが利用可能なツールのリスト ---
 available_tools = [
     normalize_location_names, 
     calculate_route, 
     knowledge_base_search, 
-    check_and_plan_visit, 
+    manage_visit_plan, 
     query_knowledge_graph
 ]

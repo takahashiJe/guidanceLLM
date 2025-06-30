@@ -19,6 +19,10 @@ class GraphState(TypedDict):
     # --- 任意/生成される情報 ---
     user_id: Optional[str]
     current_location: Optional[Tuple[float, float]]
+
+    # 訪問計画を保持するフィールド．データベースから取得した計画情報を会話中に一時的に保持する
+    visit_plan: Optional[Dict[str, Any]]
+
     intent: Optional[Literal["greeting", "general_question", "route_request", "plan_visit_request", "affirmative", "negative"]]
     tool_outputs: Optional[List[dict]]
     final_answer: Optional[str]

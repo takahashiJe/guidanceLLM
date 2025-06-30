@@ -4,25 +4,33 @@ import os
 import ast 
 import uuid
 import json
-from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
-from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.agents import AgentAction, AgentFinish
 from langchain_ollama import ChatOllama
+
+# --- サービスのインポート ---
+from app.services import planning_service
+from app.db import session as db_session
+
 from shared.state import GraphState
 from app.graph.tools import available_tools
 from app.rag import retriever
 
 # --- Agentのセットアップ ---
 # この部分はアプリケーション起動時に一度だけ実行されるのが望ましい
-SYSTEM_PROMPT = """あなたは「鳥海山ガイドAI」、ベテランの山岳ガイドです。
+SYSTEM_PROMPT_TEMPLATE = """あなたは「鳥海山ガイドAI」、ベテランの山岳ガイドです。
 ユーザーの安全を第一に考え、常に丁寧で、正確かつ分かりやすい情報を提供してください。
+
+【現在のユーザーの訪問計画】
+{visit_plan_summary}
+
 【あなたの行動原則】
-1.  **地名の正規化**: ユーザーからルートに関する質問を受けたら、まず `normalize_location_names` ツールを使い、曖昧な地名を正式名称に変換してください。
-2.  **ルート計算**: 正規化された地名を使って `calculate_route` ツールを呼び出してください。
-3.  **エラー対応**: `calculate_route`ツールの結果が `{'error': 'unsupported_location', ...}` だった場合、それはデータが存在しないことを意味します。その際は、ツールを再試行するのではなく、「申し訳ありません、実際の道案内サービスは現在、祓川周辺のトレイルコースのみ対応しております。」と丁寧に謝罪してください。
-4.  **通常のツール利用**: その他の質問に対しては、適宜 `knowledge_base_search` や `check_and_plan_visit` などのツールを利用してください。
+1.  **訪問計画の管理**: ユーザーから訪問計画に関する依頼（例：「7/15に鳥海湖行きたい」「計画やめる」「来週の空いてる日は？」）を受けたら、`manage_visit_plan`ツールを呼び出してください。ユーザーの意図を正確に解釈し、ツールの`action`と各引数を設定してください。
+2.  **混雑状況の伝達**: `manage_visit_plan`ツールの結果に`"is_congested": true`が含まれていたら、「計画を保存しましたが、その日は混雑が予想されます」のように、必ず混雑している旨を伝えてください。
+3.  **期間提案**: `manage_visit_plan`ツールの結果に`"congestion_map"`が含まれていたら、その中で値が小さい日付をユーザーに提案してください。例：「7月13日から20日の間では、特に16日と17日が比較的空いているようです。」
+4.  **地名正規化とルート計算**: ユーザーからルートに関する質問を受けたら、`normalize_location_names`と`calculate_route`を順に利用してください。
+5.  **その他の質問**: 上記以外の場合は、`knowledge_base_search`などの適切なツールを利用してください。
 """
 
 llm = ChatOllama(
@@ -103,20 +111,47 @@ def multi_rag_retrieval_node(state: GraphState) -> dict:
     return {"context_documents": context_docs}
 
 def agent_node(state: GraphState) -> dict:
-    """
-    Agentを実行し、次のアクションを決定する。
-    Agentが返す様々な型(AgentFinish, AgentAction)を処理し、
-    グラフが扱えるAIMessageに変換するのがこのノードの責務。
-    """
+    """Agentを実行し、次のアクションを決定する。会話の開始時にDBから計画を読み込む。"""
     print("--- 1. Agent Node: Deciding next action ---")
-    
-    agent_input = {
-        "messages": state["messages"],
-        "intermediate_steps": []
-    }
-    agent_outcome = agent.invoke(agent_input)
 
-    # ケース1: Agentがツールを呼び出すことを決定した場合 (AgentAction)
+    # --- ★★★ 計画の初期読み込みと状態同期 ★★★ ---
+    # 会話の各ターンで、まずDBから最新の計画を取得する
+    db = db_session.SessionLocal()
+    try:
+        user_id = state.get("user_id")
+        if user_id:
+            plan = planning_service.get_plan(db, user_id)
+            if plan:
+                # SQLAlchemyモデルを辞書に変換してStateに保存
+                state["visit_plan"] = {
+                    "spot_name": plan.spot_name,
+                    "visit_date": plan.visit_date.isoformat()
+                }
+            else:
+                state["visit_plan"] = None
+    finally:
+        db.close()
+
+    # --- ★★★ 文脈に応じたプロンプトの生成 ★★★ ---
+    plan_info = state.get("visit_plan")
+    if plan_info:
+        summary = f"場所: {plan_info['spot_name']}, 日付: {plan_info['visit_date']}"
+    else:
+        summary = "現在、計画はありません。"
+    
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(visit_plan_summary=summary)
+    
+    # 動的に生成したプロンプトでAgentを初期化
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder(variable_name="messages"),
+    ])
+    agent = create_tool_calling_agent(llm, available_tools, prompt)
+
+    # Agentの実行
+    agent_outcome = agent.invoke({"messages": state["messages"]})
+    
+    # (以降のAgentAction, AgentFinishの処理は変更なし)
     actions = []
     if isinstance(agent_outcome, list) and all(isinstance(i, AgentAction) for i in agent_outcome):
         actions = agent_outcome
@@ -124,29 +159,13 @@ def agent_node(state: GraphState) -> dict:
         actions = [agent_outcome]
 
     if actions:
-        # AgentActionを、グラフが扱える「tool_calls属性を持つAIMessage」に変換する
-        tool_calls = [
-            {"name": action.tool, "args": action.tool_input, "id": str(uuid.uuid4())}
-            for action in actions
-        ]
+        tool_calls = [{"name": action.tool, "args": action.tool_input, "id": str(uuid.uuid4())} for action in actions]
         ai_message_with_tools = AIMessage(content="", tool_calls=tool_calls)
-        
-        print(f"Agent wants to call tools: {[tc['name'] for tc in tool_calls]}")
         return {"messages": [ai_message_with_tools]}
 
-    # ケース2: Agentが最終的な応答を返すと決定した場合 (AgentFinish)
     if isinstance(agent_outcome, AgentFinish):
-        final_answer = agent_outcome.return_values["output"]
-        print("Agent decided to respond to user.")
-        return {"messages": [AIMessage(content=final_answer)]}
+        return {"messages": [AIMessage(content=agent_outcome.return_values["output"])]}
 
-    # ケース3: 予期せず直接AIMessageが返ってきた場合
-    if isinstance(agent_outcome, AIMessage):
-         # このケースは通常発生しないはずだが、念のため
-         print("Agent returned a direct AIMessage.")
-         return {"messages": [agent_outcome]}
-
-    # 上記のいずれでもない、想定外の型が返ってきた場合のエラーハンドリング
     raise ValueError(f"Agent returned unexpected type: {type(agent_outcome)}")
 
 def tools_node(state: GraphState) -> dict:
@@ -160,16 +179,11 @@ def tools_node(state: GraphState) -> dict:
     return {}
 
 def tool_executor_node(state: GraphState) -> dict:
-    """
-    Agentが決定したツールを「実際に実行」するノード。
-    ★重要：ツールを実行する直前に、グラフの状態から追加の引数を注入する。
-    """
+    """Agentが決定したツールを「実際に実行」するノード。"""
     print("--- 2. Tool Executor Node: Running tools ---")
     
-    # 最後のメッセージにツール呼び出し情報が含まれているか確認
     last_message = state['messages'][-1]
     if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
-        # ツール呼び出しがない場合は、何もせず終了
         return {}
 
     tool_messages = []
@@ -178,35 +192,21 @@ def tool_executor_node(state: GraphState) -> dict:
         tool_args = tool_call["args"]
         print(f"Executing tool: {tool_name} with args: {tool_args}")
 
-        # ★★★ ここが今回の修正の核心 ★★★
-        # もし呼び出すツールが 'calculate_route' で、
-        # かつ出発地が「現在地」の場合...
-        if tool_name == "calculate_route" and tool_args.get("start_point") == "現在地":
-            print("Injecting 'current_location' into calculate_route arguments...")
-            # グラフの状態(state)から現在地情報を取得し、ツールの引数に追加する
-            tool_args["current_location"] = state.get("current_location")
-            print(f"Updated args: {tool_args}")
-        
-        # ツール名で利用可能なツールリストから実行する関数を検索
+        # ★★★ ユーザーIDを自動で注入 ★★★
+        if tool_name == "manage_visit_plan":
+            tool_args["user_id"] = state.get("user_id")
+            print(f"Injected user_id into manage_visit_plan arguments.")
+
         tool_to_call = next((t for t in available_tools if t.name == tool_name), None)
         
         if tool_to_call:
-            # 準備した引数でツールを実行し、その結果をToolMessageとして保存
             try:
                 tool_output = tool_to_call.invoke(tool_args)
-                tool_messages.append(
-                    ToolMessage(content=json.dumps(tool_output, ensure_ascii=False), tool_call_id=tool_call['id'])
-                )
+                tool_messages.append(ToolMessage(content=json.dumps(tool_output, ensure_ascii=False), tool_call_id=tool_call['id']))
             except Exception as e:
-                print(f"Error executing tool {tool_name}: {e}")
-                tool_messages.append(
-                    ToolMessage(content=f"ツールの実行中にエラーが発生しました: {e}", tool_call_id=tool_call['id'])
-                )
+                tool_messages.append(ToolMessage(content=f"ツールの実行中にエラーが発生しました: {e}", tool_call_id=tool_call['id']))
         else:
-            print(f"Error: Tool '{tool_name}' not found.")
-            tool_messages.append(
-                ToolMessage(content=f"ツール '{tool_name}' が見つかりませんでした。", tool_call_id=tool_call['id'])
-            )
+            tool_messages.append(ToolMessage(content=f"ツール '{tool_name}' が見つかりませんでした。", tool_call_id=tool_call['id']))
 
     return {"messages": tool_messages}
 
