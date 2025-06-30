@@ -2,6 +2,7 @@
 
 import json
 from langchain_core.tools import tool
+from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 from datetime import date
 from typing import Dict, Any, Optional, Tuple
@@ -89,9 +90,10 @@ def calculate_route(
 # Neo4jなどのグラフDBに接続するのが理想だが、ここでは簡易的にJSONLファイルを読み込む
 def load_graph_data():
     graph_data = []
+    graph_file_path = "app/data/graph_data.jsonl"
     try:
         # workerコンテナ内のルートにファイルがあると仮定
-        with open("./data/graph_data.jsonl", 'r', encoding='utf-8') as f:
+        with open(graph_file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 graph_data.append(json.loads(line))
     except FileNotFoundError:
@@ -103,21 +105,44 @@ KNOWLEDGE_GRAPH = load_graph_data()
 class GraphSearchInput(BaseModel):
     query: str = Field(description="施設間の関係性や、場所に関する複雑な質問。例: '祓川コースの近くにある温泉付きの宿泊施設は？'")
 
-@tool
-def query_knowledge_graph(input: GraphSearchInput) -> str:
-    """知識グラフを検索し、エンティティ間の関係性に関する質問に答える。"""
-    # この部分は本来、クエリをCypher等に変換し、グラフDBに問い合わせる
-    # ここでは簡易的なキーワード検索でシミュレーションする
-    keywords = input.query.split() # 簡易的なキーワード抽出
-    results = []
-    for item in KNOWLEDGE_GRAPH:
-        if any(keyword in str(item["triplet"]) for keyword in keywords):
-            results.append(str(item["triplet"]))
-            
-    if not results:
-        return "関連する情報が知識グラフに見つかりませんでした。"
+@tool(args_schema=GraphSearchInput)
+def query_knowledge_graph(query: str) -> str:
+    """
+    ユーザーの質問からエンティティを特定し、ナレッジグラフを検索して関連する情報（トリプレット）を返す。
+    """
+    print(f"--- Tool: query_knowledge_graph ---\nInput: {query}")
+    if not KNOWLEDGE_GRAPH:
+        return "ナレッジグラフが利用できません。"
+
+    # ユーザーのクエリから既知の場所の名前をすべて抽出する
+    known_locations = route_service.get_known_locations()
+    found_entities = [loc for loc in known_locations if loc in query]
     
-    return "\n".join(results)
+    # もし地名が見つからなければ、より一般的なキーワードで検索を試みる
+    if not found_entities:
+         # 「温泉」「山小屋」「売店」などのキーワードを抽出
+        general_keywords = ["温泉", "山小屋", "売店", "ヒュッテ", "小屋", "駐車場", "トイレ"]
+        found_entities.extend([kw for kw in general_keywords if kw in query])
+
+    if not found_entities:
+        return "クエリから検索対象となるキーワードが見つかりませんでした。"
+
+    # 見つかったエンティティを含むトリプレットを検索
+    results = []
+    for entity in found_entities:
+        for item in KNOWLEDGE_GRAPH:
+            subject, _, obj = item["triplet"]
+            if (entity in subject or entity in obj) and item["triplet"] not in results:
+                results.append(item["triplet"])
+
+    if not results:
+        return "関連する情報がナレッジグラフに見つかりませんでした。"
+
+    # 結果をLLMが解釈しやすい形式の文字列に整形
+    formatted_results = [f"主語: {s}, 述語: {p}, 目的語: {o}" for s, p, o in results]
+    final_output = "\n".join(formatted_results)
+    print(f"--- Tool: query_knowledge_graph ---\nOutput:\n{final_output}")
+    return final_output
 
 # --- 2. 知識検索ツール ---
 class KnowledgeSearchInput(BaseModel):
@@ -127,8 +152,27 @@ class KnowledgeSearchInput(BaseModel):
 def knowledge_base_search(query: str) -> str:
     """鳥海山に関する専門的な知識ベースから関連情報を検索して返す。"""
     print(f"--- Tool: knowledge_base_search ---\nInput: {query}")
-    retrieved_text = retriever.query_rag_and_get_docs(query)
-    return retrieved_text
+
+    # 1. RAGからDocumentオブジェクトのリストを取得する
+    retrieved_docs: List[Document] = retriever.query_rag_and_get_docs(query)
+
+    # 2. 取得したドキュメントがなければ、その旨を伝えるメッセージを返す
+    if not retrieved_docs:
+        print("--- Tool: knowledge_base_search ---\nOutput: No documents found.")
+        return "関連する情報がナレッジベースに見つかりませんでした。"
+
+    # 3. 各Documentオブジェクトからテキスト(page_content)を抽出し、一つの文字列に結合する
+    #    これがJSONシリアライズ可能にするための重要な修正点
+    formatted_results = []
+    for doc in retrieved_docs:
+        # メタデータからソース（ファイルパス）を取得し、引用元として表示
+        source = doc.metadata.get('source', '不明なソース')
+        formatted_results.append(f"引用元: {source}\n内容:\n{doc.page_content}")
+    
+    # 4. 結合した文字列を返す
+    final_output = "\n\n---\n\n".join(formatted_results)
+    print(f"--- Tool: knowledge_base_search ---\nOutput:\n{final_output[:500]}...") # ログには長すぎるので省略して表示
+    return final_output
 
 
 # --- 3. 訪問計画ツール ---
@@ -150,5 +194,5 @@ available_tools = [
     calculate_route, 
     knowledge_base_search, 
     check_and_plan_visit, 
-    # query_knowledge_graph # このツールはまだ簡易的なので一旦コメントアウトを推奨
+    query_knowledge_graph
 ]
