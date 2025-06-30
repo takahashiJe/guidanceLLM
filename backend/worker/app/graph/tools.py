@@ -127,7 +127,7 @@ class KnowledgeSearchInput(BaseModel):
 def knowledge_base_search(query: str) -> str:
     """鳥海山に関する専門的な知識ベースから関連情報を検索して返す。"""
     print(f"--- Tool: knowledge_base_search ---\nInput: {query}")
-    retrieved_text = retriever.query_rag(query)
+    retrieved_text = retriever.query_rag_and_get_docs(query)
     return retrieved_text
 
 

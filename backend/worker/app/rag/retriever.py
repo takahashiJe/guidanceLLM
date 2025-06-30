@@ -17,10 +17,10 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 EMBEDDINGS_MODEL = "nomic-embed-text"
 
 # ベクトルDB（Chroma）の永続化先ディレクトリ。worker/data内に作成するのが管理上望ましい。
-VECTORSTORE_BASE_PATH = "./data/vectorstore"
+VECTORSTORE_BASE_PATH = "./app/data/vectorstore"
 
 # RAGの知識源となるドキュメントが格納されているディレクトリ
-KNOWLEDGE_BASE_PATH = "./data/knowledge"
+KNOWLEDGE_BASE_PATH = "./app/data/knowledge"
 
 # テキストを分割する際のチャンクサイズとオーバーラップ
 CHUNK_SIZE = 1000
