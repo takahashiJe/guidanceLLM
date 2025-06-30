@@ -48,13 +48,13 @@ prompt = ChatPromptTemplate.from_messages([
     MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
 
-agent = create_tool_calling_agent(llm, available_tools, prompt)
-agent_executor = AgentExecutor(
-    agent=agent, 
-    tools=available_tools, 
-    verbose=True, 
-    handle_parsing_errors=True
-    )
+# agent = create_tool_calling_agent(llm, available_tools, prompt)
+# agent_executor = AgentExecutor(
+#     agent=agent, 
+#     tools=available_tools, 
+#     verbose=True, 
+#     handle_parsing_errors=True
+#     )
 
 
 # --- ノード関数の定義 ---
