@@ -11,6 +11,19 @@ from app.db import session, models
 # 混雑と判断する予約数の閾値
 CONGESTION_THRESHOLD = 10
 
+# --- ユーザー管理ヘルパー関数 ---
+def get_or_create_user(db: Session, user_id: str) -> models.User:
+    """
+    指定されたuser_idのユーザーを取得、存在しない場合は新規作成する。
+    """
+    user = db.query(models.User).filter(models.User.user_id == user_id).first()
+    if not user:
+        print(f"User with user_id='{user_id}' not found. Creating new user.")
+        user = models.User(user_id=user_id)
+        db.add(user)
+        # この時点ではコミットせず、後続の処理と同一トランザクションで行う
+    return user
+
 # --- データベース操作関数 (CRUD + 混雑チェック) ---
 
 def get_plan(db: Session, user_id: str) -> Optional[models.VisitPlan]:
@@ -20,28 +33,71 @@ def get_plan(db: Session, user_id: str) -> Optional[models.VisitPlan]:
 def create_or_update_plan(db: Session, user_id: str, spot_name: str, visit_date: date) -> models.VisitPlan:
     """
     ユーザーの訪問計画を新規作成または更新する。
-    ユーザー一人につき計画は一つという前提。
+    ユーザーが存在しない場合は自動的に作成する。
     """
+    # --- ★★★ 修正点：計画保存の前にユーザーを確保する ★★★ ---
+    user = get_or_create_user(db, user_id)
+    
     # 既存の計画を探す
     existing_plan = get_plan(db, user_id)
     
     if existing_plan:
-        # 計画が存在すれば、内容を更新
         existing_plan.spot_name = spot_name
         existing_plan.visit_date = visit_date
         plan = existing_plan
     else:
-        # 計画がなければ、新規作成
         plan = models.VisitPlan(
-            user_id=user_id,
+            user_id=user.user_id, # 確保したユーザーのIDを使用
             spot_name=spot_name,
             visit_date=visit_date
         )
         db.add(plan)
     
+    # ユーザー作成と計画作成/更新をまとめてコミット
     db.commit()
     db.refresh(plan)
     return plan
+
+def delete_plan(db: Session, user_id: str) -> bool:
+    """指定されたユーザーの訪問計画をデータベースから削除する。"""
+    plan_to_delete = get_plan(db, user_id)
+    if plan_to_delete:
+        db.delete(plan_to_delete)
+        db.commit()
+        return True
+    return False
+
+def check_congestion_on_date(db: Session, spot_name: str, visit_date: date) -> int:
+    """指定された場所と日付の計画数をカウントして返す。"""
+    count = (
+        db.query(models.VisitPlan)
+        .filter(
+            models.VisitPlan.spot_name == spot_name,
+            func.date(models.VisitPlan.visit_date) == visit_date
+        )
+        .count()
+    )
+    return count
+
+def get_congestion_for_range(db: Session, spot_name: str, start_date: date, end_date: date) -> Dict[date, int]:
+    """指定された期間内の各日付における、特定のスポットの計画数を取得する。"""
+    results = (
+        db.query(
+            func.date(models.VisitPlan.visit_date).label("visit_day"),
+            func.count(models.VisitPlan.id).label("plan_count")
+        )
+        .filter(
+            models.VisitPlan.spot_name == spot_name,
+            and_(
+                func.date(models.VisitPlan.visit_date) >= start_date,
+                func.date(models.VisitPlan.visit_date) <= end_date
+            )
+        )
+        .group_by("visit_day")
+        .all()
+    )
+    congestion_map = {result.visit_day: result.plan_count for result in results}
+    return congestion_map
 
 def delete_plan(db: Session, user_id: str) -> bool:
     """指定されたユーザーの訪問計画をデータベースから削除する。"""

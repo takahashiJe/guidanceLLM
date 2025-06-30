@@ -8,6 +8,8 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.agents import AgentAction, AgentFinish
 from langchain_ollama import ChatOllama
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain.agents import create_tool_calling_agent
 
 # --- サービスのインポート ---
 from app.services import planning_service
@@ -43,10 +45,10 @@ llm = ChatOllama(
         temperature=0.7
         )
 
-prompt = ChatPromptTemplate.from_messages([
-    MessagesPlaceholder(variable_name="messages"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
+# prompt = ChatPromptTemplate.from_messages([
+#     MessagesPlaceholder(variable_name="messages"),
+#     MessagesPlaceholder(variable_name="agent_scratchpad"),
+#     ])
 
 # agent = create_tool_calling_agent(llm, available_tools, prompt)
 # agent_executor = AgentExecutor(
@@ -145,11 +147,40 @@ def agent_node(state: GraphState) -> dict:
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         MessagesPlaceholder(variable_name="messages"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
     agent = create_tool_calling_agent(llm, available_tools, prompt)
 
-    # Agentの実行
-    agent_outcome = agent.invoke({"messages": state["messages"]})
+    messages = state["messages"]
+    tool_call_map = {}
+    for i in range(len(messages) - 1):
+        if (
+            isinstance(messages[i], AIMessage)
+            and messages[i].tool_calls
+            and isinstance(messages[i + 1], ToolMessage)
+        ):
+            for tool_call in messages[i].tool_calls:
+                tool_call_map[tool_call["id"]] = messages[i + 1]
+
+    intermediate_steps = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tool_call in msg.tool_calls:
+                if tool_call["id"] in tool_call_map:
+                    # (AgentAction, ToolMessage.content) のタプルを作成
+                    action = AgentAction(
+                        tool=tool_call["name"],
+                        tool_input=tool_call["args"],
+                        log=f"Invoking tool `{tool_call['name']}` with "
+                        f"arguments: {tool_call['args']}\n",
+                    )
+                    intermediate_steps.append((action, tool_call_map[tool_call["id"]].content))
+    
+    # "messages"と"intermediate_steps"を渡してエージェントを実行
+    agent_outcome = agent.invoke({
+        "messages": state["messages"],
+        "intermediate_steps": intermediate_steps
+    })
     
     # (以降のAgentAction, AgentFinishの処理は変更なし)
     actions = []

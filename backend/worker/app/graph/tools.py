@@ -7,10 +7,25 @@ from pydantic import BaseModel, Field
 from datetime import date
 from typing import Dict, Any, Optional, Tuple
 from thefuzz import process
+from typing import TypedDict, List, Optional, Literal, Annotated, Tuple
 
-# --- 外部のサービスやRAGモジュールからロジックをインポート ---
 from app.services import route_service, planning_service
 from app.rag import retriever
+
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+import os
+
+summarize_llm = ChatOllama(
+    model="qwen2.5:32b-instruct",
+    # model="gemma3:27b-it-qat",
+    # model="gemma3:27b",
+    # model="llama3:70b",
+    # model="elyza-jp-chat",
+    base_url=os.getenv("OLLAMA_HOST", "http://ollama:11434"),
+    temperature=0 # 要約は創造性より正確性を重視
+)
 
 # ==============================================================================
 # --- 1. 地名正規化ツール ---
@@ -145,40 +160,55 @@ def query_knowledge_graph(query: str) -> str:
     return final_output
 
 # ==============================================================================
-# --- 3. 知識検索ツール (ベクトル検索) ---
+# --- 3. 知識検索ツール (ベクトル検索) (★★★ 今回の修正の核心 ★★★) ---
 # ==============================================================================
 class KnowledgeSearchInput(BaseModel):
     query: str = Field(description="鳥海山のスポット、コース概要、歴史、文化、自然などに関する一般的な質問に答えるために使用する。")
 
 @tool(args_schema=KnowledgeSearchInput)
 def knowledge_base_search(query: str) -> str:
-    """鳥海山に関する専門的な知識ベースから関連情報を検索して返す。"""
+    """
+    鳥海山に関する専門的な知識ベースから関連情報を検索し、その内容を要約して返す。
+    """
     print(f"--- Tool: knowledge_base_search ---\nInput: {query}")
 
     # 1. RAGからDocumentオブジェクトのリストを取得する
     retrieved_docs: List[Document] = retriever.query_rag_and_get_docs(query)
-
-    # 2. 取得したドキュメントがなければ、その旨を伝えるメッセージを返す
     if not retrieved_docs:
-        print("--- Tool: knowledge_base_search ---\nOutput: No documents found.")
         return "関連する情報がナレッジベースに見つかりませんでした。"
 
-    # 3. 各Documentオブジェクトからテキスト(page_content)を抽出し、一つの文字列に結合する
-    #    これがJSONシリアライズ可能にするための重要な修正点
-    formatted_results = []
-    for doc in retrieved_docs:
-        # メタデータからソース（ファイルパス）を取得し、引用元として表示
-        source = doc.metadata.get('source', '不明なソース')
-        formatted_results.append(f"引用元: {source}\n内容:\n{doc.page_content}")
+    # 2. 取得したドキュメントの全文を結合する
+    full_context = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
     
-    # 4. 結合した文字列を返す
-    final_output = "\n\n---\n\n".join(formatted_results)
-    print(f"--- Tool: knowledge_base_search ---\nOutput:\n{final_output[:500]}...") # ログには長すぎるので省略して表示
-    return final_output
+    # 3. ★★★ LLMを使って結合したテキストを要約する ★★★
+    print("--- Summarizing retrieved context... ---")
+    
+    summarization_prompt = ChatPromptTemplate.from_template(
+        """以下の知識ベースの情報を分析し、ユーザーの質問に答えるために必要な情報を、重要なポイントを箇条書きで漏れなく抽出・要約してください。
+        
+        【ユーザーの質問】
+        {user_query}
+
+        【知識ベースの情報】
+        {context}
+
+        【要約結果】
+        """
+    )
+    
+    summarization_chain = summarization_prompt | summarize_llm | StrOutputParser()
+    
+    summary = summarization_chain.invoke({
+        "user_query": query,
+        "context": full_context
+    })
+
+    print(f"--- Tool: knowledge_base_search ---\nOutput (Summary):\n{summary}")
+    return summary
 
 
 # ==============================================================================
-# --- 4. 訪問計画管理ツール (★今回の実装の核心) ---
+# --- 4. 訪問計画管理ツール  ---
 # ==============================================================================
 class ManageVisitPlanInput(BaseModel):
     """

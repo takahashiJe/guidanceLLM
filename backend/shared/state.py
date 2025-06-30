@@ -3,13 +3,7 @@
 from typing import TypedDict, List, Optional, Literal, Annotated, Tuple
 from langchain_core.messages import BaseMessage
 import operator
-from .schemas import VisitPlanResponse
-
-
-class ActionPayload(TypedDict, total=False):
-    """フロントエンドへのアクション指示のスキーマ"""
-    type: Literal["draw_route", "highlight_spot"]
-    payload: dict
+from .schemas import VisitPlanResponse, ActionPayload
 
 class GraphState(TypedDict):
     """LangGraph全体で共有される状態"""

@@ -1,11 +1,13 @@
 # /backend/shared/schemas.py
 
 from pydantic import BaseModel, Field
-from typing import Optional, Tuple, Literal, List, Dict, Any
+from typing import TypedDict, Optional, Tuple, Literal, List, Dict, Any
 from datetime import date
 
-# state.pyで定義したActionPayloadをインポートして再利用
-from .state import ActionPayload
+class ActionPayload(TypedDict, total=False):
+    """フロントエンドへのアクション指示のスキーマ"""
+    type: Literal["draw_route", "highlight_spot"]
+    payload: dict
 
 class VisitPlanResponse(BaseModel):
     """
