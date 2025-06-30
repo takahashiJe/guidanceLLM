@@ -1,6 +1,6 @@
 # /backend/shared/state.py
 
-from typing import TypedDict, List, Optional, Literal, Annotated
+from typing import TypedDict, List, Optional, Literal, Annotated, Tuple
 from langchain_core.messages import BaseMessage
 import operator
 
@@ -18,6 +18,7 @@ class GraphState(TypedDict):
 
     # --- 任意/生成される情報 ---
     user_id: Optional[str]
+    current_location: Optional[Tuple[float, float]]
     intent: Optional[Literal["greeting", "general_question", "route_request", "plan_visit_request", "affirmative", "negative"]]
     tool_outputs: Optional[List[dict]]
     final_answer: Optional[str]
