@@ -2,9 +2,17 @@
 
 from pydantic import BaseModel, Field
 from typing import Optional, Tuple, Literal, List, Dict, Any
+from datetime import date
 
 # state.pyで定義したActionPayloadをインポートして再利用
 from .state import ActionPayload
+
+class VisitPlanResponse(BaseModel):
+    """
+    フロントエンドに返す訪問計画情報のスキーマ
+    """
+    spot_name: str = Field(..., description="計画されている場所の名前")
+    visit_date: date = Field(..., description="計画されている日付")
 
 class ChatRequest(BaseModel):
     """
