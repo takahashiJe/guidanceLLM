@@ -10,6 +10,11 @@ WORKDIR /code
 # /codeをPythonの探索パスに追加
 ENV PYTHONPATH "${PYTHONPATH}:/code"
 
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
 # 依存関係ファイルのコピーとインストール (キャッシュ効率化)
 COPY ./backend/worker/requirements.txt .
 RUN pip install --upgrade pip \

@@ -3,7 +3,7 @@
 import json
 from langchain_core.tools import tool
 from langchain_core.documents import Document
-from pydantic import BaseModel, Field
+from pydantic.v1 import BaseModel, Field
 from datetime import date
 from typing import Dict, Any, Optional, Tuple
 from thefuzz import process

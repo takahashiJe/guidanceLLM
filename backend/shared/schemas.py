@@ -1,6 +1,6 @@
 # /backend/shared/schemas.py
 
-from pydantic import BaseModel, Field
+from pydantic.v1 import BaseModel, Field
 from typing import TypedDict, Optional, Tuple, Literal, List, Dict, Any
 from datetime import date
 
