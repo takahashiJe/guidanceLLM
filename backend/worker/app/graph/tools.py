@@ -3,7 +3,7 @@
 import json
 from langchain_core.tools import tool
 from langchain_core.documents import Document
-from pydantic.v1 import BaseModel, Field
+from pydantic.v1 import BaseModel, Field, validator
 from datetime import date
 from typing import Dict, Any, Optional, Tuple
 from thefuzz import process
@@ -221,6 +221,21 @@ class ManageVisitPlanInput(BaseModel):
     visit_date: Optional[date] = Field(None, description="計画する特定の日付。actionが'save'の場合に必要。")
     start_date: Optional[date] = Field(None, description="混雑状況を確認する期間の開始日。actionが'check_range'の場合に必要。")
     end_date: Optional[date] = Field(None, description="混雑状況を確認する期間の終了日。actionが'check_range'の場合に必要。")
+
+    @validator("visit_date", "start_date", "end_date", pre=True, always=True)
+    def parse_date_str(cls, v):
+        """
+        文字列で渡された日付をdateオブジェクトに変換するバリデータ。
+        """
+        if isinstance(v, str):
+            try:
+                # "YYYY-MM-DD" 形式の文字列をdatetimeオブジェクトに変換し、さらにdateオブジェクトに変換
+                return datetime.strptime(v, "%Y-%m-%d").date()
+            except ValueError:
+                # 形式が違う場合はエラーを発生させる
+                raise ValueError(f"日付の形式が無効です: '{v}'。YYYY-MM-DD形式で指定してください。")
+        # すでにdateオブジェクトであるか、Noneの場合はそのまま返す
+        return v
 
 @tool(args_schema=ManageVisitPlanInput)
 def manage_visit_plan(user_id: str, action: str, spot_name: Optional[str] = None, visit_date: Optional[date] = None, start_date: Optional[date] = None, end_date: Optional[date] = None) -> Dict[str, Any]:

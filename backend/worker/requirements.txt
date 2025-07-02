@@ -1,5 +1,5 @@
 # Web framework
-fastapi==0.111.0
+fastapi>=0.111.0
 uvicorn
 
 # LangChain core & components & langgraph
@@ -33,7 +33,7 @@ redis
 
 # ベクトルDB
 # ★★★ こちらは最初のTypeErrorを回避するため、0.4.24で固定 ★★★
-chromadb==0.4.24
+chromadb>=0.5.3
 
 psycopg2-binary
 unstructured

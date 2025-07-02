@@ -12,8 +12,8 @@ from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain.agents import create_tool_calling_agent
 
 # --- サービスのインポート ---
-from app.services import planning_service
-from app.db import session as db_session
+# from app.services import planning_service
+# from app.db import session as db_session
 
 from shared.state import GraphState
 from app.graph.tools import available_tools
@@ -23,9 +23,14 @@ from app.rag import retriever
 # この部分はアプリケーション起動時に一度だけ実行されるのが望ましい
 SYSTEM_PROMPT_TEMPLATE = """あなたは「鳥海山ガイドAI」、ベテランの山岳ガイドです。
 ユーザーの安全を第一に考え、常に丁寧で、正確かつ分かりやすい情報を提供してください。
+【重要】鳥海山に関する情報（スポット，コース，アクセス，施設，歴史，文化，自然，動植物）に関するあなたの回答は、必ず以下のナレッジベースの情報にのみ基づいて生成してください。
+ナレッジベースに情報がない質問については、曖昧な知識で答えず、正直に「申し訳ありません。その情報については私のデータベースに存在せず，お答えできません。」と回答してください。
 
 【現在のユーザーの訪問計画】
 {visit_plan_summary}
+
+【ナレッジベースの情報】
+{knowledge_base_context} 
 
 【あなたの行動原則】
 1.  **訪問計画の管理**: ユーザーから訪問計画に関する依頼（例：「7/15に鳥海湖行きたい」「計画やめる」「来週の空いてる日は？」）を受けたら、`manage_visit_plan`ツールを呼び出してください。ユーザーの意図を正確に解釈し、ツールの`action`と各引数を設定してください。
@@ -116,32 +121,29 @@ def agent_node(state: GraphState) -> dict:
     """Agentを実行し、次のアクションを決定する。会話の開始時にDBから計画を読み込む。"""
     print("--- 1. Agent Node: Deciding next action ---")
 
-    # --- ★★★ 計画の初期読み込みと状態同期 ★★★ ---
-    # 会話の各ターンで、まずDBから最新の計画を取得する
-    db = db_session.SessionLocal()
-    try:
-        user_id = state.get("user_id")
-        if user_id:
-            plan = planning_service.get_plan(db, user_id)
-            if plan:
-                # SQLAlchemyモデルを辞書に変換してStateに保存
-                state["visit_plan"] = {
-                    "spot_name": plan.spot_name,
-                    "visit_date": plan.visit_date.isoformat()
-                }
-            else:
-                state["visit_plan"] = None
-    finally:
-        db.close()
-
-    # --- ★★★ 文脈に応じたプロンプトの生成 ★★★ ---
-    plan_info = state.get("visit_plan")
+    # --- 文脈に応じたプロンプトの生成 ---
+    # tasks.pyから渡されたStateを直接利用する
+    plan_info = state.get("visit_plan") 
     if plan_info:
         summary = f"場所: {plan_info['spot_name']}, 日付: {plan_info['visit_date']}"
     else:
         summary = "現在、計画はありません。"
     
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(visit_plan_summary=summary)
+    # 1. Stateからナレッジベースの検索結果を取得
+    context_docs = state.get("context_documents", [])
+    if context_docs:
+        # ドキュメントのリストを文字列に変換してプロンプトに埋め込む
+        knowledge_base_context = "\n\n---\n\n".join(
+            [f"Source: {doc.get('source', 'N/A')}\nContent: {doc.get('content', '')}" for doc in context_docs]
+        )
+    else:
+        knowledge_base_context = "利用可能なナレッジベースの情報はありません。"
+    
+    # 2. プロンプトをフォーマットする際に、必要な変数をすべて渡す
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        visit_plan_summary=summary,
+        knowledge_base_context=knowledge_base_context
+    )
     
     # 動的に生成したプロンプトでAgentを初期化
     prompt = ChatPromptTemplate.from_messages([

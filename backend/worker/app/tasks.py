@@ -2,6 +2,8 @@
 import sys
 import os
 from langchain_core.messages import HumanMessage
+from typing import List
+from langchain_core.messages import BaseMessage
 
 # 共有モジュールからCeleryインスタンスとスキーマをインポート
 from shared.celery_app import celery_app
@@ -10,8 +12,9 @@ from shared.state import GraphState
 
 # ワーカー内部のモジュールをインポート
 from app.graph.build_graph import compiled_graph
-from app.services import memory_service, route_service # DBアクセスやビジネスロジックを担当するサービス
+from app.services import memory_service, route_service, planning_service # DBアクセスやビジネスロジックを担当するサービス
 from app.db.session import SessionLocal # DBセッションを直接利用する場合
+
 
 @celery_app.task
 def process_chat_message(request_data: dict) -> dict:
@@ -22,11 +25,22 @@ def process_chat_message(request_data: dict) -> dict:
     db = SessionLocal()
     try:
         request = ChatRequest(**request_data) # リクエストデータをPydanticモデルに変換
-        short_term_memory = memory_service.get_short_term_history(db, request.user_id) # 短期記憶を取得
+
+        # 1. 短期記憶と長期記憶を取得
+        short_term_memory = memory_service.get_short_term_history(db, request.user_id)
         long_term_memory = memory_service.get_long_term_memory(
             user_id=request.user_id, 
             query=request.message
-        ) # 長期記憶を取得
+        )
+
+        # 2. 現在の訪問計画を取得
+        plan = planning_service.get_plan(db, request.user_id)
+        visit_plan_data = None
+        if plan:
+            visit_plan_data = {
+                "spot_name": plan.spot_name,
+                "visit_date": plan.visit_date.isoformat()
+            }
 
         # LangGraphの初期状態を作成
         initial_state: GraphState = {
@@ -35,6 +49,7 @@ def process_chat_message(request_data: dict) -> dict:
             "language": request.language,
             "user_id": request.user_id,
             "current_location": request.current_location,
+            "visit_plan": visit_plan_data,
             # Noneで初期化
             "intent": None,
             "tool_outputs": None,

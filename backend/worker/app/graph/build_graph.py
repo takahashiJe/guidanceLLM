@@ -1,4 +1,4 @@
-# /backend/app/graph/build_graph.py (最終完成版)
+# /backend/app/graph/build_graph.py
 
 from langgraph.graph import StateGraph, END
 from shared.state import GraphState
@@ -6,6 +6,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from typing import List
 import json
 
+# ★★★ 1. RAG関連ノードをインポートリストに追加 ★★★
 from .nodes import (
     agent_node,
     tool_executor_node,
@@ -16,6 +17,8 @@ from .nodes import (
     handle_visit_plan_result_node,
     generate_simple_response_node,
     classify_confirmation_node,
+    query_expansion_node,
+    multi_rag_retrieval_node,
 )
 
 def build_graph() -> StateGraph:
@@ -26,7 +29,10 @@ def build_graph() -> StateGraph:
     workflow = StateGraph(GraphState)
 
     # --- 1. ノードをすべて登録 ---
+    # ★★★ 2. RAG関連ノードをワークフローに登録 ★★★
     workflow.add_node("classify_intent", classify_intent_node)
+    workflow.add_node("query_expansion", query_expansion_node)  
+    workflow.add_node("multi_rag_retrieval", multi_rag_retrieval_node) 
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", tool_executor_node)
     workflow.add_node("propose_route", propose_route_node)
@@ -39,13 +45,18 @@ def build_graph() -> StateGraph:
     # --- 2. エントリーポイントと初期ルーターを設定 ---
     workflow.set_entry_point("classify_intent")
 
+    # ★★★ 3. 意図分類後の交通整理（ルーティング）を修正 ★★★
     def route_after_intent_classification(state: GraphState):
         if state.get("task_status") == "confirming_route":
             return "classify_confirmation"
         intent = state.get("intent")
         if intent == "greeting":
             return "simple_response"
-        elif intent in ["route_request", "plan_visit_request", "general_question"]:
+        elif intent == "general_question":
+            # 「一般的な質問」の場合は、RAGプロセス（クエリ拡張）へ進む
+            return "query_expansion"
+        elif intent in ["route_request", "plan_visit_request"]:
+            # ルートや計画の質問は、ツールを直接使うagentへ進む
             return "agent"
         else:
             return END
@@ -55,15 +66,19 @@ def build_graph() -> StateGraph:
         route_after_intent_classification,
         {
             "classify_confirmation": "classify_confirmation",
+            "query_expansion": "query_expansion",
             "agent": "agent",
             "simple_response": "simple_response",
             END: END
         }
     )
+    
+    # ★★★ 4. RAGプロセスの流れを定義 ★★★
+    # クエリ拡張 → RAG検索 → エージェント、という流れを接続
+    workflow.add_edge("query_expansion", "multi_rag_retrieval")
+    workflow.add_edge("multi_rag_retrieval", "agent")
 
     # --- 3. 「思考と行動のループ」と、その後の分岐を定義 ---
-
-    # (A) agentノードの実行後、ツールを呼ぶか、終了するかを判断
     def route_after_agent_thinks(state: GraphState):
         last_message = state['messages'][-1]
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
@@ -72,9 +87,7 @@ def build_graph() -> StateGraph:
 
     workflow.add_conditional_edges("agent", route_after_agent_thinks)
 
-    # (B) toolsノードの実行後、どの処理に進むかを判断
     def route_after_tool_execution(state: GraphState):
-        # どのツールが呼ばれたか特定するために、最新のToolMessageの前のAIMessageを探す
         agent_decision_message = next((msg for msg in reversed(state['messages']) if isinstance(msg, AIMessage) and msg.tool_calls), None)
         last_tool_message = state['messages'][-1] if state['messages'] else None
         
@@ -84,20 +97,14 @@ def build_graph() -> StateGraph:
                 if isinstance(last_tool_message, ToolMessage):
                     try:
                         tool_output = json.loads(last_tool_message.content)
-                        # ★ツールの実行結果(status)に応じて分岐
                         if tool_output.get("status") in ["error", "outside_area"]:
-                            # 失敗した場合は、その情報を基にAgentに応答を生成させる
                             return "agent" 
                         else:
-                            # 成功した場合のみ、ルート提案へ進む
                             return "propose_route"
                     except json.JSONDecodeError:
-                        # パースに失敗した場合も安全にagentに戻す
                         return "agent"
             elif tool_name == "check_and_plan_visit":
-                return "handle_visit_plan" # 訪問計画の結果処理へ
-
-        # 上記以外のツールが呼ばれた、または不明な場合は、ツールの実行結果を持って再度agentに戻る
+                return "handle_visit_plan"
         return "agent"
 
     workflow.add_conditional_edges(
@@ -106,7 +113,7 @@ def build_graph() -> StateGraph:
         {
             "propose_route": "propose_route",
             "handle_visit_plan": "handle_visit_plan",
-            "agent": "agent", # ★これが状態を維持する鍵
+            "agent": "agent",
         }
     )
 

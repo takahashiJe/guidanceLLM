@@ -1,6 +1,7 @@
 # /backend/worker/app/services/memory_service.py
 
 import os
+import chromadb
 from typing import List, Tuple, Optional, Dict
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -23,13 +24,12 @@ EMBEDDINGS = OllamaEmbeddings(
 )
 
 # --- ベクトルデータベースの初期化 ---
+client = chromadb.PersistentClient(path=VECTORSTORE_PATH)
+
 vectorstore = Chroma(
-    persist_directory=VECTORSTORE_PATH, 
-    embedding_function=EMBEDDINGS
-)
-retriever = vectorstore.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": LONG_TERM_MEMORY_K}
+    client=client,
+    collection_name="langchain", # デフォルトのコレクション名
+    embedding_function=EMBEDDINGS,
 )
 
 # ==================== ヘルパー関数（最重要修正） ====================
@@ -121,6 +121,12 @@ def get_long_term_memory(user_id: str, query: str) -> List[BaseMessage]:
     """
     現在のクエリに最も関連する過去の会話（長期記憶）をベクトルDBから取得します。
     """
+    retrieved_docs: List[Document] = vectorstore.similarity_search(
+        query=query,
+        k=LONG_TERM_MEMORY_K,
+        filter={"user_id": user_id}
+    )
+    
     filtered_retriever = vectorstore.as_retriever(
         search_kwargs={"filter": {"user_id": user_id}, "k": LONG_TERM_MEMORY_K}
     )

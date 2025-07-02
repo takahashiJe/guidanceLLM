@@ -47,7 +47,7 @@ def create_or_update_plan(db: Session, user_id: str, spot_name: str, visit_date:
         plan = existing_plan
     else:
         plan = models.VisitPlan(
-            user=user, # 確保したユーザーのIDを使用
+            user_id=user.user_id, # userオブジェクト全体ではなく、明確にuser_id(文字列)を指定
             spot_name=spot_name,
             visit_date=visit_date
         )
