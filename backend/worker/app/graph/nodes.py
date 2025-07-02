@@ -10,6 +10,7 @@ from langchain_core.agents import AgentAction, AgentFinish
 from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain.agents import create_tool_calling_agent
+from datetime import date
 
 # --- サービスのインポート ---
 # from app.services import planning_service
@@ -23,6 +24,11 @@ from app.rag import retriever
 # この部分はアプリケーション起動時に一度だけ実行されるのが望ましい
 SYSTEM_PROMPT_TEMPLATE = """あなたは「鳥海山ガイドAI」、ベテランの山岳ガイドです。
 ユーザーの安全を第一に考え、常に丁寧で、正確かつ分かりやすい情報を提供してください。
+
+【あなたの情報】
+あなたのタスクを管理するため、以下の情報を利用してください。
+- 現在のユーザーID: {user_id}
+
 【重要】鳥海山に関する情報（スポット，コース，アクセス，施設，歴史，文化，自然，動植物）に関するあなたの回答は、必ず以下のナレッジベースの情報にのみ基づいて生成してください。
 ナレッジベースに情報がない質問については、曖昧な知識で答えず、正直に「申し訳ありません。その情報については私のデータベースに存在せず，お答えできません。」と回答してください。
 
@@ -179,6 +185,7 @@ def agent_node(state: GraphState) -> dict:
     
     # 2. プロンプトをフォーマットする際に、必要な変数をすべて渡す
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        user_id=state.get("user_id", "unknown_user"),
         visit_plan_summary=summary,
         knowledge_base_context=knowledge_base_context
     )
@@ -262,11 +269,6 @@ def tool_executor_node(state: GraphState) -> dict:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
         print(f"Executing tool: {tool_name} with args: {tool_args}")
-
-        # ★★★ ユーザーIDを自動で注入 ★★★
-        if tool_name == "manage_visit_plan":
-            tool_args["user_id"] = state.get("user_id")
-            print(f"Injected user_id into manage_visit_plan arguments.")
 
         tool_to_call = next((t for t in available_tools if t.name == tool_name), None)
         
@@ -366,13 +368,36 @@ def handle_visit_plan_result_node(state: GraphState) -> dict:
         tool_output_str = state["messages"][-1].content
         plan_result = ast.literal_eval(tool_output_str)
         status = plan_result.get("status")
-        if status == "available":
-            response_message = plan_result.get("message", "計画を登録しました。")
-        elif status == "congested":
-            suggestion = plan_result.get("suggestion", "別の日時をご検討ください。")
-            response_message = f"申し訳ありません、ご希望の日時は混雑しています。{suggestion}"
+        response_message = "計画を登録しました。" # デフォルトメッセージ
+        final_visit_plan_data = None
+
+        if status == "saved":
+            # visit_dateの文字列をdateオブジェクトに変換
+            visit_date_obj = date.fromisoformat(plan_result.get("visit_date")).date()
+            
+            # stateに保存するためのデータを作成
+            final_visit_plan_data = {
+                "spot_name": plan_result.get("spot_name"),
+                "visit_date": visit_date_obj
+            }
+
+            # 混雑状況に応じたメッセージを作成
+            if plan_result.get("is_congested"):
+                response_message = f"{visit_date_obj.strftime('%-m月%-d日')}の「{plan_result.get('spot_name')}」への計画を登録しましたが、当日は混雑が予想されます。別の日も検討しますか？"
+            else:
+                response_message = f"{visit_date_obj.strftime('%-m月%-d日')}の「{plan_result.get('spot_name')}」への計画を登録しました。"
+        
+        elif status == "invalid_spot" or status == "error":
+            response_message = plan_result.get("message", "エラーが発生しました。")
+
         else:
-            response_message = "計画の確認中にエラーが発生しました。"
+            response_message = "計画の確認中に予期せぬエラーが発生しました。"
+        
+        # 最終的なstateとメッセージを返す
+        return {
+            "messages": [AIMessage(content=response_message)],
+            "visit_plan": final_visit_plan_data
+        }
     except (ValueError, SyntaxError):
         response_message = "計画の確認結果を正しく処理できませんでした。"
         

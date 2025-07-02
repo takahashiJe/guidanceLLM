@@ -60,29 +60,27 @@ def get_short_term_history(db: Session, user_id: str) -> List[BaseMessage]:
     """
     指定されたユーザーの直近の会話履歴（短期記憶）をSQL DBから取得します。
     """
-    try:
-        # 文字列のuser_idでユーザーを検索
-        user = db.query(models.User).filter(models.User.user_id == user_id).first()
-        if not user:
-            return []
+    # 文字列のuser_idでユーザーを検索
+    user = db.query(models.User).filter(models.User.user_id == user_id).first()
+    if not user:
+        return []
 
-        # 取得したユーザーの整数ID (user.id) を使って会話を検索
-        history_from_db = (
-            db.query(models.Conversation)
-            .filter(models.Conversation.user_id == user_id) # user.idではなく、引数の文字列user_idを直接使用
-            .order_by(models.Conversation.created_at.desc())
-            .limit(SHORT_TERM_MEMORY_LIMIT)
-            .all()
-        )
-        messages: List[BaseMessage] = []
-        for record in reversed(history_from_db):
-            if record.message_type == "human":
-                messages.append(HumanMessage(content=record.content))
-            else:
-                messages.append(AIMessage(content=record.content))
-        return messages
-    finally:
-        db.close()
+    # 取得したユーザーの整数ID (user.id) を使って会話を検索
+    history_from_db = (
+        db.query(models.Conversation)
+        .filter(models.Conversation.user_id == user_id) # user.idではなく、引数の文字列user_idを直接使用
+        .order_by(models.Conversation.created_at.desc())
+        .limit(SHORT_TERM_MEMORY_LIMIT)
+        .all()
+    )
+    messages: List[BaseMessage] = []
+    for record in reversed(history_from_db):
+        if record.message_type == "human":
+            messages.append(HumanMessage(content=record.content))
+        else:
+            messages.append(AIMessage(content=record.content))
+    return messages
+        
 
 def save_short_term_history(db: Session, user_id: str, messages: List[BaseMessage]):
     """
@@ -100,7 +98,7 @@ def save_short_term_history(db: Session, user_id: str, messages: List[BaseMessag
             
             message_type = "human" if isinstance(msg, HumanMessage) else "ai"
             db_conversation = models.Conversation(
-                user_id=user.id, # ★★★ 確実に存在する整数のuser.idを使用 ★★★
+                user_id=user.user_id, # ★★★ 確実に存在する整数のuser.idを使用 ★★★
                 message_type=message_type,
                 content=str(msg.content)
             )
@@ -112,8 +110,6 @@ def save_short_term_history(db: Session, user_id: str, messages: List[BaseMessag
         print(f"Database integrity error: {e}")
         db.rollback()
         raise
-    finally:
-        db.close()
 
 # ==================== 長期記憶 (ベクトルDB) ====================
 
@@ -167,7 +163,7 @@ def save_location(db: Session, user_id: str, location: Tuple[float, float]):
     try:
         user = get_or_create_user(db, user_id)
         db_location = models.LocationHistory(
-            user_id=user.id, # 確実に存在する整数のuser.idを使用
+            user_id=user.user_id, # 確実に存在する整数のuser.idを使用
             latitude=location[0],
             longitude=location[1]
         )
@@ -177,8 +173,6 @@ def save_location(db: Session, user_id: str, location: Tuple[float, float]):
         print(f"Database integrity error: {e}")
         db.rollback()
         raise
-    finally:
-        db.close()
 
 def get_active_route(user_id: str) -> Optional[Dict]:
     """

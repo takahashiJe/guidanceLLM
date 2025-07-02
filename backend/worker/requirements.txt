@@ -39,3 +39,4 @@ psycopg2-binary
 unstructured
 markdown-it-py
 markdown
+python-dateutil
