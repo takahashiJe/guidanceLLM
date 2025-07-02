@@ -19,6 +19,7 @@ from .nodes import (
     classify_confirmation_node,
     query_expansion_node,
     multi_rag_retrieval_node,
+    rag_synthesis_node,
 )
 
 def build_graph() -> StateGraph:
@@ -41,6 +42,7 @@ def build_graph() -> StateGraph:
     workflow.add_node("handle_rejection", handle_rejection_node)
     workflow.add_node("handle_visit_plan", handle_visit_plan_result_node)
     workflow.add_node("simple_response", generate_simple_response_node)
+    workflow.add_node("rag_synthesis", rag_synthesis_node)
 
     # --- 2. エントリーポイントと初期ルーターを設定 ---
     workflow.set_entry_point("classify_intent")
@@ -76,7 +78,8 @@ def build_graph() -> StateGraph:
     # ★★★ 4. RAGプロセスの流れを定義 ★★★
     # クエリ拡張 → RAG検索 → エージェント、という流れを接続
     workflow.add_edge("query_expansion", "multi_rag_retrieval")
-    workflow.add_edge("multi_rag_retrieval", "agent")
+    workflow.add_edge("multi_rag_retrieval", "rag_synthesis")
+    workflow.add_edge("rag_synthesis", END) 
 
     # --- 3. 「思考と行動のループ」と、その後の分岐を定義 ---
     def route_after_agent_thinks(state: GraphState):
@@ -103,7 +106,7 @@ def build_graph() -> StateGraph:
                             return "propose_route"
                     except json.JSONDecodeError:
                         return "agent"
-            elif tool_name == "check_and_plan_visit":
+            elif tool_name == "manage_visit_plan":
                 return "handle_visit_plan"
         return "agent"
 

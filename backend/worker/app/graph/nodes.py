@@ -117,6 +117,44 @@ def multi_rag_retrieval_node(state: GraphState) -> dict:
     
     return {"context_documents": context_docs}
 
+def rag_synthesis_node(state: GraphState) -> dict:
+    """
+    RAGで取得したコンテキスト情報とユーザーの質問を基に、最終的な回答を生成する。
+    このノードはツールを呼び出さず、応答生成に特化する。
+    """
+    print("--- 3. RAG Synthesis Node ---")
+
+    # Stateから整形済みのナレッジベースコンテキストを取得
+    plan_info = state.get("visit_plan") 
+    if plan_info:
+        summary = f"場所: {plan_info['spot_name']}, 日付: {plan_info['visit_date']}"
+    else:
+        summary = "現在、計画はありません。"
+
+    context_docs = state.get("context_documents", [])
+    if context_docs:
+        knowledge_base_context = "\n\n---\n\n".join(
+            [f"Source: {doc.get('source', 'N/A')}\nContent: {doc.get('content', '')}" for doc in context_docs]
+        )
+    else:
+        knowledge_base_context = "利用可能なナレッジベースの情報はありません。"
+
+    # 応答生成に特化したプロンプトを作成
+    synthesis_prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT_TEMPLATE.format(
+            visit_plan_summary=summary,
+            knowledge_base_context=knowledge_base_context
+        )),
+        MessagesPlaceholder(variable_name="messages"),
+    ])
+    
+    # LLMチェーンを構築し、応答を生成
+    synthesis_chain = synthesis_prompt | llm | StrOutputParser()
+    
+    final_answer = synthesis_chain.invoke({"messages": state["messages"]})
+    
+    return {"messages": [AIMessage(content=final_answer)]}
+
 def agent_node(state: GraphState) -> dict:
     """Agentを実行し、次のアクションを決定する。会話の開始時にDBから計画を読み込む。"""
     print("--- 1. Agent Node: Deciding next action ---")
