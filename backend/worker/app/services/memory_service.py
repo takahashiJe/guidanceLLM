@@ -32,7 +32,7 @@ vectorstore = Chroma(
     embedding_function=EMBEDDINGS,
 )
 
-# ==================== ヘルパー関数（最重要修正） ====================
+# ==================== ヘルパー関数 ====================
 def get_or_create_user(db: Session, client_user_id: str) -> models.User:
     """
     クライアントから渡された文字列のIDを元にユーザーを取得または作成する。
@@ -54,7 +54,7 @@ def get_or_create_user(db: Session, client_user_id: str) -> models.User:
         db.flush() 
     return user
 
-# ==================== 短期記憶 (SQL)（修正） ====================
+# ==================== 短期記憶 (SQL) ====================
 
 def get_short_term_history(db: Session, user_id: str) -> List[BaseMessage]:
     """
@@ -69,7 +69,7 @@ def get_short_term_history(db: Session, user_id: str) -> List[BaseMessage]:
         # 取得したユーザーの整数ID (user.id) を使って会話を検索
         history_from_db = (
             db.query(models.Conversation)
-            .filter(models.Conversation.user_id == user.id) # 整数IDで検索
+            .filter(models.Conversation.user_id == user_id) # user.idではなく、引数の文字列user_idを直接使用
             .order_by(models.Conversation.created_at.desc())
             .limit(SHORT_TERM_MEMORY_LIMIT)
             .all()
