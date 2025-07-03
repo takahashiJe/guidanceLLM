@@ -1,101 +1,158 @@
 {
   "type": "FeatureCollection",
   "features": [
+    // ポイント (Nodes)
     {
       "type": "Feature",
-      "properties": {
-        "from": "矢島口登山口",
-        "to": "祓川小屋",
-        "difficulty": "初級",
-        "duration_min": 40,
-        "child_friendly": true,
-        "route_name": "矢島口ルート",
-        "segment_name": "登山口〜祓川小屋"
-      },
       "geometry": {
-        "type": "LineString",
-        "coordinates": [[139.9985, 39.0501], [140.0020, 39.0530]]
+        "type": "Point",
+        "coordinates": [140.068750, 39.131594]
+      },
+      "properties": {
+        "name": "駐車場"
       }
     },
     {
       "type": "Feature",
-      "properties": {
-        "from": "祓川小屋",
-        "to": "御田ヶ原",
-        "difficulty": "初級",
-        "duration_min": 50,
-        "child_friendly": true,
-        "route_name": "矢島口ルート",
-        "segment_name": "祓川小屋〜御田ヶ原"
-      },
       "geometry": {
-        "type": "LineString",
-        "coordinates": [[140.0020, 39.0530], [140.0050, 39.0570]]
+        "type": "Point",
+        "coordinates": [140.068203, 39.130235]
+      },
+      "properties": {
+        "name": "分岐点1"
       }
     },
     {
       "type": "Feature",
-      "properties": {
-        "from": "御田ヶ原",
-        "to": "七高山",
-        "difficulty": "中級",
-        "duration_min": 70,
-        "child_friendly": false,
-        "route_name": "矢島口ルート",
-        "segment_name": "御田ヶ原〜七高山"
-      },
       "geometry": {
-        "type": "LineString",
-        "coordinates": [[140.0050, 39.0570], [140.0080, 39.0590]]
+        "type": "Point",
+        "coordinates": [140.068249, 39.130071]
+      },
+      "properties": {
+        "name": "祓川ヒュッテ"
       }
     },
     {
       "type": "Feature",
-      "properties": {
-        "from": "七高山",
-        "to": "山頂",
-        "difficulty": "中級",
-        "duration_min": 30,
-        "child_friendly": false,
-        "route_name": "矢島口ルート",
-        "segment_name": "七高山〜山頂"
-      },
       "geometry": {
-        "type": "LineString",
-        "coordinates": [[140.0080, 39.0590], [140.0100, 39.0615]]
+        "type": "Point",
+        "coordinates": [140.067602, 39.131467]
+      },
+      "properties": {
+        "name": "展望台"
       }
     },
     {
       "type": "Feature",
-      "properties": {
-        "from": "鉾立登山口",
-        "to": "河原宿",
-        "difficulty": "初級",
-        "duration_min": 60,
-        "child_friendly": true,
-        "route_name": "鉾立ルート",
-        "segment_name": "鉾立登山口〜河原宿"
-      },
       "geometry": {
-        "type": "LineString",
-        "coordinates": [[139.9600, 39.0850], [139.9720, 39.0780]]
+        "type": "Point",
+        "coordinates": [140.067122, 39.127765]
+      },
+      "properties": {
+        "name": "祓川神社"
       }
     },
     {
       "type": "Feature",
-      "properties": {
-        "from": "河原宿",
-        "to": "七高山",
-        "difficulty": "中級",
-        "duration_min": 80,
-        "child_friendly": false,
-        "route_name": "鉾立ルート",
-        "segment_name": "河原宿〜七高山"
+      "geometry": {
+        "type": "Point",
+        "coordinates": [140.068890, 39.126130]
       },
+      "properties": {
+        "name": "赤滝"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [140.066076, 39.130431]
+      },
+      "properties": {
+        "name": "竜ヶ原湿原"
+      }
+    },
+    // エッジ (Edges/Paths)
+    {
+      "type": "Feature",
       "geometry": {
         "type": "LineString",
-        "coordinates": [[139.9720, 39.0780], [140.0080, 39.0590]]
+        "coordinates": [
+          [140.068750, 39.131594], // 駐車場
+          [140.068203, 39.130235]  // 分岐点1
+        ]
+      },
+      "properties": {
+        "name": "駐車場 - 分岐点1"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [140.068203, 39.130235], // 分岐点1
+          [140.067602, 39.131467]  // 展望台
+        ]
+      },
+      "properties": {
+        "name": "分岐点1 - 展望台"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [140.068203, 39.130235], // 分岐点1
+          [140.067122, 39.127765]  // 祓川神社
+        ]
+      },
+      "properties": {
+        "name": "分岐点1 - 祓川神社"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [140.067602, 39.131467], // 展望台
+          [140.067122, 39.127765]  // 祓川神社
+        ]
+      },
+      "properties": {
+        "name": "展望台 - 祓川神社"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [140.067122, 39.127765], // 祓川神社
+          [140.068890, 39.126130]  // 赤滝
+        ]
+      },
+      "properties": {
+        "name": "祓川神社 - 赤滝"
       }
     }
   ]
 }
+
+// ## point
+// 駐車場：39.131594, 140.068750
+// 分岐点1：39.130235, 140.068203
+// 祓川ヒュッテ（矢島祓川ヒュッテ）：39.130071, 140.068249
+// 展望台：39.131467, 140.067602
+// 祓川神社：39.127765, 140.067122
+// 赤滝：39.126130, 140.068890
+// 竜ヶ原湿原：39.130431, 140.066076
+
+// ## edge
+// 駐車場→分岐点1
+// 分岐点1→展望台
+// 分岐点1→祓川神社
+// 展望台→祓川神社
+// 祓川神社→赤滝

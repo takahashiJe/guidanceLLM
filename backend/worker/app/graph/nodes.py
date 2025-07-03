@@ -148,6 +148,7 @@ def rag_synthesis_node(state: GraphState) -> dict:
     # 応答生成に特化したプロンプトを作成
     synthesis_prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT_TEMPLATE.format(
+            user_id=state.get("user_id", "unknown_user"), #追加
             visit_plan_summary=summary,
             knowledge_base_context=knowledge_base_context
         )),
@@ -363,45 +364,54 @@ def handle_rejection_node(state: GraphState) -> dict:
     }
 
 def handle_visit_plan_result_node(state: GraphState) -> dict:
-    """`check_and_plan_visit`ツールの結果に応じて応答を生成する。"""
+    """
+    manage_visit_planツールの結果を正しく処理し、最終的な応答と状態を生成する。
+    """
     try:
+        # ツールが返した生のJSON文字列を取得
         tool_output_str = state["messages"][-1].content
-        plan_result = ast.literal_eval(tool_output_str)
+        plan_result = json.loads(tool_output_str) # 必ずjson.loads()を使用
         status = plan_result.get("status")
-        response_message = "計画を登録しました。" # デフォルトメッセージ
+
+        response_message = "計画を登録しました。"
         final_visit_plan_data = None
 
         if status == "saved":
-            # visit_dateの文字列をdateオブジェクトに変換
-            visit_date_obj = date.fromisoformat(plan_result.get("visit_date")).date()
-            
-            # stateに保存するためのデータを作成
+            # "YYYY-MM-DD" 形式の文字列を、date.fromisoformatで直接dateオブジェクトに変換
+            visit_date_obj = date.fromisoformat(plan_result.get("visit_date"))
+
+            # GraphStateに保存するための、型が保証されたデータを作成
             final_visit_plan_data = {
                 "spot_name": plan_result.get("spot_name"),
                 "visit_date": visit_date_obj
             }
 
-            # 混雑状況に応じたメッセージを作成
+            # ユーザーへの応答メッセージを作成
             if plan_result.get("is_congested"):
                 response_message = f"{visit_date_obj.strftime('%-m月%-d日')}の「{plan_result.get('spot_name')}」への計画を登録しましたが、当日は混雑が予想されます。別の日も検討しますか？"
             else:
                 response_message = f"{visit_date_obj.strftime('%-m月%-d日')}の「{plan_result.get('spot_name')}」への計画を登録しました。"
-        
-        elif status == "invalid_spot" or status == "error":
-            response_message = plan_result.get("message", "エラーが発生しました。")
+
+        elif status in ["invalid_spot", "error", "not_found", "deleted"]:
+            # ツールが返したエラーメッセージなどをそのまま応答にする
+            response_message = plan_result.get("message", "処理が完了しましたが、メッセージはありません。")
 
         else:
+            # 予期せぬステータスの場合
             response_message = "計画の確認中に予期せぬエラーが発生しました。"
-        
-        # 最終的なstateとメッセージを返す
+
+        # 最終的な応答メッセージと、更新された訪問計画を返す
         return {
             "messages": [AIMessage(content=response_message)],
             "visit_plan": final_visit_plan_data
         }
-    except (ValueError, SyntaxError):
-        response_message = "計画の確認結果を正しく処理できませんでした。"
-        
-    return {"messages": [AIMessage(content=response_message)]}
+
+    except (json.JSONDecodeError, ValueError, TypeError, SyntaxError) as e:
+        # このブロックでエラーが発生した場合のログ出力
+        print(f"---!!! ERROR IN handle_visit_plan_result_node !!!---")
+        traceback.print_exc()
+        response_message = "計画の確認結果を正しく処理できませんでした。システム管理者にご確認ください。"
+        return {"messages": [AIMessage(content=response_message)]}
 
 def generate_simple_response_node(state: GraphState) -> dict:
     """雑談や簡単な質問に対する応答を生成する。"""
