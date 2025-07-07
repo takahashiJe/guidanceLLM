@@ -11,6 +11,7 @@ from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain.agents import create_tool_calling_agent
 from datetime import date
+import inspect
 
 # --- サービスのインポート ---
 # from app.services import planning_service
@@ -269,12 +270,23 @@ def tool_executor_node(state: GraphState) -> dict:
     tool_messages = []
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-        print(f"Executing tool: {tool_name} with args: {tool_args}")
-
+        # AIが生成した引数をコピー
+        tool_args = tool_call["args"].copy()
+        
         tool_to_call = next((t for t in available_tools if t.name == tool_name), None)
         
         if tool_to_call:
+            # ツールの引数シグネチャを検査
+            tool_signature = inspect.signature(tool_to_call.func)
+            
+            # Stateに存在する共通引数を自動で注入する
+            if 'user_id' in tool_signature.parameters and 'user_id' not in tool_args:
+                tool_args['user_id'] = state.get('user_id')
+            if 'language' in tool_signature.parameters and 'language' not in tool_args:
+                tool_args['language'] = state.get('language')
+            
+            print(f"Executing tool: {tool_name} with args: {tool_args}")
+
             try:
                 tool_output = tool_to_call.invoke(tool_args)
                 tool_messages.append(ToolMessage(content=json.dumps(tool_output, ensure_ascii=False), tool_call_id=tool_call['id']))
@@ -384,7 +396,7 @@ def handle_visit_plan_result_node(state: GraphState) -> dict:
         status = plan_result.get("status")
 
         response_message = "計画を登録しました。"
-        final_visit_plan_data = None
+        final_visit_plan_data: Optional[VisitPlanState] = None
 
         if status == "saved":
             # "YYYY-MM-DD" 形式の文字列を、date.fromisoformatで直接dateオブジェクトに変換

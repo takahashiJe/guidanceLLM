@@ -3,7 +3,14 @@
 from typing import TypedDict, List, Optional, Literal, Annotated, Tuple
 from langchain_core.messages import BaseMessage
 import operator
+from datetime import date
 from .schemas import VisitPlanResponse, ActionPayload
+
+class VisitPlanState(TypedDict):
+    """訪問計画の内部状態"""
+    spot_id: str
+    spot_name: str
+    visit_date: date
 
 class GraphState(TypedDict):
     """LangGraph全体で共有される状態"""
@@ -16,8 +23,7 @@ class GraphState(TypedDict):
     user_id: Optional[str]
     current_location: Optional[Tuple[float, float]]
 
-    # 訪問計画を保持するフィールド．データベースから取得した計画情報を会話中に一時的に保持する
-    visit_plan: Optional[VisitPlanResponse]
+    visit_plan: Optional[VisitPlanState]
 
     intent: Optional[Literal["greeting", "general_question", "route_request", "plan_visit_request", "affirmative", "negative"]]
     tool_outputs: Optional[List[dict]]

@@ -2,10 +2,11 @@
 # 訪問計画を立てられる場所のリストを提供するサービス
 
 import json
-from typing import List
+from typing import List, Dict, Any, Optional
+from thefuzz import process
 
 # Dockerコンテナ内のパスを指定
-PLANNING_SPOTS_PATH = "/code/app/data/POI.json"
+POI_DATA_PATH = "/code/app/data/POI.json"
 
 # POIデータをキャッシュする変数
 _poi_data: List[Dict[str, Any]] = []
