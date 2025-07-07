@@ -209,38 +209,6 @@ def knowledge_base_search(query: str) -> str:
     print(f"--- Tool: knowledge_base_search ---\nOutput (Summary):\n{summary}")
     return summary
 
-
-# ==============================================================================
-# --- 4. 訪問計画管理ツール  ---
-# ==============================================================================
-# class ManageVisitPlanInput(BaseModel):
-#     """
-#     訪問計画を総合的に管理するツールへの入力スキーマ。
-#     ユーザーの意図に応じて、AIがactionを選択し、必要な引数を設定する。
-#     """
-#     user_id: str = Field(description="操作対象のユーザーID。")
-#     action: Literal["save", "delete", "check_range"] = Field(description="実行する操作の種類。'save'は計画の保存/更新、'delete'は削除、'check_range'は期間内の混雑確認。")
-#     spot_name: Optional[str] = Field(None, description="計画の対象となるスポット名。actionが'save'または'check_range'の場合に必要。")
-#     visit_date: Optional[date] = Field(None, description="計画する特定の日付。actionが'save'の場合に必要。")
-#     start_date: Optional[date] = Field(None, description="混雑状況を確認する期間の開始日。actionが'check_range'の場合に必要。")
-#     end_date: Optional[date] = Field(None, description="混雑状況を確認する期間の終了日。actionが'check_range'の場合に必要。")
-
-#     @validator("visit_date", "start_date", "end_date", pre=True, always=True)
-#     def parse_flexible_date_str(cls, v):
-#         """
-#         AIが生成した自然言語の日付表現を含む文字列を、dateオブジェクトに変換する。
-#         """
-#         if isinstance(v, str):
-#             try:
-#                 # dateutil.parser.parseで柔軟に日付文字列を解釈
-#                 return parse(v).date()
-#             except (ValueError, TypeError):
-#                 # 解釈に失敗した場合はエラー
-#                 raise ValueError(f"日付として認識できない形式です: '{v}'。")
-#         # すでにdateオブジェクトであるか、Noneの場合はそのまま返す
-#         return v
-
-# @tool(args_schema=ManageVisitPlanInput)
 @tool
 def manage_visit_plan(
     user_id: str,
