@@ -46,11 +46,6 @@ def _load_and_build_graph():
             start_node = tuple(coords[0])
             end_node = tuple(coords[-1])
             
-            # ★★★ ここからが修正箇所 ★★★
-            # 'start_name' -> 'from'
-            # 'end_name'   -> 'to'
-            # に変更します。
-            
             # 地名がpropertiesにある場合のみ辞書に追加
             if 'from' in feature['properties']:
                 from_name = feature['properties']['from']
@@ -61,7 +56,6 @@ def _load_and_build_graph():
                 to_name = feature['properties']['to']
                 _node_coordinates[end_node] = to_name
                 _location_name_to_coords[to_name] = end_node
-            # ★★★ ここまで修正箇所 ★★★
 
             line_length = 0
             for i in range(len(coords) - 1):

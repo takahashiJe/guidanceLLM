@@ -5,7 +5,7 @@ import ast
 import uuid
 import json
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
 from langchain_core.agents import AgentAction, AgentFinish
 from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
@@ -19,6 +19,7 @@ from datetime import date
 from shared.state import GraphState
 from app.graph.tools import available_tools
 from app.rag import retriever
+from app.graph.intent_tools import intent_classification_tools
 
 # --- Agentのセットアップ ---
 # この部分はアプリケーション起動時に一度だけ実行されるのが望ましい
@@ -285,35 +286,44 @@ def tool_executor_node(state: GraphState) -> dict:
     return {"messages": tool_messages}
 
 def classify_intent_node(state: GraphState) -> dict:
-    """ユーザーのメッセージから意図を分類する。"""
-    user_message = state["messages"][-1].content
-    
-    prompt_template = ChatPromptTemplate.from_template(
-        """ユーザーのメッセージを分析し、以下の意図のうち最も適切なものを一つだけ選んでください。
-        - greeting: 単純な挨拶や雑談
-        - general_question: ルートや訪問計画以外の一般的な質問
-        - route_request: ルートの提案を求める要求
-        - plan_visit_request: 訪問計画に関する要求
+    """
+    ユーザーのメッセージを分析し、LLMのTool-Binding機能を使って意図を決定する。
+    """
+    print("--- Intent Classification Node (Tool-Binding) ---")
+    user_message = state["messages"][-1] # HumanMessageオブジェクトを直接取得
 
-        ユーザーメッセージ: "{message}"
-        意図: """
-        )
+    # 1. LLMに意図選択ツールを直接バインドする
+    llm_with_intent_tools = llm.bind_tools(intent_classification_tools)
+
+    # 2. 意図分類のためのシンプルなメッセージリストを作成
+    #    システムプロンプトの役割を担う指示メッセージを追加
+    system_instruction = "あなたはユーザーのメッセージの意図を分析する専門家です。提示されたツールの中から、ユーザーの意図に最も合致するものを「必ず1つだけ」選択してください。"
     
-    # LLMを使って意図を分類する小さなチェーン
-    classification_chain = prompt_template | llm | StrOutputParser()
-    intent = classification_chain.invoke({"message": user_message})
+    messages_for_classification = [
+        HumanMessage(content=system_instruction),
+        user_message # ユーザーの実際のメッセージ
+    ]
     
-    # 想定される意図に変換
-    if "greeting" in intent:
-        classified_intent = "greeting"
-    elif "general_question" in intent:
-        classified_intent = "general_question"
-    elif "route_request" in intent:
-        classified_intent = "route_request"
-    elif "plan_visit_request" in intent:
-        classified_intent = "plan_visit_request"
-    else:
-        classified_intent = "general_question" # 不明な場合は汎用的な質問として扱う
+    # 3. LLMを直接呼び出し、応答を取得
+    ai_response = llm_with_intent_tools.invoke(messages_for_classification)
+
+    # 4. LLMの応答にツールコールが含まれているか確認し、意図を決定
+    classified_intent = "general_question"  # デフォルト値
+
+    # ai_response.tool_calls に、LLMが呼び出すと判断したツールのリストが入る
+    if ai_response.tool_calls:
+        # 最初のツールコールの名前を取得
+        tool_name = ai_response.tool_calls[0]['name']
+        
+        if tool_name == "select_route_request_intent":
+            classified_intent = "route_request"
+        elif tool_name == "select_plan_visit_request_intent":
+            classified_intent = "plan_visit_request"
+        elif tool_name == "select_greeting_intent":
+            classified_intent = "greeting"
+
+    print(f"User Message: {user_message.content}")
+    print(f"Classified Intent: {classified_intent}")
 
     return {"intent": classified_intent}
 
