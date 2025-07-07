@@ -47,6 +47,7 @@ class VisitPlan(Base):
     __tablename__ = "visit_plans"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.user_id"), nullable=False, index=True)
+    spot_id = Column(String, nullable=False, index=True)
     spot_name = Column(String, nullable=False, index=True)
     visit_date = Column(DateTime, nullable=False, index=True)
     

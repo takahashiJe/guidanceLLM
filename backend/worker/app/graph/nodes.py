@@ -392,6 +392,7 @@ def handle_visit_plan_result_node(state: GraphState) -> dict:
 
             # GraphStateに保存するための、型が保証されたデータを作成
             final_visit_plan_data = {
+                "spot_id": plan_result.get("spot_id"),
                 "spot_name": plan_result.get("spot_name"),
                 "visit_date": visit_date_obj
             }

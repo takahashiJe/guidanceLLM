@@ -31,38 +31,6 @@ summarize_llm = ChatOllama(
 )
 
 # ==============================================================================
-# --- 1. 地名正規化ツール ---
-# ==============================================================================
-class NormalizeNamesInput(BaseModel):
-    """normalize_location_namesツールへの入力スキーマ。"""
-    start: str = Field(description="正規化が必要な出発地の名称。")
-    end: str = Field(description="正規化が必要な目的地の名称。")
-
-@tool(args_schema=NormalizeNamesInput)
-def normalize_location_names(start: str, end: str) -> Dict[str, str]:
-    """
-    ユーザーが指定した出発地と目的地の名称を、既知の地名リストと照合し、
-    最も可能性の高い正式名称を特定する。「現在地」は特別なキーワードとしてそのまま扱う。
-    """
-    known_locations = route_service.get_known_locations()
-    if not known_locations:
-        print("Warning: Known locations list is empty. Returning original names.")
-        return {"start_point": start, "end_point": end}
-
-    end_match = process.extractOne(end, known_locations)
-    best_end_match = end_match[0] if end_match else end
-    
-    if start == "現在地":
-        best_start_match = "現在地"
-    else:
-        start_match = process.extractOne(start, known_locations)
-        best_start_match = start_match[0] if start_match else start
-
-    result = {"start_point": best_start_match, "end_point": best_end_match}
-    print(f"--- Tool: normalize_location_names --- \nInput: start='{start}', end='{end}'\nOutput: {result}")
-    return result
-
-# ==============================================================================
 # --- 2. ルート計算ツール（再設計） ---
 # ==============================================================================
 class CalculateRouteInput(BaseModel):
@@ -213,6 +181,7 @@ def knowledge_base_search(query: str) -> str:
 def manage_visit_plan(
     user_id: str,
     action: Literal["save", "delete", "check_range"],
+    language: str,
     spot_name: Optional[str] = None,
     visit_date: Optional[str] = None,
     start_date: Optional[str] = None,
@@ -235,32 +204,40 @@ def manage_visit_plan(
 
     db = SessionLocal()
     try:
-        # --- 場所の検証 ---
-        if spot_name:
-            plannable_spots = planning_spot_service.get_plannable_spots()
-            if spot_name not in plannable_spots:
-                # thefuzzで最も近い候補を提示
-                best_match, score = process.extractOne(spot_name, plannable_spots)
-                if score > 80:
-                    return {"status": "invalid_spot", "message": f"「{spot_name}」という場所は計画できませんでした。もしかして「{best_match}」のことですか？"}
-                else:
-                    return {"status": "invalid_spot", "message": f"「{spot_name}」という場所は計画できませんでした。"}
+        target_spot_id = None
+        target_spot_name = None
+        # アクションが 'save' または 'check_range' の場合、まずスポットを正規化する
+        if action in ["save", "check_range"]:
+            if not spot_name:
+                 return {"status": "error", "message": "場所の名前が指定されていません。"}
+            
+            # 1. 新しいplanning_spot_serviceを使ってスポットを正規化
+            normalized_spot = planning_spot_service.normalize_spot_by_language(spot_name, language)
+            
+            if not normalized_spot:
+                # thefuzzを使ったサジェスト機能はサービス側に集約しても良いが、ツール側でも可能
+                return {"status": "invalid_spot", "message": f"「{spot_name}」という場所は見つかりませんでした。"}
 
+            # 2. 正規化された情報を取得
+            target_spot_id = normalized_spot["spot_id"]
+            target_spot_name = normalized_spot["official_name"][language]
+        
         # --- アクションの実行 ---
         result = None
         if action == "save":
-            if not all([spot_name, parsed_visit_date]):
+            if not all([target_spot_id, target_spot_name, parsed_visit_date]):
                 return {"status": "error", "message": "計画の保存には場所と日付の両方が必要です。"}
-            # 正しくdbセッションを渡す
-            result = planning_service.process_plan_creation(db, user_id, spot_name, parsed_visit_date)
+            # 3. 取得したIDと名前をplanning_serviceに渡す
+            result = planning_service.process_plan_creation(db, user_id, target_spot_id, target_spot_name, parsed_visit_date)
 
         elif action == "delete":
             result = planning_service.process_plan_deletion(db, user_id)
 
         elif action == "check_range":
-            if not all([spot_name, parsed_start_date, parsed_end_date]):
+            if not all([target_spot_id, target_spot_name, parsed_start_date, parsed_end_date]):
                 return {"status": "error", "message": "期間の混雑確認には場所と開始日、終了日が必要です。"}
-            result = planning_service.process_plan_range_check(db, spot_name, parsed_start_date, parsed_end_date)
+            # 4. check_rangeでも取得したIDと名前を渡す
+            result = planning_service.process_plan_range_check(db, target_spot_id, target_spot_name, parsed_start_date, parsed_end_date)
             
         else:
             result = {"status": "error", "message": f"不明なアクション: {action}"}
@@ -290,8 +267,6 @@ def manage_visit_plan(
 
 # --- LangChainエージェントが利用可能なツールのリスト ---
 available_tools = [
-    normalize_location_names, 
-    calculate_route, 
     knowledge_base_search, 
     manage_visit_plan, 
     query_knowledge_graph

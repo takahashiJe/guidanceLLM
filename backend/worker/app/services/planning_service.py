@@ -29,38 +29,51 @@ def get_plan(db: Session, user_id: str) -> Optional[models.VisitPlan]:
         return None
     return db.query(models.VisitPlan).filter(models.VisitPlan.user_id == user.user_id).first()
 
-def check_congestion_on_date(db: Session, spot_name: str, visit_date: date) -> int:
+def check_congestion_on_date(db: Session, spot_id: str, visit_date: date) -> int:
+    """
+    指定されたspot_idと日付の計画数をカウントする。
+    """
     return db.query(models.VisitPlan).filter(
-        models.VisitPlan.spot_name == spot_name,
+        models.VisitPlan.spot_id == spot_id,
         func.date(models.VisitPlan.visit_date) == visit_date
     ).count()
 
-def get_congestion_for_range(db: Session, spot_name: str, start_date: date, end_date: date) -> Dict[date, int]:
+def get_congestion_for_range(db: Session, spot_id: str, start_date: date, end_date: date) -> Dict[date, int]:
+    """
+    指定されたspot_idと期間の計画数を日毎に集計する。
+    """
     results = db.query(
         func.date(models.VisitPlan.visit_date).label("visit_day"),
         func.count(models.VisitPlan.id).label("plan_count")
     ).filter(
-        models.VisitPlan.spot_name == spot_name,
+        models.VisitPlan.spot_id == spot_id, 
         func.date(models.VisitPlan.visit_date).between(start_date, end_date)
     ).group_by("visit_day").all()
     return {result.visit_day: result.plan_count for result in results}
 
-def process_plan_creation(db: Session, user_id: str, spot_name: str, visit_date: date) -> Dict[str, Any]:
+def process_plan_creation(db: Session, user_id: str, spot_id: str, spot_name: str, visit_date: date) -> Dict[str, Any]:
     try:
         user = get_or_create_user(db, user_id)
         existing_plan = get_plan(db, user_id)
 
         if existing_plan:
+            existing_plan.spot_id = spot_id
             existing_plan.spot_name = spot_name
             existing_plan.visit_date = visit_date
         else:
-            new_plan = models.VisitPlan(user_id=user.user_id, spot_name=spot_name, visit_date=visit_date)
+            new_plan = models.VisitPlan(
+                user_id=user.user_id, 
+                spot_id=spot_id,
+                spot_name=spot_name, 
+                visit_date=visit_date
+            )
             db.add(new_plan)
 
-        congestion_level = check_congestion_on_date(db, spot_name, visit_date)
+        congestion_level = check_congestion_on_date(db, spot_id, visit_date)
         
         return {
             "status": "saved",
+            "spot_id": spot_id,
             "spot_name": spot_name,
             "visit_date": visit_date.isoformat(),
             "congestion": congestion_level,
@@ -70,12 +83,17 @@ def process_plan_creation(db: Session, user_id: str, spot_name: str, visit_date:
         traceback.print_exc()
         return {"status": "error", "message": "計画の保存準備中に予期せぬエラーが発生しました。"}
 
-def process_plan_range_check(db: Session, spot_name: str, start_date: date, end_date: date) -> Dict[str, Any]:
+def process_plan_range_check(db: Session, spot_id: str, spot_name: str, start_date: date, end_date: date) -> Dict[str, Any]:
+    """
+    指定された期間の混雑状況をspot_idを基準にチェックする。
+    """
     try:
-        congestion_map = get_congestion_for_range(db, spot_name, start_date, end_date)
+        # spot_id を渡して混雑度マップを取得
+        congestion_map = get_congestion_for_range(db, spot_id, start_date, end_date)
         formatted_map = {dt.isoformat(): count for dt, count in congestion_map.items()}
         return {
             "status": "checked",
+            "spot_id": spot_id,
             "spot_name": spot_name,
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
