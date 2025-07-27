@@ -1,0 +1,63 @@
+長期記憶の仕組み
+長期記憶は、以下の2つのステップで機能します。
+
+保存時 (save_long_term_memory):
+
+ユーザーの発言とAIの応答を、それぞれDocumentオブジェクトに変換します。
+
+このとき、文書の内容（page_content）に加えて、**誰の会話かを示すuser_id**と、誰が話したかを示すmessage_typeをメタデータとして一緒に保存します。
+
+これらをOllamaEmbeddingsを使ってベクトル化し、Chromaデータベースに保存します。
+
+読み込み時 (get_long_term_memory):
+
+ユーザーの現在の入力メッセージ（query）を受け取ります。
+
+Chromaデータベースに対して、「このuser_idのデータの中から、現在のqueryに意味が最も近いものを5つ探してきてください」という、フィルタリング付きの類似度検索をリクエストします。
+
+user_idでフィルタリングすることにより、他のユーザーの会話が検索結果に混ざることを防ぎます。これが複数ユーザー対応の鍵です。
+
+見つかったDocumentを、メタデータ（message_type）を基にHumanMessageやAIMessageに復元して返します。
+
+tasks.pyでの利用方法
+tasks.py内のprocess_chat_messageタスクは、以下のように変更され、短期記憶と長期記憶の両方を利用します。
+
+# /backend/worker/app/tasks.py (抜粋)
+
+from .services import memory_service
+
+# ... (タスク定義)
+def process_chat_message(request_data: dict) -> dict:
+    try:
+        request = ChatRequest(**request_data)
+
+        # 1. 短期記憶を取得
+        short_term_memory = memory_service.get_short_term_history(request.user_id)
+        
+        # 2. 長期記憶を取得（現在のメッセージに関連する過去の会話）
+        long_term_memory = memory_service.get_long_term_memory(
+            user_id=request.user_id, 
+            query=request.message
+        )
+        
+        # 3. LangGraphの初期状態を作成
+        #    長期記憶 + 短期記憶 + 最新のメッセージ をコンテキストとする
+        initial_state: GraphState = {
+            "messages": long_term_memory + short_term_memory + [HumanMessage(content=request.message)],
+            # ...
+        }
+
+        # 4. LangGraphを実行
+        final_state = compiled_graph.invoke(initial_state)
+
+        # 5. 結果を両方のDBに保存
+        memory_service.save_short_term_history(request.user_id, final_state["messages"])
+        memory_service.save_long_term_memory(request.user_id, final_state["messages"])
+        
+        # ... (結果を返す)
+
+    except Exception as e:
+        # ...
+        raise
+
+この実装により、アプリケーションは単に直近の会話を覚えているだけでなく、数週間前の「いつか鳥海山に行きたいんだ」といった発言を思い出し、「以前お話しされていた鳥海山の件ですね！具体的に計画を立てますか？」といった、より高度で文脈を理解した応答が可能になります。

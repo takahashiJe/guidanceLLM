@@ -1,0 +1,42 @@
+# Web framework
+fastapi>=0.111.0
+uvicorn
+
+# LangChain core & components & langgraph
+# ★★★ コアライブラリのバージョンを、全ライブラリの要求を満たすものに修正 ★★★
+langchain==0.2.5
+langchain-community==0.2.5
+langchain-core==0.2.20  # ★★★ このバージョンは、>=0.2.7, >=0.2.0, そして >=0.2.20 の全ての要求を満たします ★★★
+langchain-ollama==0.1.0
+langchain-experimental==0.0.61
+langchain-text-splitters==0.2.1
+langgraph==0.0.69
+
+# LLMs
+openai>=1.1.1
+transformers
+torch
+accelerate
+
+# その他ユーティリティ
+thefuzz
+python-Levenshtein
+
+# 地理系ツール
+geopandas
+networkx
+
+# celeryとredisクライアント
+pika
+celery
+redis
+
+# ベクトルDB
+# ★★★ こちらは最初のTypeErrorを回避するため、0.4.24で固定 ★★★
+chromadb>=0.5.3
+
+psycopg2-binary
+unstructured
+markdown-it-py
+markdown
+python-dateutil

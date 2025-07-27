@@ -1,0 +1,115 @@
+# docker-compose.yml (開発用)
+
+services:
+  db-init:
+    profiles: ["api"]
+    build:
+      context: .
+      dockerfile: ./backend/api_gateway/Dockerfile
+      target: development # デフォルトは開発ステージ
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "/app/script/init_db.py"]
+  # --- API Gateway ---
+  api_gateway:
+    profiles: ["api"]
+    build:
+      context: .
+      dockerfile: ./backend/api_gateway/Dockerfile
+      target: development # デフォルトは開発ステージ
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # --- Worker ---
+  worker:
+    profiles: ["worker"]
+    build:
+      context: .
+      dockerfile: ./backend/worker/Dockerfile
+      target: development
+    env_file: .env
+    volumes:
+      # ベクトルストアのデータは永続化する
+      - ./backend/worker/data/vectorstore_knowledge:/app/worker/data/vectorstore_knowledge
+      - ./backend/worker/data/vectorstore_memory:/app/worker/data/vectorstore_memory
+    depends_on:
+      ollama:
+        condition: service_started
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # --- Ollama ---
+  ollama:
+    profiles: ["worker"]
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # --- Redis ---
+  redis:
+    profiles: ["api"]
+    image: redis:7.2-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Database ---
+  db:
+    profiles: ["api"]
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./mysql/custom.cnf:/etc/mysql/conf.d/custom.cnf
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      interval: 15s      # 確認の間隔を15秒に
+      timeout: 10s       # タイムアウトを10秒に
+      retries: 10        # リトライ回数を10回に
+      start_period: 180s  # 起動後、最初の60秒はチェックを待つ
+  
+# --- Frontend (開発用) ---
+  frontend:
+    profiles: ["api"]
+    # frontendプロジェクトのルートディレクトリをビルドコンテキストとして指定
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile # frontend/OC_guidanceLLM/Dockerfile を参照
+    ports:
+      # ホストの5173番ポートをコンテナの5173番に接続 (Viteのデフォルト)
+      - "5173:5173" 
+    volumes:
+      # ソースコードの変更を即時反映させる
+      - ./frontend/OC_guidanceLLM:/app
+      # node_modulesはホストと共有しない(パフォーマンスと環境差異のため)
+      - /app/node_modules
+
+volumes:
+  db_data:
+  ollama_data:

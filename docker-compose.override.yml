@@ -1,0 +1,63 @@
+# docker-compose.yml (開発用)
+
+services:
+  db-init:
+    volumes:
+      - ./backend/shared:/app/shared
+      - ./script:/app/script
+  
+  # --- API Gateway ---
+  api_gateway:
+    volumes:
+      # 開発中はソースコードの変更を即時反映させる
+      - ./backend/api_gateway:/app/api_gateway
+      - ./backend/shared:/app/shared
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "api_gateway.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  # --- Worker ---
+  worker:
+    volumes:
+      # 開発中はソースコードの変更を即時反映させる
+      - ./backend/worker:/app/worker
+      - ./backend/shared:/app/shared
+      - ./backend/worker/data/vectorstore_knowledge:/app/worker/data/vectorstore_knowledge
+      - ./backend/worker/data/vectorstore_memory:/app/worker/data/vectorstore_memory
+      - ./script:/app/script
+    command: ["celery", "-A", "shared.celery_app.celery_app", "worker", "--loglevel=info", "--pool=threads", "--concurrency=1"]
+
+  # --- Ollama ---
+  ollama:
+    ports:
+      - "11434:11434"
+
+  # --- Redis ---
+  redis:
+    ports:
+      - "6379:6379"
+
+  # --- Database ---
+  db:
+    ports:
+      - "3306:3306"
+  
+# # --- Frontend (開発用) ---
+#   frontend:
+#     profiles: ["api"]
+#     # frontendプロジェクトのルートディレクトリをビルドコンテキストとして指定
+#     build:
+#       context: ./frontend
+#       dockerfile: Dockerfile # frontend/OC_guidanceLLM/Dockerfile を参照
+#     ports:
+#       # ホストの5173番ポートをコンテナの5173番に接続 (Viteのデフォルト)
+#       - "5173:5173" 
+#     volumes:
+#       # ソースコードの変更を即時反映させる
+#       - ./frontend/OC_guidanceLLM:/app # ★★★ ここを修正 ★★★
+#       # node_modulesはホストと共有しない(パフォーマンスと環境差異のため)
+#       - /app/node_modules
+#     depends_on:
+#       # API Gatewayが起動してからフロントエンドを起動する
+#       api_gateway: # ★★★ サービス名のみでOK ★★★
+#         condition: service_started # API Gatewayが起動するまで待つ
