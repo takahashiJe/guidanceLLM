@@ -1,128 +1,89 @@
-# docker-compose.yml (開発用)
+# docker-compose.yml
+version: '3.8'
 
 services:
-  db-init:
-    profiles: ["api"]
-    build:
-      context: .
-      dockerfile: ./backend/api_gateway/Dockerfile
-      target: development # デフォルトは開発ステージ
+  frontend:
+    ports: ["8501:8501"]
+    depends_on: [api_gateway]
+    profiles: ["api"] # apiプロファイルに所属
+
+  api_gateway:
+    env_file: .env
+    environment: { REDIS_HOST: redis }
+    depends_on: [redis, db]
+    profiles: ["api"] # apiプロファイルに所属
+
+  worker:
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    runtime: nvidia
     env_file: .env
     environment:
-      - PYTHONPATH=/app
-    depends_on:
-      db:
-        condition: service_healthy
-    command: ["python", "/app/script/init_db.py"]
-  # --- API Gateway ---
-  api_gateway:
-    profiles: ["api"]
-    build:
-      context: .
-      dockerfile: ./backend/api_gateway/Dockerfile
-      target: development # デフォルトは開発ステージ
-    env_file: .env
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_started
+      - REDIS_HOST=redis
+      - OLLAMA_HOST=http://ollama:11434
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB} # ホスト名をdbに変更
+    depends_on: [ollama, redis, db, osrm, osrm-foot, nominatim]
+    profiles: ["worker"] # workerプロファイルに所属
 
-  # --- Worker ---
-  worker:
-    profiles: ["worker"]
-    build:
-      context: .
-      dockerfile: ./backend/worker/Dockerfile
-      target: development
-    env_file: .env
-    volumes:
-      # ベクトルストアのデータは永続化する
-      - ./backend/worker/data/vectorstore_knowledge:/app/worker/data/vectorstore_knowledge
-      - ./backend/worker/data/vectorstore_memory:/app/worker/data/vectorstore_memory
-    depends_on:
-      ollama:
-        condition: service_started
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  # --- Ollama ---
   ollama:
-    profiles: ["worker"]
     image: ollama/ollama:latest
-    volumes:
-      - ollama_data:/root/.ollama
+    ports: ["11434:11434"]
+    volumes: [ollama_data:/root/.ollama]
     deploy:
       resources:
         reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    runtime: nvidia
+    profiles: ["worker"] # workerプロファイルに所属
 
-  # --- Redis ---
   redis:
-    profiles: ["api"]
-    image: redis:7.2-alpine
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    profiles: ["api", "worker"] # 両方から使われる
+
+  db: # サービス名をpostgresからdbに変更
+    image: postgres:15-alpine
+    env_file: .env
+    ports: ["5432:5432"]
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    profiles: ["api", "worker"] # 両方から使われる
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
       timeout: 5s
       retries: 5
 
-  # --- Database ---
-  db:
-    profiles: ["api"]
-    image: mysql:8.0
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-    volumes:
-      - db_data:/var/lib/mysql
-      - ./mysql/custom.cnf:/etc/mysql/conf.d/custom.cnf
-    healthcheck:
-      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
-      interval: 15s      # 確認の間隔を15秒に
-      timeout: 10s       # タイムアウトを10秒に
-      retries: 10        # リトライ回数を10回に
-      start_period: 180s  # 起動後、最初の60秒はチェックを待つ
-  
-  ollama:
-    profiles: ["worker"]
-    image: ollama/ollama:latest
-    volumes:
-      - ollama_data:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+  osrm:
+    image: osrm/osrm-backend:v5.27.1
+    ports: ["5000:5000"]
+    volumes: [osrm_data:/data]
+    command: osrm-routed --algorithm mld /data/japan-latest.osrm
+    profiles: ["worker"] # workerプロファイルに所属
+
+  osrm-foot:
+    image: osrm/osrm-backend:v5.27.1
+    ports: ["5001:5000"]
+    volumes: [osrm_data_foot:/data]
+    command: osrm-routed --algorithm mld /data/japan-latest-foot.osrm
+    profiles: ["worker"] # workerプロファイルに所属
+
   nominatim:
-    profiles: ["worker"]
     image: mediagis/nominatim:4.4
-    ports:
-      - "8080:8080"
+    ports: ["8080:8080"]
     environment:
-      - PBF_PATH=/data/tohoku-latest.osm.pbf # OSRMと同じOSMデータを使用
-      - REPLICATION_URL=http://download.geofabrik.de/asia/japan/tohoku-updates
+      - PBF_PATH=/data/japan-latest.osm.pbf
+      - REPLICATION_URL=http://download.geofabrik.de/asia/japan-updates
     volumes:
-      - ./tohoku-latest.osm.pbf:/data/tohoku-latest.osm.pbf:ro # OSRM用にダウンロードしたファイルをマウント
+      - ./japan-latest.osm.pbf:/data/japan-latest.osm.pbf:ro
       - nominatim_data:/var/lib/postgresql/14/main
-    depends_on:
-      - postgres # NominatimはDBを必要とするため
+    depends_on: [db]
+    profiles: ["worker"] # workerプロファイルに所属
 
 volumes:
-  db_data:
   ollama_data:
-  osrm:
-  osrm-foot:
+  postgres_data:
+  osrm_data:
+  osrm_data_foot:
   nominatim_data:

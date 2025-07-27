@@ -11,4 +11,4 @@ backend/worker/llm_models/
 # Dockerが生成するファイルを無視する
 ollama_data/
 
-.env
+.env*

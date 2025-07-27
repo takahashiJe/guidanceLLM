@@ -1,31 +1,15 @@
-# docker-compose.prod.yml (本番用)
+# docker-compose.prod.yml
+version: '3.8'
 
 services:
-  db-init:
-    build:
-      target: production
-  # --- API Gateway ---
+  frontend:
+    build: { context: ./frontend }
+
   api_gateway:
-    env_file: .env.gateway
-    build:
-      target: production
-    ports:
-      - "8000:8000"
-    restart: always
+    build: { context: ., target: production-api }
+    ports: ["8000:8000"]
+    command: uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000
 
-  # --- Worker ---
   worker:
-    env_file: .env.worker
-    build:
-      target: production
-    restart: always
-
-  db:
-    ports:
-      - "3306:3306"
-    restart: always
-  
-  redis:
-    ports:
-      - "6379:6379"
-    restart: always
+    build: { context: ., target: production-worker }
+    command: celery -A shared.celery_app:celery_app worker --loglevel=info --pool=threads --concurrency=1
