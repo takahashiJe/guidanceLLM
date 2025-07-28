@@ -6,14 +6,14 @@ from typing import List
 from langchain_core.messages import BaseMessage
 
 # 共有モジュールからCeleryインスタンスとスキーマをインポート
-from shared.celery_app import celery_app
-from shared.schemas import ChatRequest, UpdateLocationRequest, ChatResponse, UpdateLocationResponse
-from shared.state import GraphState
+from backend.shared.celery_app import celery_app
+from backend.shared.schemas import ChatRequest, UpdateLocationRequest, ChatResponse, UpdateLocationResponse
+from backend.shared.state import GraphState
 
 # ワーカー内部のモジュールをインポート
-from app.graph.build_graph import compiled_graph
-from app.services import memory_service, route_service, planning_service # DBアクセスやビジネスロジックを担当するサービス
-from app.db.session import SessionLocal # DBセッションを直接利用する場合
+from backend.worker.app.graph.build_graph import compiled_graph
+from backend.worker.app.services import memory_service, route_service, planning_service # DBアクセスやビジネスロジックを担当するサービス
+from backend.worker.app.db.session import SessionLocal # DBセッションを直接利用する場合
 
 
 @celery_app.task

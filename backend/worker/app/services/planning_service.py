@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
-from app.db import models
+from backend.worker.app.db import models
 
 # 混雑と判断する予約数の閾値
 CONGESTION_THRESHOLD = 10

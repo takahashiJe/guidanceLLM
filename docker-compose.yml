@@ -1,17 +1,17 @@
-# docker-compose.yml
-version: '3.8'
+# docker-compose.yml (修正後)
+# version: '3.8' # この行はあってもなくても動作しますが、最新のComposeでは不要です
 
 services:
   frontend:
     ports: ["8501:8501"]
     depends_on: [api_gateway]
-    profiles: ["api"] # apiプロファイルに所属
+    profiles: ["api"]
 
   api_gateway:
     env_file: .env
     environment: { REDIS_HOST: redis }
     depends_on: [redis, db]
-    profiles: ["api"] # apiプロファイルに所属
+    profiles: ["api"]
 
   worker:
     deploy:
@@ -23,9 +23,9 @@ services:
     environment:
       - REDIS_HOST=redis
       - OLLAMA_HOST=http://ollama:11434
-      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB} # ホスト名をdbに変更
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     depends_on: [ollama, redis, db, osrm, osrm-foot, nominatim]
-    profiles: ["worker"] # workerプロファイルに所属
+    profiles: ["worker"]
 
   ollama:
     image: ollama/ollama:latest
@@ -36,19 +36,19 @@ services:
         reservations:
           devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
     runtime: nvidia
-    profiles: ["worker"] # workerプロファイルに所属
+    profiles: ["worker"]
 
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
-    profiles: ["api", "worker"] # 両方から使われる
+    profiles: ["api", "worker"]
 
-  db: # サービス名をpostgresからdbに変更
+  db:
     image: postgres:15-alpine
     env_file: .env
     ports: ["5432:5432"]
     volumes: [postgres_data:/var/lib/postgresql/data]
-    profiles: ["api", "worker"] # 両方から使われる
+    profiles: ["api", "worker"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -56,18 +56,22 @@ services:
       retries: 5
 
   osrm:
-    image: osrm/osrm-backend:v5.27.1
+    # ★★★ 修正点 ★★★
+    image: osrm/osrm-backend:latest #
     ports: ["5000:5000"]
-    volumes: [osrm_data:/data]
+    volumes:
+      - ./backend/worker/data/map/car:/data
     command: osrm-routed --algorithm mld /data/japan-latest.osrm
-    profiles: ["worker"] # workerプロファイルに所属
+    profiles: ["worker"]
 
   osrm-foot:
-    image: osrm/osrm-backend:v5.27.1
+    # ★★★ 修正点 ★★★
+    image: osrm/osrm-backend:latest #
     ports: ["5001:5000"]
-    volumes: [osrm_data_foot:/data]
+    volumes:
+      - ./backend/worker/data/map/foot:/data
     command: osrm-routed --algorithm mld /data/japan-latest-foot.osrm
-    profiles: ["worker"] # workerプロファイルに所属
+    profiles: ["worker"]
 
   nominatim:
     image: mediagis/nominatim:4.4
@@ -79,7 +83,7 @@ services:
       - ./japan-latest.osm.pbf:/data/japan-latest.osm.pbf:ro
       - nominatim_data:/var/lib/postgresql/14/main
     depends_on: [db]
-    profiles: ["worker"] # workerプロファイルに所属
+    profiles: ["worker"]
 
 volumes:
   ollama_data:

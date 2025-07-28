@@ -4,7 +4,7 @@ from typing import TypedDict, List, Optional, Literal, Annotated, Tuple
 from langchain_core.messages import BaseMessage
 import operator
 from datetime import date
-from .schemas import VisitPlanResponse, ActionPayload
+from backend.shared.schemas import VisitPlanResponse, ActionPayload
 
 class VisitPlanState(TypedDict):
     """訪問計画の内部状態"""

@@ -13,3 +13,12 @@ services:
   worker:
     build: { context: ., target: production-worker }
     command: celery -A shared.celery_app:celery_app worker --loglevel=info --pool=threads --concurrency=1
+  
+  ollama:
+    restart: always
+  
+  osrm:
+    restart: always
+
+  osrm-foot:
+    restart: always

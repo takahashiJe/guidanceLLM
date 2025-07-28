@@ -4,8 +4,8 @@ from celery.result import AsyncResult
 from typing import Any, Dict
 from pydantic import BaseModel
 
-from shared.celery_app import celery_app
-from shared.schemas import ChatRequest, UpdateLocationRequest
+from backend.shared.celery_app import celery_app
+from backend.shared.schemas import ChatRequest, UpdateLocationRequest
 
 router = APIRouter()
 

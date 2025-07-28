@@ -1,0 +1,46 @@
+# Web framework
+fastapi>=0.111.0
+uvicorn
+
+# LangChain and related libraries
+langchain==0.2.5
+langchain-community==0.2.5
+langchain-core==0.2.20
+langchain-ollama==0.1.0
+langchain-experimental==0.0.61
+langchain-text-splitters==0.2.1
+langgraph==0.0.69
+
+# LLMs and ML
+openai>=1.1.1
+transformers
+torch
+accelerate
+
+# Vector DB
+chromadb>=0.5.3
+
+# Async tasks and message queue
+celery
+redis
+pika
+
+# Database driver
+psycopg2-binary
+
+# Geolocation tools
+geopandas
+networkx
+
+# Document processing
+unstructured
+markdown-it-py
+markdown
+
+# Utilities
+python-dateutil
+thefuzz
+python-Levenshtein
+
+# For development hot-reloading
+watchdog

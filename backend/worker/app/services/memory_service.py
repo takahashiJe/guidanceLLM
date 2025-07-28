@@ -11,8 +11,8 @@ from langchain_community.embeddings import OllamaEmbeddings
 from langchain.schema import Document
 
 # DBセッションとモデルをインポート
-from app.db.session import SessionLocal
-from app.db import models
+from backend.worker.app.db.session import SessionLocal
+from backend.worker.app.db import models
 
 # --- 設定項目 ---
 SHORT_TERM_MEMORY_LIMIT = 10
