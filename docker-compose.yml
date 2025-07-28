@@ -1,7 +1,22 @@
-# docker-compose.yml (修正後)
-# version: '3.8' # この行はあってもなくても動作しますが、最新のComposeでは不要です
+# docker-compose.yml
+# version: '3.8'
 
 services:
+  db-init:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development # デフォルトは開発ステージ
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes: [./backend:/app]
+    command: ["python", "worker/app/init_db_script.py"]
+
   frontend:
     ports: ["8501:8501"]
     depends_on: [api_gateway]

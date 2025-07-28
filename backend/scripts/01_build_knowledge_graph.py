@@ -6,7 +6,7 @@ import json
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_ollama import ChatOllama
-from backend.worker.app.rag.retriever import KNOWLEDGE_BASE_PATH # ragからパスをインポート
+from worker.app.rag.retriever import KNOWLEDGE_BASE_PATH # ragからパスをインポート
 
 # LLMとパーサーを初期化
 llm = ChatOllama(

@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from backend.api_gateway.app import chat_router
+from api_gateway.app import chat_router
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(

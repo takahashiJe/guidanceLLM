@@ -3,7 +3,7 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from backend.worker.app.db.models import Base
+from worker.app.db.models import Base
 
 # 環境変数からデータベースのURLを取得。なければSQLiteをメモリ上で使用。
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")

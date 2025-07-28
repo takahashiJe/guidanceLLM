@@ -3,21 +3,25 @@ import os
 from celery import Celery
 
 # 環境変数から接続情報を取得
-rabbitmq_host = os.getenv('RABBITMQ_HOST', 'localhost')
-redis_host = os.getenv('REDIS_HOST', 'localhost')
+broker_url = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+result_backend_url = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 
-# Celeryの接続情報
-broker_url = f'amqp://guest:guest@{rabbitmq_host}:5672//'
-result_backend_url = f'redis://{redis_host}:6379/0'
-
-# Celeryインスタンスの作成
+# Celeryアプリケーションのインスタンスを作成
 celery_app = Celery(
-    'tasks', # アプリケーション名
+    "worker",
     broker=broker_url,
     backend=result_backend_url,
-    include=['app.tasks'] # 読み込むタスクモジュールを指定
+    include=["worker.app.tasks"] # 実行するタスクが定義されているモジュールを指定
 )
 
+# Celeryの設定（オプション）
 celery_app.conf.update(
     task_track_started=True,
+    # ワーカーが一度に受け取るタスク数を1に制限する
+    # これにより、長時間タスクが他のタスクの実行をブロックするのを防ぐ
+    worker_prefetch_multiplier=1,
+
+    # タスクが成功または失敗した後にブローカーに通知（ack）を送る
+    # これにより、ワーカーが処理中にクラッシュしてもタスクが失われない
+    task_acks_late=True,
 )

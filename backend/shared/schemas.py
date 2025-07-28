@@ -1,7 +1,8 @@
 # /backend/shared/schemas.py
 
 from pydantic import BaseModel, Field
-from typing import TypedDict, Optional, Tuple, Literal, List, Dict, Any
+from typing import Optional, Tuple, Literal, List, Dict, Any
+from typing_extensions import TypedDict
 from datetime import date
 
 class ActionPayload(TypedDict, total=False):

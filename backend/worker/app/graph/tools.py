@@ -9,9 +9,9 @@ from typing import Dict, Any, Optional, Tuple
 from thefuzz import process
 from typing import TypedDict, List, Optional, Literal, Annotated, Tuple
 
-from backend.worker.app.services import route_service, planning_service, planning_spot_service
-from backend.worker.app.rag import retriever
-from backend.worker.app.db.session import SessionLocal
+from worker.app.services import route_service, planning_service, planning_spot_service
+from worker.app.rag import retriever
+from worker.app.db.session import SessionLocal
 
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate

@@ -17,10 +17,10 @@ import inspect
 # from app.services import planning_service
 # from app.db import session as db_session
 
-from backend.shared.state import GraphState
-from backend.worker.app.graph.tools import available_tools
-from backend.worker.app.rag import retriever
-from backend.worker.app.graph.intent_tools import intent_classification_tools
+from shared.state import GraphState
+from worker.app.graph.tools import available_tools
+from worker.app.rag import retriever
+from worker.app.graph.intent_tools import intent_classification_tools
 
 # --- Agentのセットアップ ---
 # この部分はアプリケーション起動時に一度だけ実行されるのが望ましい

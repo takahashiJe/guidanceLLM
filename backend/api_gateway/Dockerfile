@@ -2,6 +2,7 @@
 # ==================================
 # 1. ベースイメージ・開発環境 (development stage)
 # ==================================
+# 今は使われていないDockerfile
 FROM python:3.11-slim AS development
 
 WORKDIR /app

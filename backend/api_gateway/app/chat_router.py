@@ -4,8 +4,8 @@ from celery.result import AsyncResult
 from typing import Any, Dict
 from pydantic import BaseModel
 
-from backend.shared.celery_app import celery_app
-from backend.shared.schemas import ChatRequest, UpdateLocationRequest
+from shared.celery_app import celery_app
+from shared.schemas import ChatRequest, UpdateLocationRequest
 
 router = APIRouter()
 
@@ -20,13 +20,13 @@ class TaskStatusResponse(BaseModel):
 @router.post("/chat", response_model=TaskResponse, status_code=status.HTTP_202_ACCEPTED)
 async def chat_endpoint(request: ChatRequest):
     """ユーザーからのチャットリクエストを受け付け、ワーカーに処理を依頼"""
-    task = celery_app.send_task("app.tasks.process_chat_message", args=[request.model_dump()])
+    task = celery_app.send_task("worker.app.tasks.process_chat_message", args=[request.model_dump()])
     return {"task_id": task.id}
 
 @router.post("/update_location", response_model=TaskResponse, status_code=status.HTTP_202_ACCEPTED)
 async def update_location_endpoint(request: UpdateLocationRequest):
     """ユーザーの位置情報更新を受け付け、ワーカーに処理を依頼"""
-    task = celery_app.send_task("app.tasks.process_location_update", args=[request.model_dump()])
+    task = celery_app.send_task("worker.app.tasks.process_location_update", args=[request.model_dump()])
     return {"task_id": task.id}
 
 @router.get("/tasks/{task_id}", response_model=TaskStatusResponse)

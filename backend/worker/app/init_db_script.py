@@ -1,5 +1,5 @@
 # /backend/worker/app/init_db_script.py
-from backend.worker.app.db.session import init_db
+from worker.app.db.session import init_db
 
 print("Initializing database...")
 init_db()

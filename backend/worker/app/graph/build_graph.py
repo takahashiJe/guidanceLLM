@@ -1,13 +1,13 @@
 # /backend/app/graph/build_graph.py
 
 from langgraph.graph import StateGraph, END
-from backend.shared.state import GraphState
+from shared.state import GraphState
 from langchain_core.messages import AIMessage, ToolMessage
 from typing import List
 import json
 
 # ★★★ 1. RAG関連ノードをインポートリストに追加 ★★★
-from backend.worker.app.graph.nodes import (
+from worker.app.graph.nodes import (
     agent_node,
     tool_executor_node,
     classify_intent_node,
