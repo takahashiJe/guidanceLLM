@@ -1,0 +1,71 @@
+[project]
+name = "guidance_llm_backend"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+# =================================================================
+# === 共通依存関係 (api_gatewayとworkerの両方で必要) =================
+# =================================================================
+dependencies = [
+    # --- Core Web & Task Queue ---
+    "fastapi>=0.111.0",
+    "uvicorn[standard]", # uvicornを標準機能付きでインストール
+    "celery",
+    "redis",
+    "pika",
+
+    # --- Database ---
+    "sqlalchemy",
+    "psycopg2-binary",
+    "geoalchemy2", # PostGIS連携に必要
+
+    # --- LangChain Family (worker側の最新バージョン定義を採用) ---
+    "langchain==0.2.5",
+    "langchain-community==0.2.5",
+    "langchain-core==0.2.20", # 依存関係の競合を避けるためバージョンを固定
+    "langchain-ollama==0.1.0",
+    "langchain-experimental==0.0.61",
+    "langgraph==0.0.69",
+
+    # --- Utilities ---
+    "python-dateutil",
+    "pydantic",
+]
+
+# =================================================================
+# === オプション依存関係 (特定のサービスでのみ必要) ===================
+# =================================================================
+[project.optional-dependencies]
+# api_gatewayでのみ必要なライブラリ (現在は特になし)
+api = [
+    # 例: "python-jose[cryptography]", # 将来的にJWT認証を強化する場合など
+]
+
+# workerでのみ必要なライブラリ
+worker = [
+    # --- LLMs & ML ---
+    "openai>=1.1.1",
+    "transformers",
+    "torch",
+    "accelerate",
+    "bitsandbytes", # 量子化に利用
+
+    # --- Vector DB ---
+    "chromadb>=0.5.3",
+
+    # --- LangChain Add-ons ---
+    "langchain-text-splitters==0.2.1",
+    
+    # --- Data Processing & Utilities ---
+    "thefuzz",
+    "python-Levenshtein",
+    "geopandas",
+    "networkx",
+    "unstructured",
+    "markdown-it-py",
+    "markdown",
+]
+
+[tool.setuptools.packages.find]
+# `backend`ディレクトリをパッケージのルートとして認識させる
+where = ["."]

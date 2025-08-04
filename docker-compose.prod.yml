@@ -6,12 +6,12 @@ services:
     build: { context: ./frontend }
 
   api_gateway:
-    build: { context: ., target: production-api }
+    build: { context: ., target: production }
     ports: ["8000:8000"]
     command: uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000
 
   worker:
-    build: { context: ., target: production-worker }
+    build: { context: ., target: production }
     command: celery -A shared.celery_app:celery_app worker --loglevel=info --pool=threads --concurrency=1
   
   ollama:
