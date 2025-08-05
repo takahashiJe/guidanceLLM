@@ -17,4 +17,4 @@ services:
     build: { context: ., target: development }
     volumes: [./backend:/app]
     # ホットリロード用のコマンド
-    command: watchmedo auto-restart --directory=/app --pattern=*.py --recursive -- celery -A shared.celery_app:celery_app worker --loglevel=info --pool=threads --concurrency=1
+    command: watchmedo auto-restart --directory=/app --pattern=*.py --recursive -- celery -A shared.app.celery_app:celery_app worker --loglevel=info --pool=threads --concurrency=1

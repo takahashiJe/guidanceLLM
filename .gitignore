@@ -12,3 +12,7 @@ backend/worker/llm_models/
 ollama_data/
 
 .env*
+
+japan-latest.osm.pbf
+backend/worker/data/map/car/*
+backend/worker/data/map/foot/*

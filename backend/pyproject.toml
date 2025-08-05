@@ -43,6 +43,7 @@ api = [
 
 # workerでのみ必要なライブラリ
 worker = [
+    "watchdog",
     # --- LLMs & ML ---
     "openai>=1.1.1",
     "transformers",
@@ -64,6 +65,11 @@ worker = [
     "unstructured",
     "markdown-it-py",
     "markdown",
+]
+
+# 開発環境でのみ必要なライブラリ
+dev = [
+    "watchdog", # ホットリロード用
 ]
 
 [tool.setuptools.packages.find]
