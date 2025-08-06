@@ -1,4 +1,4 @@
-# backend/shared/celery_app.py
+# shared/app/celery_app.py
 import os
 from celery import Celery
 

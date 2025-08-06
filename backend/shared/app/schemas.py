@@ -3,7 +3,7 @@
 from typing import TypedDict, List, Optional, Any
 from langchain_core.messages import BaseMessage
 
-class AgentState(TypedDict):
+class AgentState(TypedDict):CC
     """
     LangGraphのグラフ全体で受け渡される状態オブジェクト。
     FR-1, FR-2, FR-6, FR-7の要件を管理する。
