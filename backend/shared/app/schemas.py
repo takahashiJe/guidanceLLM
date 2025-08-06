@@ -3,14 +3,14 @@
 from typing import TypedDict, List, Optional, Any
 from langchain_core.messages import BaseMessage
 
-class AgentState(TypedDict):CC
+class AgentState(TypedDict):
     """
     LangGraphのグラフ全体で受け渡される状態オブジェクト。
     FR-1, FR-2, FR-6, FR-7の要件を管理する。
     """
     # === セッション情報 ===
     # FR-1-1: 認証されたユーザーのID
-    userId: str
+    userId: int
     
     # FR-1-2: 現在の会話セッションのID
     sessionId: str
