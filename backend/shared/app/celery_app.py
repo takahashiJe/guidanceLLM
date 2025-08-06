@@ -25,3 +25,5 @@ celery_app.conf.update(
     # これにより、ワーカーが処理中にクラッシュしてもタスクが失われない
     task_acks_late=True,
 )
+
+celery_app.conf.timezone = 'Asia/Tokyo'

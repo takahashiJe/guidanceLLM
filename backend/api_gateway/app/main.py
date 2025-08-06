@@ -1,19 +1,42 @@
-from fastapi import FastAPI
-from api_gateway.app import chat_router
+# backend/api_gateway/app/main.py
 
-# FastAPIアプリケーションのインスタンスを作成
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+# api/v1ディレクトリ内の各ルーターをインポート
+from backend.api_gateway.app.api.v1 import auth, sessions, chat
+
 app = FastAPI(
-    title="山道案内AI API Gateway",
-    description="ユーザーからのリクエストを受け付け、ワーカーに処理を依頼するAPIです。",
+    title="Guidance LLM API Gateway",
+    description="This is the main entry point for the Guidance LLM application.",
     version="1.0.0",
 )
 
-# /api/v1 というプレフィックスでチャットルーターを登録します。
-app.include_router(chat_router.router, prefix="/api/v1", tags=["Task Endpoints"])
+# --- ミドルウェアの設定 ---
+# フロントエンドからのリクエストを許可する
+# 本番環境では、オリジンをより厳密に設定すること
+origins = [
+    "http://localhost",
+    "http://localhost:8080", # Vue開発サーバーのデフォルトポートなど
+    "http://localhost:8501", # Streamlitのデフォルトポート
+    "https://ibera.cps.akita-pu.ac.jp"
+]
 
-@app.get("/", tags=["Root"])
-async def read_root():
-    """
-    APIサーバーが正常に起動しているかを確認するためのルートエンドポイントです。
-    """
-    return {"message": "API Gateway is running."}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- APIルーターのインクルード ---
+# 各エンドポイントを有効化する
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
+app.include_router(sessions.router, prefix="/api/v1/sessions", tags=["Sessions"])
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat & Navigation"])
+
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the Guidance LLM API Gateway"}
