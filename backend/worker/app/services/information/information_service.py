@@ -8,11 +8,12 @@ from shared.app.models import Spot
 # 他のサービス部やモジュールをインポート
 # from worker.app.services.routing.routing_service import RoutingService # 仮インポート
 # ★★★ 集計機能をitineraryサービスからインポート ★★★
-from worker.app.services.itinerary.crud_plan import get_plan_count_for_spot_on_date
+from worker.app.services.itinerary.itinerary_service import ItineraryService
 from worker.app.services.information import crud_spot, web_crawler, weather_api
 
 # サービスインスタンスの生成
 # routing_service = RoutingService() # 仮インスタンス
+itinerary_service = ItineraryService()
 
 class InformationService:
     """情報提供サービス部のビジネスロジックを実装するサービスクラス。"""
@@ -58,8 +59,11 @@ class InformationService:
                 # --- 天気情報を取得 ---
                 weather_info = self._get_weather_for_spot(spot, date_iterator)
 
-                # ★★★ 混雑情報をDBから取得（スタブを本実装に置換） ★★★
-                plan_count = get_plan_count_for_spot_on_date(db, spot_id=spot.spot_id, target_date=date_iterator)
+                # --- 混雑情報をDBから取得 ---
+                # 専門家（itinerary_service）の公開窓口を通じて依頼する
+                plan_count = itinerary_service.get_congestion_info(
+                    db, spot_id=spot.spot_id, target_date=date_iterator
+                )
                 congestion_status = self._convert_count_to_congestion(plan_count)
 
                 # --- 日ごとのスコアリング ---

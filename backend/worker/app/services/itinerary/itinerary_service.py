@@ -2,6 +2,8 @@
 
 from typing import List, Optional, Dict
 from sqlalchemy.orm import Session
+from datetime import date
+
 
 from shared.app.models import Plan, Stop
 from worker.app.services.itinerary import crud_plan
@@ -116,3 +118,13 @@ class ItineraryService:
         
         # 3. 更新後のリストを返却する
         return crud_plan.get_stops_by_plan_id(db, plan_id=plan_id)
+    
+    def get_congestion_info(self, db: Session, spot_id: str, target_date: date) -> int:
+        """
+        指定された日・スポットの計画人数（混雑情報）を返す。
+        これは他のサービスから呼び出されることを想定した公開インターフェース。
+        """
+        # 内部の道具（crud_plan）を使って処理を実行する
+        return crud_plan.get_plan_count_for_spot_on_date(
+            db, spot_id=spot_id, target_date=target_date
+        )
