@@ -33,6 +33,8 @@ class Session(Base):
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
     app_status = Column(String(50), nullable=False, default='Browse')
     active_plan_id = Column(Integer, ForeignKey("plans.plan_id"), nullable=True)
+    language = Column(String(10), nullable=False, default='ja')
+    interaction_mode = Column(String(10), nullable=False, default='text')
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_updated = Column(DateTime(timezone=True), onupdate=func.now())
 

@@ -23,7 +23,9 @@ def create_session(session_create: schemas.SessionCreate, db: Session = Depends(
     db_session = models.Session(
         session_id=session_create.session_id,
         user_id=session_create.user_id,
-        app_status='browsing'
+        app_status='browsing',
+        language=session_create.language,
+        interaction_mode=session_create.interaction_mode
     )
     db.add(db_session)
     db.commit()
@@ -51,5 +53,7 @@ def restore_session(session_id: uuid.UUID, db: Session = Depends(get_db), curren
         "user_id": db_session.user_id,
         "app_status": db_session.app_status,
         "active_plan_id": db_session.active_plan_id,
+        "language": db_session.language,
+        "interaction_mode": db_session.interaction_mode,
         "history": history
     }

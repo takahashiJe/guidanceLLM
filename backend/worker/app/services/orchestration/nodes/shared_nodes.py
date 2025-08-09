@@ -1,21 +1,30 @@
 # worker/app/services/orchestration/nodes/shared_nodes.py
 
 from shared.app.schemas import AgentState
+from worker.app.services.llm.llm_service import LLMInferenceService
+
+# LLMサービスのインスタンスを生成
+llm_service = LLMInferenceService()
 
 def chitchat_node(state: AgentState) -> AgentState:
-    """
-    雑談応答を生成するノード（スタブ実装）。
-    """
-    print("Executing chitchat_node...")
-    # TODO: LLMInferenceServiceを呼び出して、自然な雑談応答を生成する
-    user_message = state["userInput"]
-    state["finalResponse"] = f"「{user_message}」についてですね。面白いお話です！"
+    """LLMを使い、自然な雑談応答を生成するノード。"""
+    print("Executing chitchat_node with LLM...")
+    
+    response_text = llm_service.generate_chitchat_response(
+        history=state["chatHistory"],
+        language=state["language"]
+    )
+    
+    state["finalResponse"] = response_text or "ごめんなさい、うまくお返事できませんでした。"
     return state
 
 def error_node(state: AgentState) -> AgentState:
-    """
-    エラー応答を生成するノード。
-    """
-    print("Executing error_node...")
-    state["finalResponse"] = "申し訳ありません、うまく理解できませんでした。別の言葉で試していただけますか？"
+    """LLMを使い、丁寧なエラー応答を生成するノード。"""
+    print("Executing error_node with LLM...")
+
+    response_text = llm_service.generate_error_message(
+        language=state["language"]
+    )
+    
+    state["finalResponse"] = response_text or "申し訳ありません、予期せぬエラーが発生しました。"
     return state
