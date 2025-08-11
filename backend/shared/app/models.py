@@ -9,8 +9,11 @@ from sqlalchemy import (
     ForeignKey,
     Double,
     ARRAY,
+    JSON,
     UUID,
+    UUID as UUIDType,
 )
+import uuid
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
 from geoalchemy2 import Geometry # PostGIS用の型
@@ -55,7 +58,7 @@ class ConversationHistory(Base):
 
 class Spot(Base):
     """
-    FR-3: POIマスターデータ (最終版)
+    FR-3: POIマスターデータ
     """
     __tablename__ = "spots"
     spot_id = Column(Text, primary_key=True)
@@ -104,3 +107,41 @@ class Stop(Base):
 
     plan = relationship("Plan", back_populates="stops")
     spot = relationship("Spot")
+
+class AccessPoint(Base):
+    """
+    OSMから抽出した、駐車場や登山口などのアクセス拠点情報を格納するテーブル。
+    車と徒歩のルートを組み合わせる際の「乗り換え地点」として機能する。
+    """
+    __tablename__ = "access_points"
+
+    # 内部管理用のUUID主キー
+    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # OpenStreetMap由来のID。重複を許さず、検索のキーとする。
+    osm_id = Column(String(255), unique=True, nullable=False, index=True)
+    
+    # 'parking' または 'trailhead'
+    access_type = Column(String(50), nullable=False, index=True)
+    
+    name = Column(Text, nullable=True)
+    
+    # OSMから取得した全てのタグ情報をJSON形式でそのまま保存
+    # (例: surface, access, capacity, fee など)
+    tags = Column(JSON)
+
+    latitude = Column(Double, nullable=False)
+    longitude = Column(Double, nullable=False)
+    # PostGISを使った高速な地理空間検索のためのカラム
+    geom = Column(Geometry(geometry_type='POINT', srid=4326), nullable=False)
+
+    # OSRMの/nearest APIで事前に計算した、最も近いグラフ上のノードID。
+    # ルート計算時に毎回最近傍点を探索するコストを削減するためのキャッシュ。
+    car_osrm_node_id = Column(Integer)
+    foot_osrm_node_id = Column(Integer)
+
+    # --- 管理用カラム ---
+    source = Column(String(50), default="OSM")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    # このデータが人手で確認・修正されたかを示すフラグ
+    verified = Column(Boolean, default=False)
