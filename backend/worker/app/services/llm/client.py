@@ -2,14 +2,15 @@
 
 import ollama
 from typing import List, Dict, Any, Optional, Type
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 class OllamaClient:
     """
     Ollama APIとの通信に特化したクライアントクラス。
-    LLMモデルとの直接的な対話をカプセル化し、エラーハンドリングや
-    レスポンス形式の制御を行う。
     """
 
     def __init__(self, model: str = "qwen3:30b", host: Optional[str] = None):
@@ -17,30 +18,39 @@ class OllamaClient:
         クライアントを初期化する。
 
         Args:
-            model (str): 使用するOllamaモデル名。
+            model (str): 使用するOllamaモデル名。要件に従い "qwen3:30b" を使用。
             host (Optional[str]): OllamaサーバーのホストURL。Noneの場合はデフォルト。
         """
         self.model = model
-        self.client = ollama.Client(host=host)
+        try:
+            self.client = ollama.Client(host=host)
+            # 起動時に疎通確認を行う
+            self.client.list()
+            logger.info(f"Ollama client initialized successfully for model '{self.model}'.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Ollama client. Is the Ollama server running? Error: {e}", exc_info=True)
+            # サーバーに接続できない場合は、クライアントをNoneに設定
+            self.client = None
 
     def invoke_completion(self, messages: List[Dict[str, str]]) -> Optional[str]:
         """
         標準的なテキスト生成（Completion）を実行する。
-
-        Args:
-            messages (List[Dict[str, str]]): LangChain形式のメッセージ履歴。
-
-        Returns:
-            Optional[str]: LLMによって生成されたテキスト。エラー時はNone。
         """
+        if not self.client:
+            logger.error("Ollama client is not available. Cannot invoke completion.")
+            return None
         try:
             response = self.client.chat(
                 model=self.model,
                 messages=messages
             )
-            return response['message']['content']
+            content = response.get('message', {}).get('content')
+            if content is None:
+                logger.warning(f"Ollama response did not contain message content: {response}")
+                return None
+            return content
         except Exception as e:
-            print(f"Error invoking Ollama completion: {e}")
+            logger.error(f"Error invoking Ollama completion: {e}", exc_info=True)
             return None
 
     def invoke_structured_completion(
@@ -48,33 +58,32 @@ class OllamaClient:
     ) -> Optional[Dict[str, Any]]:
         """
         指定されたPydanticスキーマに従って、構造化されたJSON出力を生成する。
-
-        Args:
-            messages (List[Dict[str, str]]): LangChain形式のメッセージ履歴。
-            output_schema (Type[BaseModel]): 出力形式を定義したPydanticモデル。
-
-        Returns:
-            Optional[Dict[str, Any]]: パースされたJSONデータ。エラー時はNone。
         """
+        if not self.client:
+            logger.error("Ollama client is not available. Cannot invoke structured completion.")
+            return None
         try:
-            # モデルにJSON形式での出力を強制する
             response = self.client.chat(
                 model=self.model,
                 messages=messages,
                 format="json"
             )
+            content = response.get('message', {}).get('content')
+            if not content:
+                logger.warning(f"Ollama structured response was empty: {response}")
+                return None
             
-            # 返ってきたJSON文字列をパースする
-            json_response = json.loads(response['message']['content'])
-            
-            # Pydanticモデルでバリデーション（念のため）
+            json_response = json.loads(content)
             validated_data = output_schema(**json_response)
             
             return validated_data.dict()
             
         except json.JSONDecodeError as e:
-            print(f"Error decoding JSON from Ollama structured response: {e}")
+            logger.error(f"Error decoding JSON from Ollama. Response: '{content}'. Error: {e}", exc_info=True)
+            return None
+        except ValidationError as e:
+            logger.error(f"Ollama response did not match Pydantic schema. Response: '{content}'. Error: {e}", exc_info=True)
             return None
         except Exception as e:
-            print(f"Error invoking Ollama structured completion: {e}")
+            logger.error(f"Error invoking Ollama structured completion: {e}", exc_info=True)
             return None

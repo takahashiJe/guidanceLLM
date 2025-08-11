@@ -2,18 +2,19 @@
 
 import requests
 from typing import List, Dict, Any, Optional, Literal
+import logging
+
+# ロガーの設定
+logger = logging.getLogger(__name__)
 
 class OSRMClient:
     """
     OSRMサーバーとのHTTP通信に特化したクライアントクラス。
-    車用と徒歩用のエンジンを透過的に切り替え、リクエストの構築と
-    レスポンスのパース、エラーハンドリングを行う。
     """
 
     def __init__(self):
         """
         クライアントを初期化し、各プロファイルのベースURLを設定する。
-        Docker Composeのサービス名でコンテナにアクセスする。
         """
         self.base_urls = {
             "car": "http://osrm-car:5000",
@@ -22,7 +23,8 @@ class OSRMClient:
 
     def _format_coordinates(self, coordinates: List[Dict[str, float]]) -> str:
         """座標リストをOSRM APIが要求する "lon,lat;lon,lat" 形式の文字列に変換する。"""
-        return ";".join([f"{coord['longitude']},{coord['latitude']}" for coord in coordinates])
+        # 座標データが不正な場合にKeyErrorが発生しないようにgetを使用
+        return ";".join([f"{coord.get('longitude', 0)},{coord.get('latitude', 0)}" for coord in coordinates])
 
     def fetch_route(
         self,
@@ -31,43 +33,41 @@ class OSRMClient:
     ) -> Optional[Dict[str, Any]]:
         """
         複数の経由地を含むルート情報をOSRMから取得する。
-
-        Args:
-            coordinates (List[Dict[str, float]]): 経由地の座標リスト。
-            profile (Literal["car", "foot"]): 使用する移動プロファイル。
-
-        Returns:
-            Optional[Dict[str, Any]]: OSRMから返されたGeoJSONを含むルート情報。エラー時はNone。
         """
         if len(coordinates) < 2:
-            # 2点未満ではルートを計算できないため、Noneを返す。
             return None 
 
         base_url = self.base_urls.get(profile)
         if not base_url:
-            # 万が一、不正なprofileが指定された場合はエラーを発生させる。
-            raise ValueError(f"Invalid profile specified: {profile}")
+            # 不正なprofileが指定された場合はエラーログを残し、Noneを返す
+            logger.error(f"Invalid profile specified: {profile}")
+            return None
             
         coords_str = self._format_coordinates(coordinates)
-        # overview=full: 詳細なジオメトリを取得 / geometries=geojson: GeoJSON形式で取得
-        url = f"{base_url}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
+        # OSRM v5 APIの正しいエンドポイント形式に修正
+        url = f"{base_url}/route/v1/{'driving' if profile == 'car' else 'foot'}/{coords_str}?overview=full&geometries=geojson"
 
         try:
-            # タイムアウトを設定し、OSRMサーバーが応答しない場合に備える。
             response = requests.get(url, timeout=20)
-            # 200番台以外のステータスコード（例: 400, 500）で例外を発生させる。
             response.raise_for_status() 
             data = response.json()
+            
             if data.get("code") == "Ok" and data.get("routes"):
-                # 正常にルートが計算された場合、最初のルート情報を返す。
                 return data["routes"][0]
             else:
-                # OSRMがエラーメッセージを返した場合（例：座標が道路上にない）
-                print(f"OSRM API returned an error: {data.get('message')}")
+                # OSRMが計算失敗のメッセージを返した場合
+                logger.warning(f"OSRM API returned an error for URL {url}: {data.get('message')}")
                 return None
-        except requests.RequestException as e:
-            # ネットワークエラーやタイムアウトなど、リクエスト自体の失敗を捕捉する。
-            print(f"Error fetching route from OSRM ({profile}): {e}")
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout error when fetching route from OSRM URL: {url}")
+            return None
+        except requests.exceptions.RequestException as e:
+            # ネットワークエラーやOSRMコンテナがダウンしている場合
+            logger.error(f"RequestException when fetching route from OSRM URL {url}: {e}", exc_info=True)
+            return None
+        except Exception as e:
+            # JSONデコードエラーなど、その他の予期せぬエラー
+            logger.error(f"An unexpected error occurred in fetch_route for URL {url}: {e}", exc_info=True)
             return None
 
     def fetch_distance_and_duration(
@@ -78,20 +78,12 @@ class OSRMClient:
     ) -> Optional[Dict[str, float]]:
         """
         2点間の距離(distance)と所要時間(duration)を取得する。
-
-        Args:
-            origin (Dict[str, float]): 出発地の座標。
-            destination (Dict[str, float]): 目的地の座標。
-            profile (Literal["car", "foot"]): 使用する移動プロファイル。
-
-        Returns:
-            Optional[Dict[str, float]]: 距離(km)と時間(分)。例: {"distance_km": 25.5, "duration_min": 45.1}
         """
-        # 2点間のルート計算を行い、その結果から距離と時間を抽出する。
         route_data = self.fetch_route([origin, destination], profile)
         if route_data:
-            distance_meters = route_data.get("distance", 0)
-            duration_seconds = route_data.get("duration", 0)
+            # レスポンスにキーが存在しない場合でもエラーにならないようにgetを使用
+            distance_meters = route_data.get("distance", 0.0)
+            duration_seconds = route_data.get("duration", 0.0)
             return {
                 "distance_km": round(distance_meters / 1000, 1),
                 "duration_min": round(duration_seconds / 60, 1)
