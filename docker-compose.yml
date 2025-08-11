@@ -1,33 +1,50 @@
 # docker-compose.yml
-# version: '3.8'
+version: '3.8'
 
 services:
+  # --- Tools ---
   db-init:
     profiles: ["tools"]
     build:
       context: .
       dockerfile: Dockerfile
-      target: development # デフォルトは開発ステージ
+      target: development
     env_file: .env
-    environment:
-      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     depends_on:
       db:
         condition: service_healthy
     volumes: ['./backend:/app/backend']
     command: ["python", "backend/worker/app/init_db_script.py"]
 
+  # --- Main Application Services ---
   frontend:
+    profiles: ["dev", "api"] # devまたはapiプロファイルで起動
+    build: { context: ./frontend }
     ports: ["8501:8501"]
     depends_on: [api_gateway]
-    profiles: ["api"]
+    networks: [frontend_network]
 
   api_gateway:
-    env_file: .env
-    depends_on: [redis, db]
     profiles: ["api"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      redis: { condition: service_healthy }
+      db: { condition: service_healthy }
+    networks: [backend_network, frontend_network]
+    # command は override/prod ファイルで定義するため、ここでは記述しない
 
   worker:
+    profiles: ["worker"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
     deploy:
       resources:
         reservations:
@@ -35,72 +52,72 @@ services:
     runtime: nvidia
     env_file: .env
     environment:
+      - PYTHONPATH=/app
       - OLLAMA_HOST=http://ollama:11434
-      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-    depends_on: [ollama, redis, db, osrm, osrm-foot, nominatim]
-    profiles: ["worker"]
+    depends_on:
+      ollama: { condition: service_started }
+      redis: { condition: service_healthy }
+      db: { condition: service_healthy }
+      osrm-car: { condition: service_started }
+      osrm-foot: { condition: service_started }
+    networks: [backend_network]
 
-  ollama:
-    image: ollama/ollama:latest
-    ports: ["11434:11434"]
-    volumes: [ollama_data:/root/.ollama]
-    deploy:
-      resources:
-        reservations:
-          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
-    runtime: nvidia
-    profiles: ["worker"]
-
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
-    profiles: ["api", "worker"]
-
+  # --- Dependencies ---
   db:
+    profiles: ["api", "worker", "tools"]
     image: postgis/postgis:15-3.4
     env_file: .env
     ports: ["5432:5432"]
     volumes: [postgres_data:/var/lib/postgresql/data]
-    profiles: ["api", "worker"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks: [backend_network]
 
-  osrm:
-    # ★★★ 修正点 ★★★
-    image: osrm/osrm-backend:latest #
-    ports: ["5000:5000"]
-    volumes:
-      - ./backend/worker/data/map/car:/data
-    command: osrm-routed --algorithm mld /data/japan-latest.osrm
+  redis:
+    profiles: ["api", "worker"]
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [backend_network]
+
+  ollama:
     profiles: ["worker"]
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: [ollama_data:/root/.ollama]
+    deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
+    runtime: nvidia
+    networks: [backend_network]
+
+  osrm-car:
+    profiles: ["worker"]
+    image: osrm/osrm-backend:latest
+    ports: ["5000:5000"]
+    volumes: ['./backend/worker/data/map/car:/data']
+    command: osrm-routed --algorithm mld /data/japan-latest.osrm
+    networks: [backend_network]
 
   osrm-foot:
-    # ★★★ 修正点 ★★★
-    image: osrm/osrm-backend:latest #
+    profiles: ["worker"]
+    image: osrm/osrm-backend:latest
     ports: ["5001:5000"]
-    volumes:
-      - ./backend/worker/data/map/foot:/data
+    volumes: ['./backend/worker/data/map/foot:/data']
     command: osrm-routed --algorithm mld /data/japan-latest-foot.osrm
-    profiles: ["worker"]
-
-  nominatim:
-    image: mediagis/nominatim:4.4
-    ports: ["8080:8080"]
-    environment:
-      - PBF_PATH=/data/japan-latest.osm.pbf
-      - REPLICATION_URL=http://download.geofabrik.de/asia/japan-updates
-    volumes:
-      - ./japan-latest.osm.pbf:/data/japan-latest.osm.pbf:ro
-      - nominatim_data:/var/lib/postgresql/14/main
-    depends_on: [db]
-    profiles: ["worker"]
+    networks: [backend_network]
 
 volumes:
   ollama_data:
   postgres_data:
-  osrm_data:
-  osrm_data_foot:
-  nominatim_data:
+
+networks:
+  backend_network:
+    driver: bridge
+  frontend_network:
+    driver: bridge

@@ -1,77 +1,55 @@
-[project]
-name = "guidance_llm_backend"
+[tool.poetry]
+name = "guidance-llm-backend"
 version = "0.1.0"
-requires-python = ">=3.11"
+description = "Backend services for the Guidance LLM application."
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
 
-# =================================================================
-# === 共通依存関係 (api_gatewayとworkerの両方で必要) =================
-# =================================================================
-dependencies = [
-    # --- Core Web & Task Queue ---
-    "fastapi>=0.111.0",
-    "uvicorn[standard]", # uvicornを標準機能付きでインストール
-    "celery",
-    "redis",
-    "pika",
+[tool.poetry.dependencies]
+python = "^3.10"
 
-    # --- Database ---
-    "sqlalchemy",
-    "psycopg2-binary",
-    "geoalchemy2", # PostGIS連携に必要
+# --- API Gateway & Core ---
+fastapi = "^0.111.0"
+uvicorn = {extras = ["standard"], version = "^0.29.0"}
+sqlalchemy = "^2.0.30"
+psycopg2-binary = "^2.9.9" # PostgreSQL driver
+pydantic = "^2.7.1"
 
-    # --- LangChain Family (worker側の最新バージョン定義を採用) ---
-    "langchain==0.2.5",
-    "langchain-community==0.2.5",
-    "langchain-core==0.2.20", # 依存関係の競合を避けるためバージョンを固定
-    "langchain-ollama==0.1.0",
-    "langchain-experimental==0.0.61",
-    "langgraph==0.0.69",
+# --- Security ---
+passlib = {extras = ["bcrypt"], version = "^1.7.4"}
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+python-multipart = "^0.0.9" # For file uploads
 
-    # --- Utilities ---
-    "python-dateutil",
-    "pydantic",
-]
+# --- Worker & Asynchronous Tasks ---
+celery = {extras = ["redis"], version = "^5.4.0"}
+redis = "^5.0.4"
+watchfiles = "^0.21.0" # For development hot-reloading
 
-# =================================================================
-# === オプション依存関係 (特定のサービスでのみ必要) ===================
-# =================================================================
-[project.optional-dependencies]
-# api_gatewayでのみ必要なライブラリ (現在は特になし)
-api = [
-    # 例: "python-jose[cryptography]", # 将来的にJWT認証を強化する場合など
-]
+# --- LangChain & AI ---
+langchain = "^0.2.1"
+langchain-core = "^0.2.3"
+langgraph = "^0.0.60"
+ollama = "^0.2.1"
 
-# workerでのみ必要なライブラリ
-worker = [
-    "watchdog",
-    # --- LLMs & ML ---
-    "openai>=1.1.1",
-    "transformers",
-    "torch",
-    "accelerate",
-    "bitsandbytes", # 量子化に利用
+# --- Voice Services ---
+# TTS (Coqui) and its dependencies
+TTS = "^0.22.0"
+# STT (Whisper) and its dependencies
+whisper-cpp-python = "^0.1.21"
+pydub = "^0.25.1"
+numpy = "^1.26.4"
+torch = "^2.3.0" # TTS/Whisper often require torch
 
-    # --- Vector DB ---
-    "chromadb>=0.5.3",
+# --- Information Services ---
+requests = "^2.31.0"
+beautifulsoup4 = "^4.12.3"
 
-    # --- LangChain Add-ons ---
-    "langchain-text-splitters==0.2.1",
-    
-    # --- Data Processing & Utilities ---
-    "thefuzz",
-    "python-Levenshtein",
-    "geopandas",
-    "networkx",
-    "unstructured",
-    "markdown-it-py",
-    "markdown",
-]
+# --- Geospatial Services ---
+shapely = "^2.0.4"
+pyproj = "^3.6.1"
+geojson = "^3.1.0"
 
-# 開発環境でのみ必要なライブラリ
-dev = [
-    "watchdog", # ホットリロード用
-]
 
-[tool.setuptools.packages.find]
-# `backend`ディレクトリをパッケージのルートとして認識させる
-where = ["."]
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
