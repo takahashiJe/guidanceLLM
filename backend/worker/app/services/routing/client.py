@@ -40,10 +40,12 @@ class OSRMClient:
             Optional[Dict[str, Any]]: OSRMから返されたGeoJSONを含むルート情報。エラー時はNone。
         """
         if len(coordinates) < 2:
-            return None # 2点未満ではルートを計算できない
+            # 2点未満ではルートを計算できないため、Noneを返す。
+            return None 
 
         base_url = self.base_urls.get(profile)
         if not base_url:
+            # 万が一、不正なprofileが指定された場合はエラーを発生させる。
             raise ValueError(f"Invalid profile specified: {profile}")
             
         coords_str = self._format_coordinates(coordinates)
@@ -51,15 +53,20 @@ class OSRMClient:
         url = f"{base_url}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
 
         try:
-            response = requests.get(url, timeout=20) # 複数地点の計算は時間がかかる可能性
-            response.raise_for_status() # 200番台以外のステータスコードで例外を発生
+            # タイムアウトを設定し、OSRMサーバーが応答しない場合に備える。
+            response = requests.get(url, timeout=20)
+            # 200番台以外のステータスコード（例: 400, 500）で例外を発生させる。
+            response.raise_for_status() 
             data = response.json()
             if data.get("code") == "Ok" and data.get("routes"):
-                return data["routes"][0] # 最も一般的なルートを返す
+                # 正常にルートが計算された場合、最初のルート情報を返す。
+                return data["routes"][0]
             else:
+                # OSRMがエラーメッセージを返した場合（例：座標が道路上にない）
                 print(f"OSRM API returned an error: {data.get('message')}")
                 return None
         except requests.RequestException as e:
+            # ネットワークエラーやタイムアウトなど、リクエスト自体の失敗を捕捉する。
             print(f"Error fetching route from OSRM ({profile}): {e}")
             return None
 
@@ -80,6 +87,7 @@ class OSRMClient:
         Returns:
             Optional[Dict[str, float]]: 距離(km)と時間(分)。例: {"distance_km": 25.5, "duration_min": 45.1}
         """
+        # 2点間のルート計算を行い、その結果から距離と時間を抽出する。
         route_data = self.fetch_route([origin, destination], profile)
         if route_data:
             distance_meters = route_data.get("distance", 0)

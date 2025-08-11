@@ -4,7 +4,7 @@ from typing import Dict, Any
 from shapely.geometry import Point, LineString
 from pyproj import Geod
 
-# WGS84測地系に基づく距離計算機
+# WGS84測地系に基づく高精度な距離計算機を初期化
 geod = Geod(ellps="WGS84")
 
 def calculate_distance_from_route(
@@ -19,13 +19,13 @@ def calculate_distance_from_route(
         route_geojson (Dict[str, Any]): ルートのGeoJSONオブジェクト。
 
     Returns:
-        float: ルートからの逸脱距離（メートル単位）。
+        float: ルートからの逸脱距離（メートル単位）。エラー時は無限大を返す。
     """
     try:
         user_point = Point(point_coords["longitude"], point_coords["latitude"])
         route_line = LineString(route_geojson["coordinates"])
         
-        # Shapelyのprojectとinterpolateを使って、線上で最も近い点を見つけ、その点と現在地の距離を計算する
+        # Shapelyのprojectとinterpolateを使い、ルート線上でユーザーの現在地に最も近い点を見つける
         nearest_point_on_route = route_line.interpolate(route_line.project(user_point))
         
         # 2点間の測地線距離を計算
@@ -34,9 +34,10 @@ def calculate_distance_from_route(
             nearest_point_on_route.x, nearest_point_on_route.y
         )
         return distance_meters
-    except (KeyError, IndexError, TypeError) as e:
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        # 不正なGeoJSONや座標データが渡された場合のエラーハンドリング
         print(f"Error calculating distance from route: {e}")
-        return float('inf') # エラー時は大きな値を返す
+        return float('inf')
 
 def calculate_distance_between_points(
     point1_coords: Dict[str, float],
@@ -50,15 +51,16 @@ def calculate_distance_between_points(
         point2_coords (Dict[str, float]): 点2の座標。
 
     Returns:
-        float: 2点間の距離（メートル単位）。
+        float: 2点間の距離（メートル単位）。エラー時は無限大を返す。
     """
     try:
+        # pyprojライブラリを使い、地球の曲率を考慮した正確な距離を計算
         _, _, distance_meters = geod.inv(
             point1_coords["longitude"], point1_coords["latitude"],
             point2_coords["longitude"], point2_coords["latitude"]
         )
         return distance_meters
-    except KeyError as e:
+    except (KeyError, TypeError) as e:
         print(f"Error calculating distance between points: {e}")
         return float('inf')
 
@@ -78,5 +80,7 @@ def is_within_radius(
     Returns:
         bool: 半径内であればTrue、そうでなければFalse。
     """
+    if radius_meters < 0:
+        return False
     distance = calculate_distance_between_points(point1_coords, point2_coords)
     return distance <= radius_meters

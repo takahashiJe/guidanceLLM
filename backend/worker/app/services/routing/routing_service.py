@@ -2,6 +2,7 @@
 
 from typing import List, Dict, Any, Optional, Literal
 
+# OSRMとの通信を担当するクライアントをインポート
 from worker.app.services.routing.client import OSRMClient
 
 class RoutingService:
@@ -40,6 +41,8 @@ class RoutingService:
             route_points.append(route_points[0])
 
         route_data = self.client.fetch_route(route_points, profile)
+        # OSRMからのレスポンスにはジオメトリ以外にも距離や時間などが含まれるが、
+        # この関数は純粋なルート形状(GeoJSON)のみを返す責務を持つ。
         return route_data.get("geometry") if route_data else None
 
     def get_distance_and_duration(
@@ -68,7 +71,7 @@ class RoutingService:
         profile: Literal["car", "foot"]
     ) -> Optional[Dict[str, Any]]:
         """
-        [達成事項3] ナビ中のリルート計算を行う。
+        [達成事項3][実装完了] ナビ中のリルート計算を行う。
 
         Args:
             current_location (Dict[str, float]): ユーザーの現在地座標。
@@ -78,11 +81,17 @@ class RoutingService:
         Returns:
             Optional[Dict[str, Any]]: 新しいルートのGeoJSONオブジェクト。
         """
+        # リルート先の訪問先がなければ、計算を終了する。
         if not remaining_waypoints:
             return None
             
-        # 現在地を新しい出発点としてルートを再計算
+        # [処理フロー 4] 現在地を新しい出発点としてルートを再計算する。
+        # これにより、ユーザーの現在地から残りの全訪問地を巡る新しいルートが作成される。
         route_points = [current_location] + remaining_waypoints
         
+        # [処理フロー 5] OSRMクライアントに計算を依頼する。
+        # 往復ではなく片道なので、round_tripは指定しない。
         route_data = self.client.fetch_route(route_points, profile)
+
+        # [処理フロー 8] 結果からGeoJSONジオメトリのみを抽出して返す。
         return route_data.get("geometry") if route_data else None
