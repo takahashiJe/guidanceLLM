@@ -1,12 +1,12 @@
 # worker/app/services/orchestration/nodes/itinerary_nodes.py
 
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 import logging
 
-from backend.shared.app.schemas import AgentState
-from backend.shared.app.database import session_scope
-from backend.worker.app.services.itinerary.itinerary_service import ItineraryService
-from backend.worker.app.services.llm.llm_service import LLMInferenceService
+from shared.app.schemas import AgentState
+from shared.app.database import session_scope
+from worker.app.services.itinerary.itinerary_service import ItineraryService
+from worker.app.services.llm.llm_service import LLMInferenceService
 
 logger = logging.getLogger(__name__)
 itinerary_service = ItineraryService()

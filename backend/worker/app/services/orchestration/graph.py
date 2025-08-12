@@ -3,7 +3,7 @@
 from langgraph.graph import StateGraph, END
 from typing import Literal
 
-from backend.shared.app.schemas import AgentState
+from shared.app.schemas import AgentState
 
 # 各ファイルからノードとルーター、そして条件分岐用の関数をインポート
 from .router import route_conversation
@@ -38,12 +38,14 @@ workflow.add_node("gather_nudge_data", gather_nudge_data_node)
 workflow.add_node("select_best_spot", select_best_spot_node)
 workflow.add_node("generate_nudge_proposal", generate_nudge_proposal_node)
 workflow.add_node("handle_no_spot_found", handle_no_spot_found_node)
+workflow.add_node("check_spot_found", check_spot_found)
 
 # Itinerary (Planning) Flow
 workflow.add_node("create_plan", create_plan_node)
 workflow.add_node("summarize_plan", summarize_plan_node)
 workflow.add_node("extract_plan_edit", extract_plan_edit_node)
 workflow.add_node("execute_plan_edit", execute_plan_edit_node)
+workflow.add_node("check_plan_edit_extraction", check_plan_edit_extraction)
 
 
 # --- グラフのエントリーポイントとメインルーター ---
@@ -69,7 +71,7 @@ workflow.add_conditional_edges(
 workflow.add_edge("find_candidate_spots", "check_spot_found")
 # 2. 検索結果に応じて分岐
 workflow.add_conditional_edges(
-    "check_spot_found",
+    "find_candidate_spots", # ← 開始点を修正
     check_spot_found,
     {
         "continue": "gather_nudge_data", # 見つかった場合 -> ナッジ情報収集へ

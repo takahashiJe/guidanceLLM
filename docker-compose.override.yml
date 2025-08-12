@@ -18,4 +18,4 @@ services:
     build:
       target: development
     volumes: ['./backend:/app/backend']
-    command: watchfiles "celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1" ./backend
+    command: watchfiles "celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1" /app/backend

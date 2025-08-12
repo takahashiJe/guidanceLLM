@@ -7,7 +7,7 @@ from sqlalchemy import func, cast, Date
 from datetime import date
 import logging
 
-from backend.shared.app.models import Spot, Plan, Stop
+from shared.app.models import Spot, Plan, Stop
 
 logger = logging.getLogger(__name__)
 

@@ -5,6 +5,7 @@ from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field
 from uuid import UUID
 from datetime import datetime
+from enum import Enum
 
 # ==============================================================================
 # LangGraph Agent State
@@ -48,15 +49,6 @@ class AgentState(TypedDict):
     intermediateData: dict
 
 # ==============================================================================
-# 共通スキーマ
-# ==============================================================================
-
-class Location(BaseModel):
-    """ユーザーの現在地座標を定義する共通スキーマ"""
-    latitude: float
-    longitude: float
-
-# ==============================================================================
 # 認証 (Authentication) 関連スキーマ
 # ==============================================================================
 
@@ -73,7 +65,7 @@ class UserResponse(UserBase):
     user_id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class Token(BaseModel):
     """[POST /login] ログイン成功時のレスポンスボディ"""
@@ -112,7 +104,7 @@ class SessionResponse(BaseModel):
     user_id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class ConversationHistoryResponse(BaseModel):
     """会話履歴のレスポンス形式 (セッション復元時に使用)"""
@@ -122,7 +114,7 @@ class ConversationHistoryResponse(BaseModel):
     created_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         
 class SessionRestoreResponse(BaseModel):
     """[GET /sessions/restore/{session_id}] セッション復元成功時のレスポンスボディ"""
@@ -161,4 +153,29 @@ class NavigationStart(BaseModel):
 class LocationData(BaseModel):
     """[POST /navigation/location] 位置情報更新時のリクエストボディ"""
     session_id: UUID
-    location: Location
+    latitude: float
+    longitude: float
+
+# ==============================================================================
+# Intentはworker/app/services/orchestration/router.pyで使用
+# ==============================================================================
+
+class Intent(str, Enum):
+    """
+    ユーザーの意図を分類するためのカテゴリ。
+    LLMはこのEnumのメンバー名のいずれかを返すように指示される。
+    """
+    SPECIFIC_SPOT_QUESTION = "specific_spot_question" # 例: 「法体の滝について教えて」
+    GENERAL_TOURIST_SPOT_QUESTION = "general_tourist_spot_question" # 例: 「どこか良い観光地ない？」
+    CATEGORY_SPOT_QUESTION = "category_spot_question" # 例: 「泊まれるところ探して」
+    PLAN_CREATION_REQUEST = "plan_creation_request" # 例: 「旅行の計画を立てたい」
+    PLAN_EDIT_REQUEST = "plan_edit_request" # 例: 「計画に〇〇を追加して」
+    PLAN_CONFIRMATION = "plan_confirmation" # 例: 「それで確定して」
+    PLAN_CANCEL = "plan_cancel" # 例: 「計画をやめる」
+    CHITCHAT = "chitchat" # 雑談
+    UNKNOWN = "unknown" # 不明
+
+class IntentClassificationResult(BaseModel):
+    """意図分類タスクの出力スキーマ"""
+    intent: Intent = Field(description="分類されたユーザーの意図。")
+    extracted_category: Optional[str] = Field(None, description="カテゴリに関する質問の場合、抽出されたカテゴリ名（例：「温泉」、「絶景」）。")

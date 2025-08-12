@@ -4,9 +4,9 @@ from typing import List, Dict, Any, Optional
 from langchain_core.messages import BaseMessage
 import logging
 
-from backend.shared.app.models import Stop, Spot
-from backend.worker.app.services.llm.client import OllamaClient
-from backend.worker.app.services.llm.prompts import templates, schemas
+from shared.app.models import Stop, Spot
+from worker.app.services.llm.client import OllamaClient
+from worker.app.services.llm.prompts import templates, schemas
 
 logger = logging.getLogger(__name__)
 

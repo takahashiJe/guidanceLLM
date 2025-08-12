@@ -1,7 +1,7 @@
 # worker/app/services/orchestration/router.py
 
-from backend.shared.app.schemas import AgentState, Intent
-from backend.worker.app.services.llm.llm_service import LLMInferenceService
+from shared.app.schemas import AgentState, Intent
+from worker.app.services.llm.llm_service import LLMInferenceService
 import logging
 
 logger = logging.getLogger(__name__)

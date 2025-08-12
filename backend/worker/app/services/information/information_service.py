@@ -6,11 +6,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 import logging
 
-from backend.shared.app.models import Spot
+from shared.app.models import Spot
 # 他のサービス部やモジュールをインポート
-from backend.worker.app.services.routing.routing_service import RoutingService
-from backend.worker.app.services.itinerary.itinerary_service import ItineraryService
-from backend.worker.app.services.information import crud_spot, web_crawler, weather_api
+from worker.app.services.routing.routing_service import RoutingService
+from worker.app.services.itinerary.itinerary_service import ItineraryService
+from worker.app.services.information import crud_spot, web_crawler, weather_api
 
 # ロガーの設定
 logger = logging.getLogger(__name__)

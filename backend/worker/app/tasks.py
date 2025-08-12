@@ -5,13 +5,13 @@ from celery.utils.log import get_task_logger
 from typing import Optional, Dict, Any
 
 # Celeryアプリケーションのインスタンスをインポート
-from backend.shared.app.celery_app import celery_app
+from shared.app.celery_app import celery_app
 
 # 各専門サービスとオーケストレーターのグラフをインポート
 # (実際にはDIコンテナ等でインスタンスを管理するのが望ましい)
 from worker.app.services.orchestration.graph import app as orchestration_graph
 from worker.app.services.orchestration.state import load_state, save_state
-# from backend.worker.app.services.navigation.navigation_service import NavigationService # 実行時に動的に生成
+# from worker.app.services.navigation.navigation_service import NavigationService # 実行時に動的に生成
 
 # Celeryタスク用のロガーを取得
 logger = get_task_logger(__name__)
