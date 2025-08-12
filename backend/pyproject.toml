@@ -34,7 +34,7 @@ ollama = "^0.2.1"
 # --- Voice Services ---
 TTS = "^0.22.0"
 pyyaml = "^6.0.1"
-whisper-cpp-python = "^0.2.0"
+# whisper-cpp-python = "0.4.0"
 pydub = "^0.25.1"
 numpy = "^1.26.4"
 torch = "^2.3.0"

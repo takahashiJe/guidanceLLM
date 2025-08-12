@@ -8,7 +8,7 @@ from celery.exceptions import CeleryError
 import logging
 
 # api/v1ディレクトリ内の各ルーターをインポート
-from backend.api_gateway.app.api.v1 import auth, sessions, chat
+from api_gateway.app.api.v1 import auth, sessions, chat
 
 # ロガーの設定
 logging.basicConfig(level=logging.INFO)

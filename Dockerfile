@@ -8,32 +8,15 @@ FROM python:3.11-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     # PYTHONPATHを設定し、/appをモジュール検索パスの起点に追加
-    PYTHONPATH=/app
+    PYTHONPATH=/app/backend
 
 # 全てのステージで作業ディレクトリを/appに統一
-WORKDIR /app
+WORKDIR /app/backend
 
 # =================================================================
 # 2. Builder Stage: 依存関係をインストールする専用ステージ
 # =================================================================
 FROM base AS builder
-
-# CMakeのバージョン指定
-ARG CMAKE_VERSION=3.25.3
-ARG CMAKE_DIST=cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz
-ARG CMAKE_URL=https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_DIST}
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    g++ \
-    cmake \
-    wget \
-    && rm -rf /var/lib/apt/lists/* \
-    && wget ${CMAKE_URL} -O /tmp/${CMAKE_DIST} \
-    && tar --strip-components=1 -zxvf /tmp/${CMAKE_DIST} -C /usr/local \
-    && rm /tmp/${CMAKE_DIST}
 
 # 依存関係ファイルのみを先にコピーすることで、
 # ソースコードの変更でライブラリの再インストールが走らないようにする
@@ -42,6 +25,7 @@ COPY ./backend/pyproject.toml ./backend/poetry.lock* /app/backend/
 # backendディレクトリに移動
 WORKDIR /app/backend
 
+RUN pip install --no-cache-dir --only-binary=:all: whisper-cpp-python==0.2.0 || true
 # Poetryをインストールし、pyproject.tomlに基づき全ての依存関係をインストール
 RUN pip install --no-cache-dir poetry && \
     poetry config virtualenvs.create false && \

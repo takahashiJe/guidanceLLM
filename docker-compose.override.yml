@@ -11,11 +11,11 @@ services:
     ports: ["8000:8000"]
     volumes: ['./backend:/app/backend']
     # ホットリロード用のコマンド
-    command: uvicorn backend.api_gateway.app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/backend
+    command: uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/backend
 
   worker:
     profiles: ["worker"]
     build:
       target: development
     volumes: ['./backend:/app/backend']
-    command: watchfiles "celery -A backend.shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1" ./backend
+    command: watchfiles "celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1" ./backend
