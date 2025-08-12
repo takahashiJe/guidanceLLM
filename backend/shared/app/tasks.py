@@ -1,6 +1,6 @@
 # backend/shared/app/tasks.py
 
-from backend.shared.app.celery_app import celery_app
+from shared.app.celery_app import celery_app
 
 # このファイルは、Celeryタスクの「シグネチャ（名前と引数）」を定義する場所です。
 # API Gatewayはここをインポートしてタスクを呼び出し、

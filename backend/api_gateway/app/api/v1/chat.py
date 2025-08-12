@@ -5,14 +5,14 @@ from typing import Optional
 import uuid
 from sqlalchemy.orm import Session
 
-from backend.shared.app.tasks import (
+from shared.app.tasks import (
     orchestrate_conversation_task,
     start_navigation_task,
     update_location_task
 )
-from backend.shared.app import models, schemas
-from backend.shared.app.database import get_db
-from backend.api_gateway.app.security import get_current_user
+from shared.app import models, schemas
+from shared.app.database import get_db
+from api_gateway.app.security import get_current_user
 
 router = APIRouter()
 

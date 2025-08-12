@@ -14,7 +14,7 @@ services:
       db:
         condition: service_healthy
     volumes: ['./backend:/app/backend']
-    command: ["python", "backend/worker/app/init_db_script.py"]
+    command: ["python", "worker/app/init_db_script.py"]
 
   # --- Main Application Services ---
   frontend:

@@ -10,6 +10,7 @@ from sqlalchemy import (
     Double,
     ARRAY,
     JSON,
+    Boolean,
     UUID,
     UUID as UUIDType,
 )

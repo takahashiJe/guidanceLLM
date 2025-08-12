@@ -1,12 +1,13 @@
 # backend/api_gateway/app/api/v1/auth.py
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
-from backend.shared.app.database import get_db
-from backend.shared.app import models, schemas
-from backend.api_gateway.app import security
+from shared.app.database import get_db
+from shared.app import models, schemas
+from api_gateway.app import security
 
 router = APIRouter()
 
@@ -34,9 +35,9 @@ def register_user(user_create: schemas.UserCreate, db: Session = Depends(get_db)
 
 
 @router.post("/login", response_model=schemas.Token)
-def login_for_access_token(form_data: schemas.UserLogin, db: Session = Depends(get_db)):
+def login_for_access_token(db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()):
     """FR-1-1: ログイン処理とトークン発行"""
-    user = db.query(models.User).filter(models.User.username == form_data.username).first()
+    user = authenticate_user(db, form_data.username, form_data.password)
     if not user or not security.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

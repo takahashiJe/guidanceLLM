@@ -11,8 +11,8 @@ from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 # sharedディレクトリから共通定義をインポート
-from backend.shared.app.database import get_db
-from backend.shared.app import models, schemas
+from shared.app.database import get_db
+from shared.app import models, schemas
 
 # --- 環境変数から設定を読み込み ---
 # これらは.envファイルで設定します
