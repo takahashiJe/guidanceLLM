@@ -8,7 +8,6 @@ FROM python:3.11-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     # PYTHONPATHを設定し、/appをモジュール検索パスの起点に追加
-    # これにより、どのディレクトリからでも `from backend.` でインポート可能になる
     PYTHONPATH=/app
 
 # 全てのステージで作業ディレクトリを/appに統一
@@ -19,14 +18,19 @@ WORKDIR /app
 # 2. Builder Stage: 依存関係をインストールする専用ステージ
 # =================================================================
 FROM base AS builder
-# 依存関係定義ファイルのみを先にコピー
+
+# ★★★ 改善点 ★★★
+# 依存関係ファイルのみを先にコピーすることで、
+# ソースコードの変更でライブラリの再インストールが走らないようにする
 COPY ./backend/pyproject.toml ./backend/poetry.lock* /app/backend/
+
 # backendディレクトリに移動
 WORKDIR /app/backend
+
 # Poetryをインストールし、pyproject.tomlに基づき全ての依存関係をインストール
 RUN pip install --no-cache-dir poetry && \
     poetry config virtualenvs.create false && \
-    poetry install --no-root --no-dev
+    poetry install --no-root
 
 
 # =================================================================
@@ -36,8 +40,7 @@ FROM base AS development
 # builderステージからインストール済みのライブラリのみをコピー
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
-# 開発時はソースコードをマウントするため、COPYは不要
-# デフォルトコマンドはbash。docker-compose.override.ymlで上書きされる
+# 開発時はソースコードをマウントするため、ソースのCOPYは不要
 CMD ["/bin/bash"]
 
 
@@ -50,5 +53,3 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 # backendディレクトリのソースコードを/app/backendにコピー
 COPY ./backend /app/backend
-# frontendのビルド済み静的ファイルをコピーする場合（将来的な拡張）
-# COPY ./frontend/dist /app/static
