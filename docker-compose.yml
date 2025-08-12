@@ -32,7 +32,7 @@ services:
       target: production
     env_file: .env
     environment:
-      - PYTHONPATH=/app
+      - PYTHONPATH=/app/backend
     depends_on:
       redis: { condition: service_healthy }
       db: { condition: service_healthy }
@@ -52,7 +52,7 @@ services:
     runtime: nvidia
     env_file: .env
     environment:
-      - PYTHONPATH=/app
+      - PYTHONPATH=/app/backend
       - OLLAMA_HOST=http://ollama:11434
     depends_on:
       ollama: { condition: service_started }

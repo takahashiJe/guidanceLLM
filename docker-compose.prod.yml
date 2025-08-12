@@ -8,12 +8,12 @@ services:
   api_gateway:
     build: { context: ., target: production }
     ports: ["8000:8000"]
-    command: uvicorn backend.api_gateway.app.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000
 
   worker:
     build: { context: ., target: production }
     restart: unless-stopped
-    command: celery -A backend.shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1
+    command: celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1
   
   ollama:
     restart: always
