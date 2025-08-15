@@ -1,81 +1,64 @@
-# worker/app/services/information/crud_spot.py
+# -*- coding: utf-8 -*-
+"""
+情報提供サービス部向けの Spot 検索 CRUD。
+要件:
+- FR-3-1: 正式名称/カテゴリ/一般観光でスポット特定
+- FR-3-5: 漠然質問では tourist_spot のみ
+"""
 
 from typing import List, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import func, cast, Date
-from datetime import date
-import logging
+from sqlalchemy import or_, and_
 
-from shared.app.models import Spot, Plan, Stop
+from shared.app import models
 
-logger = logging.getLogger(__name__)
 
-def get_spot_by_id(db: Session, spot_id: str) -> Optional[Spot]:
-    """[責務3] IDで単一のスポット情報を取得する。"""
-    try:
-        return db.query(Spot).filter(Spot.spot_id == spot_id).first()
-    except SQLAlchemyError as e:
-        logger.error(f"DB error in get_spot_by_id for spot_id {spot_id}: {e}", exc_info=True)
-        raise # エラーを呼び出し元に伝播させる
+def find_spots_by_official_name(
+    db: Session, query: str, language: str, limit: int = 20
+) -> List[models.Spot]:
+    """部分一致で official_name_xx を検索（固有名詞）"""
+    col = {
+        "ja": models.Spot.official_name_ja,
+        "en": models.Spot.official_name_en,
+        "zh": models.Spot.official_name_zh,
+    }.get(language, models.Spot.official_name_ja)
 
-def find_spots_by_name(db: Session, name: str, language: str) -> List[Spot]:
-    """[責務1] 固有名詞でスポットを検索する。"""
-    try:
-        query_filter = None
-        search_pattern = f"%{name}%"
-        
-        if language == 'en':
-            query_filter = Spot.official_name_en.ilike(search_pattern)
-        elif language == 'zh':
-            query_filter = Spot.official_name_zh.ilike(search_pattern)
-        else:
-            query_filter = Spot.official_name_ja.ilike(search_pattern)
-            
-        return db.query(Spot).filter(query_filter).all()
-    except SQLAlchemyError as e:
-        logger.error(f"DB error in find_spots_by_name for name {name}: {e}", exc_info=True)
-        raise
+    return (
+        db.query(models.Spot)
+        .filter(col.ilike(f"%{query}%"))
+        .order_by(models.Spot.popularity.desc().nullslast())
+        .limit(limit)
+        .all()
+    )
 
-def find_spots_by_tag(db: Session, tag: str, language: str) -> List[Spot]:
-    """[責務1] 「絶景」などのタグでスポットを検索する。"""
-    try:
-        query_filter = None
-        
-        if language == 'en':
-            query_filter = Spot.tags_en.any(tag)
-        elif language == 'zh':
-            query_filter = Spot.tags_zh.any(tag)
-        else:
-            query_filter = Spot.tags_ja.any(tag)
-            
-        return db.query(Spot).filter(query_filter).all()
-    except SQLAlchemyError as e:
-        logger.error(f"DB error in find_spots_by_tag for tag {tag}: {e}", exc_info=True)
-        raise
 
-def find_spots_by_type(db: Session, spot_type: str) -> List[Spot]:
-    """[責務1] 「tourist_spot」などの種別でスポットを検索する。"""
-    try:
-        return db.query(Spot).filter(Spot.spot_type == spot_type).all()
-    except SQLAlchemyError as e:
-        logger.error(f"DB error in find_spots_by_type for type {spot_type}: {e}", exc_info=True)
-        raise
+def find_spots_by_tag(
+    db: Session, tag: str, limit: int = 30
+) -> List[models.Spot]:
+    """tags(JSON/CSV いずれでも) に tag を含むレコードを検索"""
+    # tags が TEXT(JSON) の想定：文字列包含で簡易実装（正規化済みDBであれば中間テーブルJOINに置換）
+    like = f"%{tag}%"
+    return (
+        db.query(models.Spot)
+        .filter(or_(models.Spot.tags.ilike(like), models.Spot.category.ilike(like)))
+        .order_by(models.Spot.popularity.desc().nullslast())
+        .limit(limit)
+        .all()
+    )
 
-def get_plan_count_for_spot_on_date(db: Session, spot_id: str, target_date: date) -> int:
-    """
-    指定された日に、特定のスポットを訪問計画に含んでいるユーザーの総数を取得する。
-    """
-    try:
-        count = (
-            db.query(func.count(Plan.plan_id))
-            .join(Stop, Plan.plan_id == Stop.plan_id)
-            .filter(Stop.spot_id == spot_id)
-            .filter(cast(Plan.start_date, Date) == target_date)
-            .scalar()
-        )
-        return count or 0
-    except SQLAlchemyError as e:
-        logger.error(f"DB error in get_plan_count_for_spot_on_date for spot {spot_id}: {e}", exc_info=True)
-        # DBエラー時は0を返し、混雑予測が「空いている」と判断されるようにする
-        return 0
+
+def list_general_tourist_spots(
+    db: Session, limit: int = 50
+) -> List[models.Spot]:
+    """観光スポットのみ（宿泊は除外）"""
+    return (
+        db.query(models.Spot)
+        .filter(models.Spot.spot_type == "tourist_spot")
+        .order_by(models.Spot.popularity.desc().nullslast())
+        .limit(limit)
+        .all()
+    )
+
+
+def get_spot_by_id(db: Session, spot_id: int) -> Optional[models.Spot]:
+    return db.query(models.Spot).filter(models.Spot.id == spot_id).first()

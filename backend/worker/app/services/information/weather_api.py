@@ -1,71 +1,100 @@
-# worker/app/services/information/weather_api.py
+# -*- coding: utf-8 -*-
+"""
+外部天気API 実装（Open-Meteo 使用、APIキー不要）
+- 入力: (lat, lon, date_str="YYYY-MM-DD")
+- 出力: {"date": "YYYY-MM-DD", "summary": "晴れ/曇り/雨 など", "source": "api", "note": None}
+"""
 
-import requests
-from typing import Optional, Dict
-from datetime import date
-import logging
+from __future__ import annotations
+import math
+from typing import Dict, Optional
+import httpx
 
-logger = logging.getLogger(__name__)
 
-def fetch_weather_for_coordinate(latitude: float, longitude: float, target_date: date) -> Optional[Dict[str, str]]:
+OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+# Open-Meteo の weathercode -> 日本語ラベルへの簡易マップ
+# 参考: https://open-meteo.com/en/docs
+_WEATHERCODE_MAP = {
+    0: "快晴",  # Clear sky
+    1: "晴れ", 2: "晴れ時々曇り", 3: "曇り",  # Mainly clear / partly cloudy / overcast
+    45: "霧", 48: "霧",
+    51: "霧雨", 53: "霧雨", 55: "霧雨",
+    56: "着氷性の霧雨", 57: "着氷性の霧雨",
+    61: "弱い雨", 63: "雨", 65: "強い雨",
+    66: "着氷性の雨", 67: "着氷性の雨",
+    71: "小雪", 73: "雪", 75: "大雪",
+    77: "雪片", 80: "にわか雨", 81: "にわか雨", 82: "激しいにわか雨",
+    85: "にわか雪", 86: "にわか雪",
+    95: "雷雨", 96: "ひょうを伴う雷雨", 97: "ひょうを伴う雷雨",
+    99: "ひょうを伴う激しい雷雨",
+}
+
+def _to_label_from_code(code: Optional[int]) -> str:
+    if code is None:
+        return "不明"
+    # 代表値へ
+    return _WEATHERCODE_MAP.get(code, "不明")
+
+
+def get_weather_by_latlon(lat: float, lon: float, date_str: str) -> Dict:
     """
-    Open-Meteo APIを使用して、指定された座標と日付の天気予報を取得する。
+    指定日の日別天気を Open-Meteo で取得する。
+    - daily.weathercode を参照、Asia/Tokyo で解釈
     """
-    API_URL = "https://api.open-meteo.com/v1/forecast"
-    target_date_str = target_date.strftime("%Y-%m-%d")
-    
     params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "daily": "weathercode,temperature_2m_max,temperature_2m_min",
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "weathercode",
         "timezone": "Asia/Tokyo",
-        "start_date": target_date_str,
-        "end_date": target_date_str
+        "start_date": date_str,
+        "end_date": date_str,
     }
-    try:
-        response = requests.get(API_URL, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        # APIからのレスポンスが期待通りかチェック
-        daily_data = data.get("daily")
-        if not daily_data or not all(k in daily_data for k in ["weathercode", "temperature_2m_max", "temperature_2m_min"]):
-             logger.warning(f"Incomplete data from Open-Meteo for {target_date_str}: {data}")
-             return None
 
-        weather_code = daily_data["weathercode"][0]
-        weather_description = _convert_wmo_code_to_description(weather_code)
-        
-        return {
-            "weather": weather_description,
-            "max_temp": f"{daily_data['temperature_2m_max'][0]}℃",
-            "min_temp": f"{daily_data['temperature_2m_min'][0]}℃",
-            "source": "Open-Meteo"
-        }
+    # タイムアウト/リトライ（簡易）
+    timeout = httpx.Timeout(connect=5.0, read=8.0)
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=timeout, headers={"User-Agent": "guidanceLLM-weather/1.0"}) as client:
+                r = client.get(OPEN_METEO_BASE, params=params)
+                r.raise_for_status()
+                data = r.json()
+                daily = data.get("daily", {})
+                codes = daily.get("weathercode") or []
+                code = codes[0] if codes else None
+                label = _to_label_from_code(code)
 
-    except requests.RequestException as e:
-        # ネットワークエラーやAPIサーバーのエラーを捕捉
-        logger.error(f"Error fetching data from Open-Meteo: {e}", exc_info=True)
-        return None
-    except (KeyError, IndexError, TypeError) as e:
-        # JSONの構造が予期せず変更された場合のエラーを捕捉
-        logger.error(f"Error parsing data from Open-Meteo: {e}", exc_info=True)
-        return None
+                # 大まかなラベルを「晴れ/曇り/雨」に寄せたい場合の正規化（InformationService のスコアと整合）
+                normalized = _normalize_to_sunny_cloudy_rain(label)
 
-def _convert_wmo_code_to_description(code: int) -> str:
-    """WMO Weather codeを日本語の簡単な説明に変換する。"""
-    if not isinstance(code, int): return "不明"
-    if code == 0: return "快晴"
-    if code == 1: return "晴れ"
-    if code == 2: return "一部曇り"
-    if code == 3: return "曇り"
-    if 45 <= code <= 48: return "霧"
-    if 51 <= code <= 55: return "霧雨"
-    if 61 <= code <= 65: return "雨"
-    if 66 <= code <= 67: return "みぞれ"
-    if 71 <= code <= 75: return "雪"
-    if 77 == code: return "雪（霧雪）"
-    if 80 <= code <= 82: return "にわか雨"
-    if 85 <= code <= 86: return "にわか雪"
-    if 95 <= code <= 99: return "雷雨"
-    return "不明"
+                return {
+                    "date": date_str,
+                    "summary": normalized,
+                    "source": "api",
+                    "note": None,
+                }
+        except Exception:
+            if attempt == 2:
+                raise  # 呼び出し元で扱う
+            continue
+
+
+def _normalize_to_sunny_cloudy_rain(label: str) -> str:
+    """
+    スコアリングで使う 3値（晴れ/曇り/雨）へ大まかに丸め込む。
+    雪・雷雨などは安全側で「雨」に寄せる。
+    """
+    if any(k in label for k in ["快晴", "晴れ"]):
+        return "晴れ"
+    if any(k in label for k in ["曇", "霧"]):
+        return "曇り"
+    if label == "不明":
+        return "曇り"  # 中立寄せ
+    # 雨・雪・雷雨・着氷性などは総じて悪条件扱い
+    return "雨"
+
+
+def annotate_foothill(weather: Dict) -> Dict:
+    """山岳クロール失敗時の注釈付与"""
+    w = dict(weather)
+    w["note"] = "※これは山麓に近い一般の予報です（山域は急変に注意）"
+    return w

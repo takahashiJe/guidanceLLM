@@ -1,89 +1,122 @@
-# worker/app/services/llm/client.py
+# -*- coding: utf-8 -*-
+"""
+Ollama API クライアント
+- qwen3:30b を既定で使用
+- テキスト生成（自然文）
+- JSON生成（構造化出力）: format="json" を利用し、厳格パース
+- リトライ/タイムアウト/簡易バックオフ
+"""
 
-import ollama
-from typing import List, Dict, Any, Optional, Type
-from pydantic import BaseModel, ValidationError
 import json
-import logging
+import os
+import time
+from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+import requests
+
 
 class OllamaClient:
     """
-    Ollama APIとの通信に特化したクライアントクラス。
+    Ollama の /api/generate を使用するシンプルなクライアント。
+    - モデルは環境変数で切替可能（既定: qwen3:30b）
+    - format="json" を指定すると厳密なJSON文字列が返る
     """
 
-    def __init__(self, model: str = "qwen3:30b", host: Optional[str] = None):
-        """
-        クライアントを初期化する。
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout_sec: int = 60,
+        max_retries: int = 2,
+        retry_backoff_sec: float = 1.5,
+    ) -> None:
+        self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+        self.model = model or os.getenv("OLLAMA_MODEL", "qwen3:30b")
+        self.timeout_sec = timeout_sec
+        self.max_retries = max_retries
+        self.retry_backoff_sec = retry_backoff_sec
 
-        Args:
-            model (str): 使用するOllamaモデル名。要件に従い "qwen3:30b" を使用。
-            host (Optional[str]): OllamaサーバーのホストURL。Noneの場合はデフォルト。
-        """
-        self.model = model
-        try:
-            self.client = ollama.Client(host=host)
-            # 起動時に疎通確認を行う
-            self.client.list()
-            logger.info(f"Ollama client initialized successfully for model '{self.model}'.")
-        except Exception as e:
-            logger.error(f"Failed to initialize Ollama client. Is the Ollama server running? Error: {e}", exc_info=True)
-            # サーバーに接続できない場合は、クライアントをNoneに設定
-            self.client = None
+        self._endpoint = f"{self.base_url.rstrip('/')}/api/generate"
 
-    def invoke_completion(self, messages: List[Dict[str, str]]) -> Optional[str]:
-        """
-        標準的なテキスト生成（Completion）を実行する。
-        """
-        if not self.client:
-            logger.error("Ollama client is not available. Cannot invoke completion.")
-            return None
-        try:
-            response = self.client.chat(
-                model=self.model,
-                messages=messages
-            )
-            content = response.get('message', {}).get('content')
-            if content is None:
-                logger.warning(f"Ollama response did not contain message content: {response}")
-                return None
-            return content
-        except Exception as e:
-            logger.error(f"Error invoking Ollama completion: {e}", exc_info=True)
-            return None
+    def _post_generate(self, payload: Dict[str, Any]) -> str:
+        """/api/generate を叩いて response['response'] を返す（ストリームOFF）"""
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = requests.post(
+                    self._endpoint,
+                    json=payload,
+                    timeout=self.timeout_sec,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # Ollamaのgenerateは streaming=false でも 'response' に本文が入る
+                text = data.get("response", "")
+                if not isinstance(text, str):
+                    text = str(text)
+                return text.strip()
+            except Exception as e:
+                last_exc = e
+                time.sleep(self.retry_backoff_sec * (attempt + 1))
+        # リトライ尽きた場合
+        raise RuntimeError(f"Ollama generate failed: {last_exc}")
 
+    # ---- 自然文生成 ---------------------------------------------------------
+    def invoke_completion(
+        self,
+        prompt: str,
+        temperature: float = 0.4,
+        top_p: float = 0.9,
+        seed: Optional[int] = 7,
+    ) -> str:
+        """
+        自然文の単発生成。
+        """
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "top_p": top_p,
+            },
+        }
+        if seed is not None:
+            payload["options"]["seed"] = seed
+        return self._post_generate(payload)
+
+    # ---- JSON構造化生成 -----------------------------------------------------
     def invoke_structured_completion(
-        self, messages: List[Dict[str, str]], output_schema: Type[BaseModel]
-    ) -> Optional[Dict[str, Any]]:
+        self,
+        prompt: str,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: Optional[int] = 7,
+    ) -> Dict[str, Any]:
         """
-        指定されたPydanticスキーマに従って、構造化されたJSON出力を生成する。
+        JSONモードでの応答を辞書で返す。
+        - LLM側で厳密なJSONのみ出力させるプロンプトを使用する前提
         """
-        if not self.client:
-            logger.error("Ollama client is not available. Cannot invoke structured completion.")
-            return None
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",  # 重要：厳密JSONを返す
+            "options": {
+                "temperature": temperature,
+                "top_p": top_p,
+            },
+        }
+        if seed is not None:
+            payload["options"]["seed"] = seed
+
+        text = self._post_generate(payload)
         try:
-            response = self.client.chat(
-                model=self.model,
-                messages=messages,
-                format="json"
-            )
-            content = response.get('message', {}).get('content')
-            if not content:
-                logger.warning(f"Ollama structured response was empty: {response}")
-                return None
-            
-            json_response = json.loads(content)
-            validated_data = output_schema(**json_response)
-            
-            return validated_data.dict()
-            
+            return json.loads(text)
         except json.JSONDecodeError as e:
-            logger.error(f"Error decoding JSON from Ollama. Response: '{content}'. Error: {e}", exc_info=True)
-            return None
-        except ValidationError as e:
-            logger.error(f"Ollama response did not match Pydantic schema. Response: '{content}'. Error: {e}", exc_info=True)
-            return None
-        except Exception as e:
-            logger.error(f"Error invoking Ollama structured completion: {e}", exc_info=True)
-            return None
+            # 乱れた出力の際は整形トライ（よくある末尾カンマ/コードブロック対策）
+            repaired = text.strip().strip("`").strip()
+            try:
+                return json.loads(repaired)
+            except Exception:
+                raise RuntimeError(f"Invalid JSON from model: {text[:300]} ... ({e})")

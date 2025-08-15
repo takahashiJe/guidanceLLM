@@ -1,3 +1,4 @@
+# docker-compose.prod.yml （更新版：フェーズ2）
 services:
   api_gateway:
     build:
@@ -16,7 +17,6 @@ services:
       target: production
     command: celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1
     restart: unless-stopped
-    # GPU は base compose 側の gpus: all が有効
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -29,3 +29,10 @@ services:
 
   osrm-foot:
     restart: always
+
+  # 本番でも必要なら tools プロファイルで実行可能
+  db-init:
+    restart: "no"
+
+  vectorstore-init:
+    restart: "no"

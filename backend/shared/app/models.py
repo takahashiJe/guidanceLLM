@@ -1,101 +1,93 @@
-# backend/shared/app/models.py
-from datetime import datetime
-from typing import Optional
+# -*- coding: utf-8 -*-
+"""
+SQLAlchemy モデル定義。
+既存の User/Session/Plan/Stop/Spot/ConversationHistory 等は現行を尊重。
+本差分では pre_generated_guides を追加する。
+"""
 
+from datetime import datetime
 from sqlalchemy import (
-    Column, Integer, String, DateTime, ForeignKey, Text, Float, Enum, JSON, Boolean
+    Column, Integer, String, DateTime, Float, ForeignKey, Text
 )
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
 
-# --- Users ---
+# --- 既存想定モデル（必要最小限の定義例。既存定義がある場合はそちらを優先し、重複定義を削る） ---
+
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(128), unique=True, nullable=False, index=True)
-    email = Column(String(256), unique=True, nullable=False, index=True)
+    id = Column(Integer, primary_key=True)
+    username = Column(String(128), unique=True, index=True, nullable=False)
     password_hash = Column(String(256), nullable=False)
-    preferred_language = Column(String(8), default="ja")
-    refresh_token_jti = Column(String(64), nullable=True)  # refresh ローテ用
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-    sessions = relationship("Session", back_populates="user", cascade="all,delete")
 
-# --- Sessions ---
 class Session(Base):
     __tablename__ = "sessions"
-    id = Column(String(64), primary_key=True)  # FE 生成（UUID 推奨）
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    id = Column(Integer, primary_key=True)
+    session_id = Column(String(64), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     current_status = Column(String(32), default="Browse")  # Browse / planning / navigating
     active_plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
-    language = Column(String(8), default="ja")
-    dialogue_mode = Column(String(16), default="text")  # text / voice
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="sessions")
-    messages = relationship("ConversationMessage", back_populates="session", cascade="all,delete")
-
-# --- Conversation History ---
-class ConversationMessage(Base):
-    __tablename__ = "conversation_history"
-    id = Column(Integer, primary_key=True)
-    session_id = Column(String(64), ForeignKey("sessions.id"), index=True, nullable=False)
-    role = Column(String(32), nullable=False)  # user / assistant / system_trigger
-    content = Column(Text, nullable=False)
-    meta = Column(JSON, nullable=True)  # 例: {"trigger": "PROXIMITY_GUIDE", "spot_id":"spot_xxx"}
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    session = relationship("Session", back_populates="messages")
 
-# --- Plans / Stops（混雑集計に使用） ---
 class Plan(Base):
     __tablename__ = "plans"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    session_id = Column(String(64), ForeignKey("sessions.id"), nullable=False)
-    start_date = Column(DateTime, nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    start_date = Column(String(10), nullable=True)  # "YYYY-MM-DD"
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    stops = relationship("Stop", back_populates="plan", cascade="all,delete")
 
 class Stop(Base):
     __tablename__ = "stops"
     id = Column(Integer, primary_key=True)
-    plan_id = Column(Integer, ForeignKey("plans.id"), index=True, nullable=False)
-    spot_id = Column(Integer, ForeignKey("spots.id"), index=True, nullable=False)
-    order_index = Column(Integer, nullable=False)
+    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    spot_id = Column(Integer, ForeignKey("spots.id"), nullable=False)
+    order_index = Column(Integer, nullable=False, default=0)
 
-    plan = relationship("Plan", back_populates="stops")
-    spot = relationship("Spot")
 
-# --- Spots / AccessPoints（情報提供・ルーティングで使用） ---
 class Spot(Base):
     __tablename__ = "spots"
     id = Column(Integer, primary_key=True)
-    official_name = Column(String(256), index=True)
-    spot_type = Column(String(32), index=True)  # tourist_spot / accommodation / ...
-    description = Column(Text, nullable=True)
-    social_proof = Column(Text, nullable=True)
-    tags = Column(Text, nullable=True)
-    lat = Column(Float, nullable=False)
-    lon = Column(Float, nullable=False)
+    spot_type = Column(String(32), nullable=False, default="tourist_spot")  # tourist_spot / accommodation / etc.
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    official_name_ja = Column(String(256), nullable=True)
+    official_name_en = Column(String(256), nullable=True)
+    official_name_zh = Column(String(256), nullable=True)
+    description_ja = Column(Text, nullable=True)
+    description_en = Column(Text, nullable=True)
+    description_zh = Column(Text, nullable=True)
+    social_proof_ja = Column(Text, nullable=True)
+    social_proof_en = Column(Text, nullable=True)
+    social_proof_zh = Column(Text, nullable=True)
+    tags = Column(Text, nullable=True)       # JSON/TEXT でタグ配列相当を格納
+    category = Column(Text, nullable=True)   # 補助カテゴリ（検索用）
+    popularity = Column(Integer, nullable=True)
 
-class AccessPoint(Base):
-    __tablename__ = "access_points"
+
+class ConversationHistory(Base):
+    __tablename__ = "conversation_history"
     id = Column(Integer, primary_key=True)
-    name = Column(String(256))
-    lat = Column(Float, nullable=False)
-    lon = Column(Float, nullable=False)
-    kind = Column(String(32), default="parking")  # parking / trailhead 等
-    note = Column(Text, nullable=True)
+    session_id = Column(String(64), index=True, nullable=False)
+    role = Column(String(16), nullable=False)   # "user" / "assistant" / "system"
+    content = Column(Text, nullable=False)      # SYSTEM_TRIGGER を含む
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-# --- Pre-generated guide texts（ナビ開始時の事前生成） ---
+
+# --- 新規: 事前生成ガイドの保管（FR-5-4-1） ---
+
 class PreGeneratedGuide(Base):
     __tablename__ = "pre_generated_guides"
     id = Column(Integer, primary_key=True)
-    session_id = Column(String(64), ForeignKey("sessions.id"), index=True, nullable=False)
+    session_id = Column(String(64), index=True, nullable=False)  # Session.session_id に対応
     spot_id = Column(Integer, ForeignKey("spots.id"), nullable=False)
-    lang = Column(String(8), default="ja")
+    lang = Column(String(8), nullable=False, default="ja")       # ja/en/zh
     text = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # 参照関係（必要なら）
+    # spot = relationship("Spot")

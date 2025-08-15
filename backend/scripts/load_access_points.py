@@ -1,43 +1,52 @@
-# backend/scripts/load_access_points.py
-import geojson
-from backend.shared.app.database import session_scope
-from backend.shared.app.models import AccessPoint
-from geoalchemy2.shape import from_shape
-from shapely.geometry import Point
+# -*- coding: utf-8 -*-
+"""
+AccessPoints ローダ（冪等）
+- access_points.geojson を読んで UPSERT
+"""
+import json
+from pathlib import Path
 
-def load_access_points_from_geojson(filepath: str):
-    """Overpass APIから抽出したGeoJSONをAccessPointテーブルに投入する。"""
-    print(f"Loading access points from {filepath}...")
-    with session_scope() as db:
-        db.query(AccessPoint).delete()
-        
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = geojson.load(f)
-            
-            for feature in data['features']:
-                props = feature['properties']
-                coords = feature['geometry']['coordinates']
-                
-                access_type = props.get('amenity') or props.get('highway')
-                if not access_type:
-                    continue
-                    
-                geom = from_shape(Point(coords[0], coords[1]), srid=4326)
-                
-                new_ap = AccessPoint(
-                    osm_id=str(feature['id']),
-                    access_type=access_type,
-                    name=props.get('name'),
-                    tags=props,
-                    latitude=coords[1],
-                    longitude=coords[0],
-                    geom=geom
+from shared.app.database import SessionLocal
+from shared.app.models import AccessPoint
+
+AP_GEOJSON = Path("/app/scripts/access_points.geojson")
+
+
+def main():
+    db = SessionLocal()
+    try:
+        geo = json.loads(AP_GEOJSON.read_text(encoding="utf-8"))
+        for f in geo.get("features", []):
+            props = f.get("properties", {}) or {}
+            geom = f.get("geometry", {}) or {}
+            coords = geom.get("coordinates", [])
+            if len(coords) != 2:
+                continue
+            lon, lat = coords
+            name = props.get("name") or props.get("title") or "Unnamed"
+
+            existing = (
+                db.query(AccessPoint)
+                .filter(AccessPoint.name == name, AccessPoint.lat == lat, AccessPoint.lon == lon)
+                .one_or_none()
+            )
+            if existing:
+                existing.ap_type = props.get("ap_type", existing.ap_type)
+                existing.tags = props.get("tags", existing.tags)
+            else:
+                db.add(
+                    AccessPoint(
+                        name=name,
+                        lat=lat,
+                        lon=lon,
+                        ap_type=props.get("ap_type", "unknown"),
+                        tags=props.get("tags"),
+                    )
                 )
-                db.add(new_ap)
-        
         db.commit()
-    print("Successfully loaded access points.")
+    finally:
+        db.close()
+
 
 if __name__ == "__main__":
-    # ダウンロードしたGeoJSONファイルへのパスを指定
-    load_access_points_from_geojson("backend/scripts/access_points.geojson")
+    main()
