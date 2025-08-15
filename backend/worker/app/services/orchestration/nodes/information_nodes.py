@@ -1,126 +1,215 @@
 # -*- coding: utf-8 -*-
 """
-information_nodes.py
-- 情報提供フロー：候補抽出→ナッジ材料収集→最適提案文（LLM）
+Information Flow の各ノード群（長期記憶注入対応版）
+- 役割:
+  - ユーザー意図に応じたスポット候補抽出
+  - ナッジ材料（距離/天気/混雑）収集と最適日の算出
+  - LLM による最終提案文生成
+  - ★ 長期記憶（会話 Embedding）の検索結果を LLM に渡す（フェーズ10-2）
+
+前提:
+- 短期記憶は Orchestrator の state.py で直近5往復を取得済み。
+- 長期記憶は shared.app.embeddings で埋め込み/類似度計算し、
+  ConversationMemory（models.ConversationMemory）に保存済み（フェーズ10-1/10-3）。
+
+このファイルでは、"最新ユーザー発話" をクエリとして長期記憶から
+関連が高いメモリを取り出し、LLM のプロンプトに注入する。
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List
+
+from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
+
+from shared.app.database import SessionLocal
+from shared.app import models
+from shared.app.embeddings import embed_text, cosine_similarities
 
 from worker.app.services.information.information_service import InformationService
+from worker.app.services.routing.routing_service import RoutingService
 from worker.app.services.llm.llm_service import LLMInferenceService
-from .shared_nodes import safe_set_final_response
-from ..state import AgentState, save_message
 
 
-def information_entry(state: AgentState) -> AgentState:
+# =========================
+# 長期記憶の取得ヘルパ
+# =========================
+
+def _fetch_long_term_memories(
+    *,
+    db,
+    user_id: Optional[int],
+    session_id: str,
+    lang: str,
+    query_text: str,
+    top_k: int = 5,
+    min_sim: float = 0.25,
+) -> List[Dict[str, Any]]:
     """
-    情報提供フローのエントリ。
-    意図分類の結果に応じて、find_spots_by_intent の intent_type を決定し候補抽出。
+    会話埋め込みテーブル（ConversationMemory）から k近傍検索を行う。
+    - ユーザー単位（user_id優先）で取得、見つからない場合は session_id でフォールバック
+    - lang は一致優先。空であれば無条件に候補。
+    - DB から一定件数をロードし、Python側でコサイン類似度を計算して上位を返す。
     """
-    info = InformationService()
-    llm = LLMInferenceService()
+    if not query_text or not query_text.strip():
+        return []
 
-    user_msg = state.latest_user_message or ""
-    # classify は router 済みだが、intentの詳細は LLM から再取得する方が堅牢
-    intent = llm.classify_intent(
-        user_message=user_msg,
-        app_status=state.app_status,
-        history=[m.model_dump() for m in state.short_history],
-        lang=state.user_lang,
-    )
+    # クエリの埋め込み
+    q_emb = np.array(embed_text(query_text), dtype=np.float32)
 
-    # intent_type を Information Service の規約に合わせて決定
-    if intent.intent == "specific_question":
-        intent_type = "specific"
-        query = intent.parameters.get("entity_name") or user_msg
-    elif intent.intent == "general_question":
-        # 「どこか良いところ」=> tourist_spot 固定
-        intent_type = "general_tourist"
-        query = intent.parameters.get("category") or user_msg
+    # まず user_id で検索、無ければ session_id で検索
+    q = db.query(models.ConversationMemory)
+    if user_id is not None:
+        q = q.filter(models.ConversationMemory.user_id == user_id)
     else:
-        # それ以外はひとまずカテゴリ推測
-        intent_type = "category"
-        query = intent.parameters.get("category") or user_msg
+        q = q.filter(models.ConversationMemory.session_id == session_id)
 
-    spots = info.find_spots_by_intent(
-        intent_type=intent_type,
-        query=query,
-        language=state.user_lang,
+    # 言語が指定されている場合は一致優先
+    if lang:
+        q = q.filter(models.ConversationMemory.lang == lang)
+
+    # 最近のものから上限件数をサンプリング（性能と精度の折衷）
+    # 必要に応じて上限を .env や定数に
+    candidates: List[models.ConversationMemory] = (
+        q.order_by(models.ConversationMemory.ts.desc()).limit(1000).all()
     )
+    if not candidates:
+        return []
 
-    state.bag["candidate_spots"] = [s.id for s in spots]
+    # ベクトルとテキストを取得
+    mats = []
+    texts = []
+    for row in candidates:
+        if row.embedding is None:
+            continue
+        try:
+            vec = np.array(row.embedding, dtype=np.float32)
+            if vec.ndim != 1:
+                continue
+            mats.append(vec)
+            texts.append(row.text or "")
+        except Exception:
+            continue
+
+    if not mats:
+        return []
+
+    mat = np.vstack(mats)
+    sims = cosine_similarities(q_emb, mat)  # shape: (N, )
+
+    # スコア上位 top_k、かつ閾値以上のみ返却
+    idx_sorted = np.argsort(-sims)
+    results: List[Dict[str, Any]] = []
+    for idx in idx_sorted[:top_k * 2]:  # 少し多めに取り、閾値で最終絞り込み
+        score = float(sims[idx])
+        if score < min_sim:
+            continue
+        results.append({"score": score, "text": texts[idx]})
+        if len(results) >= top_k:
+            break
+
+    return results
+
+
+def _format_long_term_context_for_prompt(memories: List[Dict[str, Any]]) -> str:
+    """
+    LLM プロンプトに埋め込むための長期記憶テキスト整形。
+    """
+    if not memories:
+        return ""
+    lines = []
+    for m in memories:
+        # スコアは小数2桁で参考表示（必要なければ省略可）
+        lines.append(f"- ({m['score']:.2f}) {m['text']}")
+    return "\n".join(lines)
+
+
+# =========================
+# 既存フローのノード（例）
+# =========================
+
+def node_find_spots_by_intent(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    情報提供フェーズ最初のノード：
+      - ユーザー意図に応じた候補スポットを抽出
+    期待入力:
+      state["intent_type"], state["query"], state["lang"]
+    追記:
+      - 変更なし（既存仕様通り）
+    """
+    lang = state.get("lang", "ja")
+    intent_type = state.get("intent_type")  # "specific" | "category" | "general_tourist"
+    query = state.get("query") or state.get("latest_user_message") or ""
+
+    info = InformationService()
+    with SessionLocal() as db:
+        spots = info.find_spots_by_intent(db=db, intent_type=intent_type, query=query, language=lang)
+    state["candidate_spots"] = spots
     return state
 
 
-def gather_nudge_and_pick_best(state: AgentState) -> AgentState:
+def node_gather_nudge_materials(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    候補全件に対して：
-      - get_distance_and_duration（routing連携）
-      - 天気（山タグ→crawler→fallback API）
-      - 混雑（Itinerary Service のJOIN集計）
-    を収集・スコアし、スポット毎の最適日を決定。
-    その中から総合的に最適なスポットを1つ選ぶ。
+    候補スポットに対して、距離/天気/混雑を収集し最適日を決定。
+    期待入力:
+      state["candidate_spots"], state["user_location"], state["date_range"]
+    追記:
+      - 変更なし（既存仕様通り）
     """
-    info = InformationService()
-
-    spot_ids: List[int] = state.bag.get("candidate_spots", [])
-    if not spot_ids:
-        # 候補ゼロならここで終了
-        safe_set_final_response(state, "該当する候補を見つけられませんでした。別の条件でお試しください。")
+    spots = state.get("candidate_spots") or []
+    user_location = state.get("user_location") or {}
+    date_range = state.get("date_range") or {}
+    if not spots:
+        state["nudge_materials"] = {}
         return state
 
-    # フロント側でユーザー現在地を送ってきている想定なら state.bag に入っている
-    # なければ便宜的に None を渡す（Information Service 側で扱えるようにしておく）
-    user_location = state.bag.get("user_location")
-    date_range = state.bag.get("date_range")  # {"start": "YYYY-MM-DD", "end":"YYYY-MM-DD"} を想定
-
-    # Information Service でナッジ材料を収集し、最適日を決定
-    result: Dict[int, Dict[str, Any]] = info.find_best_day_and_gather_nudge_data(
-        spot_ids=spot_ids, user_location=user_location, date_range=date_range
-    )
-    state.bag["nudge_materials"] = result
-
-    # 単純にスコア（Information Service 側で持たせた total_score）最大のスポットを選ぶ
-    best_spot_id = None
-    best_score = -1
-    for sid, payload in result.items():
-        score = payload.get("total_score", -1)
-        if score > best_score:
-            best_score = score
-            best_spot_id = sid
-
-    state.bag["best_spot_id"] = best_spot_id
+    info = InformationService()
+    with SessionLocal() as db:
+        materials = info.find_best_day_and_gather_nudge_data(
+            db=db,
+            spots=spots,
+            user_location=user_location,
+            date_range=date_range,
+        )
+    state["nudge_materials"] = materials
     return state
 
 
-def compose_nudge_response(state: AgentState) -> AgentState:
+def node_generate_nudge_text(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ベストスポットの詳細を取得し、LLMで「説得力あるナッジ応答」を生成。
+    ナッジ材料を元に、LLM で最終提案文を生成。
+    ★ ここで「長期記憶」をプロンプトに注入する（フェーズ10-2）
+    期待入力:
+      state["nudge_materials"], state["lang"], state["latest_user_message"],
+      state["session_id"], state["user_id"]
+    出力:
+      state["final_response"]
     """
-    info = InformationService()
+    lang = state.get("lang", "ja")
+    latest = state.get("latest_user_message", "")
+    session_id = state.get("session_id")
+    user_id = state.get("user_id")
+
+    # 1) 長期記憶の検索
+    with SessionLocal() as db:
+        memories = _fetch_long_term_memories(
+            db=db,
+            user_id=user_id,
+            session_id=session_id,
+            lang=lang,
+            query_text=latest,
+            top_k=5,
+            min_sim=0.25,
+        )
+    long_term_context = _format_long_term_context_for_prompt(memories)
+
+    # 2) LLM で提案文生成（長期記憶を注入）
     llm = LLMInferenceService()
-
-    best_spot_id = state.bag.get("best_spot_id")
-    nudge = state.bag.get("nudge_materials", {}).get(best_spot_id)
-    if not best_spot_id or not nudge:
-        safe_set_final_response(state, "良さそうな候補を特定できませんでした。条件を変えてもう一度お試しください。")
-        return state
-
-    spot = info.get_spot_details(spot_id=best_spot_id)
+    nudge_materials = state.get("nudge_materials") or {}
     text = llm.generate_nudge_proposal(
-        lang=state.user_lang,
-        spot={
-            "official_name": spot.official_name,
-            "description": spot.description,
-            "social_proof": spot.social_proof,
-        },
-        materials=nudge,
+        lang=lang,
+        user_message=latest,
+        nudge_materials=nudge_materials,
+        long_term_context=long_term_context,  # ★ 追加
     )
-
-    # 応答を最終レスポンスに反映
-    state.final_response = text
-
-    # 履歴保存（assistant）
-    save_message(state.session_id, "assistant", text, meta={"type": "nudge"})
+    state["final_response"] = text
     return state

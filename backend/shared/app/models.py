@@ -200,3 +200,41 @@ class PreGeneratedGuide(Base):
     # relations（必要に応じて参照）
     session: Mapped["Session"] = relationship("Session")
     spot: Mapped["Spot"] = relationship("Spot")
+
+# =========================================================
+# ConversationEmbedding（長期記憶）
+# =========================================================
+class ConversationEmbedding(Base):
+    """
+    長期記憶の保存先（会話埋め込み）
+    - session_id: どのセッションの会話か
+    - speaker: 'user' | 'assistant' | 'system'
+    - lang: 'ja'|'en'|'zh' など
+    - ts: タイムスタンプ（会話時刻）
+    - text: 元テキスト
+    - embedding: ベクトル（pgvector / フォールバック時は JSON）
+    - embedding_version: "mxbai-embed-large@<hash or date>" などバージョン識別
+    """
+    __tablename__ = "conversation_embeddings"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(String(64), ForeignKey("sessions.id"), index=True, nullable=False)
+    speaker = Column(String(16), nullable=False)  # 'user'|'assistant'|'system'
+    lang = Column(String(8), nullable=True)
+    ts = Column(DateTime, default=datetime.utcnow, nullable=False)
+    text = Column(Text, nullable=False)
+    embedding_version = Column(String(64), nullable=False, default="mxbai-embed-large")
+
+    if HAS_PGVECTOR:
+        # mxbai-embed-large は 1024 次元
+        embedding = Column(Vector(1024), nullable=False)
+        # KNN 用インデックスは init スクリプトで作成（IVFFLAT / lists=100 など）
+    else:
+        # フォールバック: JSONB に格納（KNN は不可）
+        embedding = Column(JSONB, nullable=False)
+
+    session = relationship("Session")
+
+    __table_args__ = (
+        Index("ix_convemb_session_ts", "session_id", "ts"),
+    )

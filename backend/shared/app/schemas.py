@@ -171,3 +171,29 @@ class TTSResult(BaseModel):
     audio_b64: str
     sample_rate: int = Field(default=22050)
     lang: Literal["ja", "en", "zh"]
+
+# =========================================================
+# Conversation Embedding 用スキーマ
+# =========================================================
+
+class ConversationEmbeddingCreate(BaseModel):
+    session_id: str
+    speaker: str  # 'user'|'assistant'|'system'
+    lang: Optional[str] = None
+    ts: datetime = Field(default_factory=datetime.utcnow)
+    text: str
+    embedding: List[float]
+    embedding_version: str = "mxbai-embed-large"
+
+
+class ConversationEmbeddingRead(BaseModel):
+    id: int
+    session_id: str
+    speaker: str
+    lang: Optional[str] = None
+    ts: datetime
+    text: str
+    embedding_version: str
+
+    class Config:
+        from_attributes = True

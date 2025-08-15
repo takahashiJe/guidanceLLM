@@ -1,160 +1,149 @@
-# -*- coding: utf-8 -*-
-"""
-state.py
-- セッション状態のロード/保存（短期記憶=直近5往復、SYSTEM_TRIGGERの記録）
-- LangGraph用の状態コンテナ（AgentState）の定義
-"""
-
+# backend/worker/app/services/orchestration/state.py
+# ------------------------------------------------------------
+# 役割:
+#  - AgentState のロード/セーブ
+#  - 短期記憶（直近5往復=最大10件）読み出し
+#  - 応答確定後の ConversationEmbedding 永続化（user/assistant）
+# ------------------------------------------------------------
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Literal
-from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field
+from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime
 
-from shared.app.database import get_session as get_db_session
+from sqlalchemy.orm import Session
+
+from shared.app.database import SessionLocal
 from shared.app import models
+from worker.app.services.embeddings import EmbeddingClient, save_conversation_embeddings
 
 
-# ============= LangGraph用の状態定義 =============
-class HistoryMessage(BaseModel):
-    role: Literal["user", "assistant", "system"]
-    content: str
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-
-class AgentState(BaseModel):
-    session_id: str
-    user_lang: Literal["ja", "en", "zh"] = "ja"
-    app_status: Literal["Browse", "planning", "navigating"] = "Browse"
-    active_plan_id: Optional[int] = None
-
-    # 短期記憶（直近5往復=最大10メッセージ＋SYSTEM_TRIGGER）
-    short_history: List[HistoryMessage] = Field(default_factory=list)
-
-    # ユーザーの最新入力
-    latest_user_message: Optional[str] = None
-
-    # 最終応答（テキスト）
-    final_response: Optional[str] = None
-
-    # ルーティング結果用（情報/計画/雑談/END）
-    route: Optional[str] = None
-
-    # 付随データ（各ノード間の受け渡し）
-    bag: Dict[str, Any] = Field(default_factory=dict)
-
-
-# ============= 状態I/Oユーティリティ =============
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def load_state(session_id: str, limit_rounds: int = 5) -> AgentState:
+def _fetch_short_term_history(db: Session, session_id: str, limit_pairs: int = 5) -> List[Dict[str, Any]]:
     """
-    DBからセッション状態を復元し、直近5往復（=10メッセージ）＋SYSTEM_TRIGGERを短期記憶として構築。
+    直近の会話履歴（user/assistant/system 含む）を最大 10 件（5往復想定）取得。
+    新しい順に取り、前後関係を保つために最後に時刻昇順で返す。
     """
-    with get_db_session() as db:
-        session = db.query(models.Session).filter(models.Session.session_id == session_id).one_or_none()
-        if session is None:
-            # ない場合は初期化
-            return AgentState(session_id=session_id)
+    q = (
+        db.query(models.ConversationHistory)
+        .filter(models.ConversationHistory.session_id == session_id)
+        .order_by(models.ConversationHistory.created_at.desc())
+        .limit(limit_pairs * 2)
+    )
+    rows = list(reversed(q.all()))
+    return [
+        {
+            "role": r.role,
+            "content": r.content,
+            "lang": r.lang,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
 
-        # セッションメタ
-        app_status = session.current_status or "Browse"
-        active_plan_id = session.active_plan_id
 
-        # 直近のメッセージ取得（SYSTEM_TRIGGER も role='system' として保存されている前提）
-        # 最新から limit_rounds*2 件（user/assistantの往復）＋SYSTEM_TRIGGERを少し多めに取得
-        q = (
-            db.query(models.ConversationHistory)
-            .filter(models.ConversationHistory.session_id == session_id)
-            .order_by(models.ConversationHistory.created_at.desc())
-            .limit(limit_rounds * 3)  # 多少多めに取って後で整形
-            .all()
-        )
-        # 逆順（古い→新しい）
-        q = list(reversed(q))
+def load_agent_state(*, session_id: str) -> Dict[str, Any]:
+    """
+    セッションから現在のアプリ状態/短期記憶を構築。
+    """
+    with SessionLocal() as db:
+        sess = db.query(models.Session).filter(models.Session.id == session_id).one_or_none()
+        if sess is None:
+            # セッションが無い場合は初期状態
+            return {
+                "session_id": session_id,
+                "app_status": "browse",
+                "active_plan_id": None,
+                "short_term_history": [],
+            }
 
-        short: List[HistoryMessage] = []
-        user_cnt = 0
-        asst_cnt = 0
-        for row in q:
-            role = row.role
-            if role == "user":
-                user_cnt += 1
-            elif role == "assistant":
-                asst_cnt += 1
-            # SYSTEM_TRIGGERは role='system' で保存
-            if role not in ("user", "assistant", "system"):
-                continue
+        short_hist = _fetch_short_term_history(db, session_id=session_id, limit_pairs=5)
 
-            short.append(
-                HistoryMessage(
-                    role=role, content=row.content or "", meta=row.metadata or {}
+        return {
+            "session_id": session_id,
+            "app_status": sess.current_status,
+            "active_plan_id": sess.active_plan_id,
+            "short_term_history": short_hist,
+        }
+
+
+def save_agent_state(*, session_id: str, agent_state: Dict[str, Any]) -> None:
+    """
+    LangGraph 実行結果を DB に保存。
+    - final_response を ConversationHistory に保存
+    - SYSTEM_TRIGGER があれば保存
+    - 直近ユーザー発話/アシスタント応答を ConversationEmbedding に保存
+    """
+    latest_user_message: Optional[str] = agent_state.get("latest_user_message")
+    final_response: Optional[str] = agent_state.get("final_response")
+    lang: Optional[str] = agent_state.get("lang") or "ja"
+    app_status: Optional[str] = agent_state.get("app_status")
+    active_plan_id: Optional[int] = agent_state.get("active_plan_id")
+
+    emb_client = EmbeddingClient()
+
+    with SessionLocal() as db:
+        # セッション状態更新
+        sess = db.query(models.Session).filter(models.Session.id == session_id).one_or_none()
+        if sess is None:
+            sess = models.Session(id=session_id)
+            db.add(sess)
+        if app_status:
+            sess.current_status = app_status
+        if active_plan_id is not None:
+            sess.active_plan_id = active_plan_id
+
+        # 1) ユーザー発話を履歴に保存（あれば）
+        if latest_user_message:
+            db.add(
+                models.ConversationHistory(
+                    session_id=session_id,
+                    role="user",
+                    content=latest_user_message,
+                    lang=lang,
                 )
             )
-            # user/assistant が5往復（=10件）に達したら以降の user/assistant は打ち切り
-            if user_cnt >= limit_rounds and asst_cnt >= limit_rounds:
-                # ただし system は通す
-                pass
 
-        # 最新のユーザー入力（あれば）
-        latest_user_message = None
-        for row in reversed(q):
-            if row.role == "user":
-                latest_user_message = row.content
-                break
+        # 2) システムトリガ（オプション）も履歴に保存（例: [SYSTEM_TRIGGER:...])
+        sys_trig = agent_state.get("system_trigger_message")
+        if isinstance(sys_trig, str) and sys_trig.strip():
+            db.add(
+                models.ConversationHistory(
+                    session_id=session_id,
+                    role="system",
+                    content=sys_trig.strip(),
+                    lang=lang,
+                )
+            )
 
-        # 言語はセッション or ユーザー設定を参照（なければ "ja"）
-        user_lang = session.user_lang or "ja"
+        # 3) アシスタント最終応答を履歴保存
+        if final_response:
+            db.add(
+                models.ConversationHistory(
+                    session_id=session_id,
+                    role="assistant",
+                    content=final_response,
+                    lang=lang,
+                )
+            )
 
-        return AgentState(
-            session_id=session_id,
-            user_lang=user_lang,
-            app_status=app_status,
-            active_plan_id=active_plan_id,
-            short_history=short,
-            latest_user_message=latest_user_message,
-        )
-
-
-def save_message(session_id: str, role: str, content: str, meta: Optional[Dict[str, Any]] = None) -> None:
-    """
-    会話履歴に1件保存。SYSTEM_TRIGGERのときは role='system'＋専用メタ。
-    """
-    with get_db_session() as db:
-        row = models.ConversationHistory(
-            session_id=session_id,
-            role=role,
-            content=content,
-            metadata=meta or {},
-            created_at=_now_utc(),
-        )
-        db.add(row)
         db.commit()
 
+        # ===== 埋め込み保存 =====
+        # 直近の user / assistant をそれぞれ埋め込み化
+        entries: List[Tuple[str, str, Optional[str], str, List[float], str]] = []
 
-def record_system_trigger(session_id: str, trigger_type: str, **kwargs: Any) -> None:
-    """
-    システムイベント（例：[SYSTEM_TRIGGER:PROXIMITY_GUIDE, spot_id:xxx]）を履歴保存。
-    """
-    meta = {"SYSTEM_TRIGGER": trigger_type}
-    meta.update(kwargs or {})
-    save_message(session_id=session_id, role="system", content=f"SYSTEM_TRIGGER:{trigger_type}", meta=meta)
+        texts_to_embed: List[Tuple[str, str]] = []  # (speaker, text)
+        if latest_user_message and latest_user_message.strip():
+            texts_to_embed.append(("user", latest_user_message.strip()))
+        if final_response and final_response.strip():
+            texts_to_embed.append(("assistant", final_response.strip()))
 
+        if texts_to_embed:
+            # まとめて埋め込み（Ollama は1件ずつなので内部でループ）
+            vectors = []
+            for _, t in texts_to_embed:
+                vectors.append(emb_client.embed_text(t))
 
-def persist_session_status(session_id: str, app_status: Optional[str] = None, active_plan_id: Optional[int] = None):
-    """
-    セッションテーブルの current_status / active_plan_id を更新。
-    """
-    with get_db_session() as db:
-        session = db.query(models.Session).filter(models.Session.session_id == session_id).one_or_none()
-        if session is None:
-            return
-        if app_status is not None:
-            session.current_status = app_status
-        if active_plan_id is not None:
-            session.active_plan_id = active_plan_id
-        session.updated_at = _now_utc()
-        db.add(session)
-        db.commit()
+            for (speaker, t), vec in zip(texts_to_embed, vectors):
+                entries.append((session_id, speaker, lang, t, vec, emb_client.model))
+
+            save_conversation_embeddings(db, entries)
