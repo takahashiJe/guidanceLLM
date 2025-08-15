@@ -1,81 +1,57 @@
-# worker/app/services/voice/tts_handler.py
+# -*- coding: utf-8 -*-
+"""
+音声合成（TTS）ハンドラ
+- Coqui TTS を CPU で実行
+- ja/en/zh の音色/モデルを簡易マッピング
+- 出力は WAV（bytes）
+"""
 
-from TTS.api import TTS
-import torch
-from typing import Optional, Dict
-import logging
 import os
+import io
+from typing import Optional, Tuple
 
-logger = logging.getLogger(__name__)
+import numpy as np
+from TTS.api import TTS
+from scipy.io.wavfile import write as wav_write
+
+
+LANG_MODEL_MAP = {
+    # 利用可能なモデルは環境に合わせて変更してください
+    # 例の日本語モデル: "tts_models/ja/kokoro/tacotron2-DDC"
+    # 英語: "tts_models/en/ljspeech/tacotron2-DDC"
+    # 中国語（簡体）例: "tts_models/zh-CN/baker/tacotron2-DDC-GST"
+    "ja": os.getenv("TTS_MODEL_JA", "tts_models/ja/kokoro/tacotron2-DDC"),
+    "en": os.getenv("TTS_MODEL_EN", "tts_models/en/ljspeech/tacotron2-DDC"),
+    "zh": os.getenv("TTS_MODEL_ZH", "tts_models/zh-CN/baker/tacotron2-DDC-GST"),
+}
+
 
 class TTSHandler:
-    """
-    Coqui TTSモデルに関する全ての処理を担当するクラス。
-    """
+    def __init__(self) -> None:
+        self.use_cuda = os.getenv("TTS_USE_CUDA", "0") == "1"
+        self.default_voice = os.getenv("TTS_VOICE", "ja-JP")
+        self.sample_rate = int(os.getenv("TTS_SAMPLE_RATE", "22050"))
 
-    def __init__(self):
+        # モデルは言語ごとにロード（必要時に遅延ロードでも可）
+        self._models = {}
+
+    def _get_tts(self, lang: str) -> TTS:
+        model_name = LANG_MODEL_MAP.get(lang, LANG_MODEL_MAP["ja"])
+        key = f"{lang}:{model_name}"
+        if key not in self._models:
+            # CPU でロード（cuda=False）
+            self._models[key] = TTS(model_name)
+        return self._models[key]
+
+    def synthesize(self, text: str, lang: str) -> Tuple[bytes, dict]:
         """
-        TTSHandlerを初期化し、各言語に対応するTTSモデルをロードする。
+        テキスト→音声（WAV）
         """
-        self.models: Dict[str, TTS] = {}
-        self.speaker_wav_path = os.getenv("SPEAKER_WAV_PATH", "default_speaker.wav") # 環境変数から話者音声パスを取得
-        
-        # 話者音声ファイルが存在するかチェック
-        if not os.path.exists(self.speaker_wav_path):
-            logger.error(f"Speaker WAV file not found at '{self.speaker_wav_path}'. TTS will likely fail.")
-            # ここでダミーファイルを作成するなどのフォールバックも可能
-
-        try:
-            logger.info("Loading Coqui TTS models...")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            
-            # XTTS-v2は多言語対応なので、一つのモデルを共有する
-            model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
-            
-            logger.info(f"Loading TTS model: {model_name}...")
-            # 共通モデルを一度だけロード
-            common_model = TTS(model_name).to(device)
-            logger.info(f"TTS model '{model_name}' loaded successfully on {device}.")
-
-            # 各言語に共通モデルを割り当て
-            for lang in ["ja", "en", "zh"]:
-                self.models[lang] = common_model
-            
-            logger.info("All TTS models assigned.")
-
-        except Exception as e:
-            logger.error(f"Failed to load Coqui TTS model. TTS will be unavailable. Error: {e}", exc_info=True)
-
-
-    def synthesize(self, text: str, language: str) -> Optional[bytes]:
-        """
-        テキストと言語を受け取り、音声合成を実行してWAV形式のbytesを返す。
-        """
-        model = self.models.get(language)
-        if not model:
-            logger.error(f"No TTS model available for language: {language}")
-            return None
-            
-        try:
-            # メモリ上でWAV形式のbytesとして直接受け取る
-            wav_bytes_list = model.tts(
-                text=text,
-                speaker_wav=self.speaker_wav_path,
-                language=language
-            )
-            
-            # tts()はリストを返すため、bytesに変換
-            wav_bytes = bytes(bytearray(wav_bytes_list))
-
-            logger.info(f"Speech synthesis successful for language: {language}")
-            return wav_bytes
-
-        except FileNotFoundError:
-             logger.error(f"Speaker WAV file not found at '{self.speaker_wav_path}' during synthesis.")
-             return None
-        except Exception as e:
-            logger.error(f"Error during speech synthesis for language '{language}': {e}", exc_info=True)
-            return None
-
-# アプリケーション全体で共有するシングルトンインスタンス
-tts_handler_instance = TTSHandler()
+        tts = self._get_tts(lang)
+        # Coqui は numpy array を返すので WAV にエンコード
+        wav: np.ndarray = tts.tts(text=text)
+        buf = io.BytesIO()
+        wav_write(buf, self.sample_rate, wav.astype(np.float32))
+        audio_bytes = buf.getvalue()
+        meta = {"sample_rate": self.sample_rate, "lang": lang}
+        return audio_bytes, meta

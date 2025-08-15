@@ -1,22 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-共有Celeryタスク定義。
-- ここにマテビュー更新タスクを追加
-- 既存のタスク名・インポートは壊さない（orchestrate, STT/TTS, routing など）
+共有Celeryタスク定義 / タスクフォワーダ
+- API ノードから Worker 専用タスクを直接 import しないためのフォワーダを提供
+- ここにマテビュー更新タスクや軽量タスクを配置
+- 既存のタスク名・インポートは壊さない（routing など）
 """
 
 import os
-from datetime import date
-from celery import shared_task
+from typing import Dict, Any
+from celery.result import AsyncResult
+from sqlalchemy import create_engine, text
 
 from shared.app.celery_app import celery_app
 from shared.app.database import SessionLocal
-from sqlalchemy import create_engine, text
 
+# ---------------------------------------------------------------------
+# DB 接続（マテビュー更新用）
+# ---------------------------------------------------------------------
 DB_URL = os.getenv("DATABASE_URL")
 _engine = create_engine(DB_URL, future=True)
 
 
+# ---------------------------------------------------------------------
+# フォワーダ：オーケストレーション
+# ---------------------------------------------------------------------
+def orchestrate_message(payload: Dict[str, Any]) -> AsyncResult:
+    """
+    API から呼ばれる「フォワーダ」関数。
+    Worker 側の 'worker.app.tasks.orchestrate_message' タスクへ委譲する。
+    - API ノードで Worker 実装を import しないために send_task を使う
+    - 戻り値は AsyncResult（フロントはポーリング運用なのでIDだけ使えばOK）
+    """
+    return celery_app.send_task("worker.app.tasks.orchestrate_message", args=[payload])
+
+
+# ---------------------------------------------------------------------
+# マテリアライズド・ビュー更新系
+# ---------------------------------------------------------------------
 @celery_app.task(name="shared.app.tasks.refresh_spot_congestion_mv")
 def refresh_spot_congestion_mv():
     """
@@ -28,6 +48,7 @@ def refresh_spot_congestion_mv():
             conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY spot_congestion_mv;"))
         except Exception:
             conn.execute(text("REFRESH MATERIALIZED VIEW spot_congestion_mv;"))
+
 
 @celery_app.task(name="worker.app.tasks.refresh_congestion_mv_task")
 def refresh_congestion_mv_task() -> str:
@@ -46,10 +67,10 @@ def refresh_congestion_mv_task() -> str:
             # MV未作成などの場合はログのみ（初回ブート順の差異考慮）
             return f"failed: {e}"
 
-# =========================================================
-# Routing 用 追加タスク
-# =========================================================
 
+# ---------------------------------------------------------------------
+# Routing 用 追加タスク
+# ---------------------------------------------------------------------
 @celery_app.task(name="routing.get_distance_and_duration", bind=True)
 def routing_get_distance_and_duration(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     """

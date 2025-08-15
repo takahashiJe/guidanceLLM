@@ -5,16 +5,19 @@
 
 import base64
 import os
-from typing import Optional
+from typing import Optional, Literal
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from api_gateway.app.security import get_current_user
+from api_gateway.app.security import get_current_user, get_current_user_optional
 from shared.app.database import get_db
 from shared.app.celery_app import celery_app
 from shared.app.schemas import ChatSubmitResponse, NavigationStartRequest, NavigationLocationRequest
+from shared.app.tasks import (
+    orchestrate_message,  # 既存の総合タスク（テキスト/音声どちらも渡せる前提）
+)
 
 load_dotenv()
 
@@ -35,35 +38,34 @@ async def submit_message(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    # テキスト or 音声のいずれかは必須
-    if not message and not audio_file:
-        raise HTTPException(status_code=400, detail="message or audio_file is required")
+    """
+    メインの対話受付。
+    - text があればそのまま受け付け
+    - audio があれば base64 に変換して Celery に委譲（STT は Worker 側）
+    - 受け付けのみで 202 を返す（NFR-2-1: 応答速度）
+    """
+    if not text and not audio:
+        raise HTTPException(status_code=400, detail="text か audio のいずれかが必要です。")
 
     audio_b64 = None
-    audio_mime = None
-    audio_name = None
-    if audio_file:
-        raw = await audio_file.read()
-        audio_b64 = base64.b64encode(raw).decode("utf-8")
-        audio_mime = audio_file.content_type or "application/octet-stream"
-        audio_name = audio_file.filename or "audio_input"
+    media_type = None
+    if audio:
+        content = await audio.read()
+        audio_b64 = base64.b64encode(content).decode("utf-8")
+        media_type = audio.content_type or "audio/wav"
 
-    # Celery タスクに投入
-    # Worker 側のタスクは session_id / user_id / message / language / audio_* を受け取る想定
-    task = celery_app.send_task(
-        ORCH_TASK_NAME,
-        kwargs={
-            "session_id": session_id,
-            "user_id": str(user.id),
-            "message": message,
-            "language": language,
-            "audio_b64": audio_b64,
-            "audio_mime": audio_mime,
-            "audio_name": audio_name,
-        },
-    )
+    payload = {
+        "session_id": session_id,
+        "lang": lang,
+        "user_id": getattr(current_user, "id", None),  # 未ログインでも None 許容
+        "text": text,
+        "audio_b64": audio_b64,
+        "media_type": media_type,
+    }
 
-    return ChatSubmitResponse(task_id=task.id, accepted=True)
+    # オーケストレーションへ非同期委譲（意図分類→必要なら STT→以降の分岐）
+    orchestrate_message(payload)
+    return {"accepted": True, "session_id": session_id}
 
 
 @router.post("/navigation/start", status_code=202)

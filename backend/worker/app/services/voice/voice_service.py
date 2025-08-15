@@ -1,42 +1,25 @@
-# worker/app/services/voice/voice_service.py
+# -*- coding: utf-8 -*-
+"""
+VoiceService
+- STT/TTS をまとめる薄いファサード
+- lang は "ja"|"en"|"zh" 想定
+"""
 
-from typing import Optional
-import logging
-from backend.worker.app.services.voice.stt_handler import stt_handler_instance
-from backend.worker.app.services.voice.tts_handler import tts_handler_instance
+from typing import Optional, Tuple
 
-logger = logging.getLogger(__name__)
+from .stt_handler import STTHandler
+from .tts_handler import TTSHandler
+
 
 class VoiceService:
-    """
-    音声認識と音声合成の機能を統括するサービスクラス。
-    """
+    def __init__(self) -> None:
+        self.stt = STTHandler()
+        self.tts = TTSHandler()
 
-    def transcribe_audio_to_text(self, audio_data: bytes) -> Optional[str]:
-        """
-        [FR-7-1] 音声データをテキストに変換する。
-        """
-        logger.info("VoiceService: Transcribing audio...")
-        if not audio_data:
-            logger.warning("transcribe_audio_to_text received empty audio data.")
-            return None
-        try:
-            return stt_handler_instance.transcribe(audio_data)
-        except Exception as e:
-            # STTHandler内で捕捉しきれなかった予期せぬエラーに対応
-            logger.error(f"An unexpected error occurred in transcribe_audio_to_text: {e}", exc_info=True)
-            return None
+    # -------- STT --------
+    def transcribe(self, audio_bytes: bytes, lang_hint: Optional[str] = None) -> Tuple[str, dict]:
+        return self.stt.transcribe(audio_bytes, lang_hint=lang_hint)
 
-    def synthesize_text_to_audio(self, text: str, language: str) -> Optional[bytes]:
-        """
-        [FR-7-2] テキストを音声データに変換する。
-        """
-        logger.info(f"VoiceService: Synthesizing speech for language '{language}'...")
-        if not text:
-            logger.warning("synthesize_text_to_audio received empty text.")
-            return None
-        try:
-            return tts_handler_instance.synthesize(text, language)
-        except Exception as e:
-            logger.error(f"An unexpected error occurred in synthesize_text_to_audio: {e}", exc_info=True)
-            return None
+    # -------- TTS --------
+    def synthesize(self, text: str, lang: str) -> Tuple[bytes, dict]:
+        return self.tts.synthesize(text, lang=lang)

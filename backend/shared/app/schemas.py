@@ -142,3 +142,32 @@ class RerouteRequest(BaseModel):
     current_location: Coordinate
     remaining_waypoints: List[Coordinate] = Field(..., min_items=1)
     profile: OSRMProfile
+
+
+class STTRequest(BaseModel):
+    """STT 用の入力ペイロード（API や Celery タスク間で使う）"""
+    session_id: str
+    audio_b64: str  # base64 エンコードされた音声
+    lang: Optional[Literal["ja", "en", "zh"]] = None
+
+
+class STTResult(BaseModel):
+    """STT の出力（文+メタ）"""
+    text: str
+    detected_language: Optional[str] = None
+    duration: Optional[float] = None
+    language_probability: Optional[float] = None
+
+
+class TTSRequest(BaseModel):
+    """TTS 用の入力ペイロード"""
+    session_id: str
+    text: str
+    lang: Literal["ja", "en", "zh"]
+
+
+class TTSResult(BaseModel):
+    """TTS の出力（base64 WAV とメタ）"""
+    audio_b64: str
+    sample_rate: int = Field(default=22050)
+    lang: Literal["ja", "en", "zh"]

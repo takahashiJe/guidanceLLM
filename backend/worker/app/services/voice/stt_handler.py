@@ -1,63 +1,73 @@
-# worker/app/services/voice/stt_handler.py
+# -*- coding: utf-8 -*-
+"""
+音声認識（STT）ハンドラ
+- faster-whisper を CPU で実行（env により compute_type, threads を調整）
+- ja/en/zh の自動/明示指定に対応
+- 入力: WAV/MP3/OGG いずれもOK（bytes）を一時ファイルに保存して推論
+- 出力: テキスト（str）とメタ情報
+"""
 
-import whisper
-import torch
-from typing import Optional
+import os
 import io
-import numpy as np
-from pydub import AudioSegment, exceptions as pydub_exceptions
-import logging
+import tempfile
+from typing import Optional, Tuple
 
-logger = logging.getLogger(__name__)
+from faster_whisper import WhisperModel
+
 
 class STTHandler:
-    """
-    Whisperモデルに関する全ての処理を担当するクラス。
-    """
+    def __init__(self) -> None:
+        # 環境変数から設定を読み込み（CPU前提）
+        self.model_name = os.getenv("STT_MODEL", "base")
+        self.device = os.getenv("STT_DEVICE", "cpu")
+        self.compute_type = os.getenv("STT_COMPUTE_TYPE", "int8")
+        self.max_threads = int(os.getenv("STT_MAX_THREADS", "4"))
+        self.lang_auto = os.getenv("STT_LANGUAGE_AUTO", "true").lower() == "true"
 
-    def __init__(self, model_name: str = "base"):
+        # モデルのロード（CPU・低メモリで安定運用）
+        # NOTE: CPU でも base/small 程度なら 1〜2秒台で応答できるケースが多い
+        self.model = WhisperModel(
+            model_size_or_path=self.model_name,
+            device=self.device,
+            compute_type=self.compute_type,
+            cpu_threads=self.max_threads,
+        )
+
+    def transcribe(
+        self,
+        audio_bytes: bytes,
+        lang_hint: Optional[str] = None,
+    ) -> Tuple[str, dict]:
         """
-        STTHandlerを初期化し、Whisperモデルをメモリにロードする。
+        音声（バイト列）→ 文字起こし
+        - lang_hint が "ja"|"en"|"zh" の場合は言語固定、それ以外は自動検出
         """
-        self.model = None
-        try:
-            logger.info(f"Loading Whisper STT model: {model_name}...")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.model = whisper.load_model(model_name, device=device)
-            logger.info(f"Whisper STT model '{model_name}' loaded successfully on {device}.")
-        except Exception as e:
-            logger.error(f"Failed to load Whisper model '{model_name}'. STT will be unavailable. Error: {e}", exc_info=True)
+        # 一時ファイルに保存してから読み込む（faster-whisper はパス/ファイルオブジェクトどちらも可）
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".wav") as tmp:
+            tmp.write(audio_bytes)
+            tmp.flush()
 
-    def transcribe(self, audio_data: bytes) -> Optional[str]:
-        """
-        音声データを受け取り、文字起こしを実行してテキストを返す。
-        """
-        if not self.model:
-            logger.error("Whisper model is not loaded. Cannot transcribe.")
-            return None
-        try:
-            audio_file = io.BytesIO(audio_data)
-            
-            # Pydubでの読み込みエラーを捕捉
-            try:
-                audio = AudioSegment.from_file(audio_file)
-            except pydub_exceptions.CouldntDecodeError as e:
-                logger.error(f"Failed to decode audio data. It might be corrupted or in an unsupported format. Error: {e}")
-                return None
+            language = None if self.lang_auto and not lang_hint else (lang_hint or None)
 
-            audio = audio.set_channels(1).set_frame_rate(16000)
-            
-            samples = np.array(audio.get_array_of_samples()).astype(np.float32) / 32768.0
+            segments, info = self.model.transcribe(
+                tmp.name,
+                language=language,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=250),
+                temperature=0.0,  # 安定性重視
+                beam_size=1,
+            )
 
-            result = self.model.transcribe(samples, language="ja", fp16=torch.cuda.is_available())
-            
-            transcribed_text = result.get("text")
-            logger.info(f"Transcription successful. Result: {transcribed_text}")
-            return transcribed_text
-            
-        except Exception as e:
-            logger.error(f"Error during audio transcription: {e}", exc_info=True)
-            return None
+            # 低レイテンシのため逐次結合（セグメント数は短音声なら数個）
+            text_parts = []
+            for seg in segments:
+                text_parts.append(seg.text.strip())
 
-# アプリケーション全体で共有するシングルトンインスタンス
-stt_handler_instance = STTHandler()
+            text = " ".join([t for t in text_parts if t])
+
+            meta = {
+                "detected_language": info.language,
+                "duration": info.duration,
+                "language_probability": getattr(info, "language_probability", None),
+            }
+            return text.strip(), meta
