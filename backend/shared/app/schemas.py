@@ -2,7 +2,9 @@
 # API 入出力で使う Pydantic スキーマ（Gateway / Worker 共有）
 from datetime import date
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
+from __future__ import annotations
+from typing import List, Literal, Optional
 
 
 # ========== Auth ==========
@@ -99,3 +101,44 @@ class CongestionStatusResponse(BaseModel):
     count: int
     status: str
 
+# =========================================================
+# Routing 用 追加スキーマ
+# =========================================================
+
+OSRMProfile = Literal["car", "foot"]
+
+
+class Coordinate(BaseModel):
+    """(lat, lon) の表現。API レイヤではこのモデルを基本に受け渡しする。"""
+
+    lat: float = Field(..., description="緯度")
+    lon: float = Field(..., description="経度")
+
+
+class GetDistanceAndDurationRequest(BaseModel):
+    origin: Coordinate
+    destination: Coordinate
+    profile: OSRMProfile
+
+
+class DistanceDurationResponse(BaseModel):
+    distance_km: float
+    duration_min: float
+
+
+class FullRouteRequest(BaseModel):
+    waypoints: List[Coordinate] = Field(..., min_items=2, description="経由地を含む座標列")
+    profile: OSRMProfile
+    piston: bool = Field(False, description="ピストン（往復）にする場合は True")
+
+
+class GeoJSONRouteResponse(BaseModel):
+    geojson: dict
+    distance_km: float
+    duration_min: float
+
+
+class RerouteRequest(BaseModel):
+    current_location: Coordinate
+    remaining_waypoints: List[Coordinate] = Field(..., min_items=1)
+    profile: OSRMProfile
