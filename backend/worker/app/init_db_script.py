@@ -33,7 +33,6 @@ def main():
     engine = wait_for_db()
 
     with engine.connect() as connection:
-        # ★★★ 修正点 ★★★
         # PostGIS拡張機能を有効化する
         print("Enabling PostGIS extension...")
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))

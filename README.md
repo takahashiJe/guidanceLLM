@@ -1,4 +1,4 @@
-# # 開発環境の起動:
+# 開発環境の起動:
 docker compose --profile "*" up
 
 # 本番環境での実行:

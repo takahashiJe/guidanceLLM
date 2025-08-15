@@ -1,21 +1,31 @@
-# docker-compose.override.yml
-# version: '3.8'
-
 services:
-  frontend:
-    build: { context: ./frontend }
-    volumes: [./frontend/streamlit_app:/app]
-
   api_gateway:
-    build: { context: ., target: development }
-    ports: ["8000:8000"]
-    volumes: ['./backend:/app/backend']
-    # ホットリロード用のコマンド
-    command: uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/backend
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+    command: >
+      uvicorn api_gateway.app.main:app
+      --host 0.0.0.0 --port 8000
+      --reload --reload-dir /app/backend
 
   worker:
-    profiles: ["worker"]
     build:
+      context: .
+      dockerfile: Dockerfile
       target: development
-    volumes: ['./backend:/app/backend']
-    command: watchfiles "celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1" /app/backend
+    volumes:
+      - ./backend:/app/backend
+    command: >
+      watchfiles "celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1" /app/backend
+    # ※ GPU は base compose 側の設定（gpus: all）が効いています
+
+  frontend:
+    build:
+      context: ./frontend
+    volumes:
+      - ./frontend/streamlit_app:/app

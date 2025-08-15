@@ -1,9 +1,6 @@
 # backend/api_gateway/app/api/v1/sessions.py
-
-import uuid
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
 
 from shared.app.database import get_db
 from shared.app import models, schemas
@@ -11,50 +8,53 @@ from api_gateway.app.security import get_current_user
 
 router = APIRouter()
 
-@router.post("/create", response_model=schemas.SessionResponse)
-def create_session(session_create: schemas.SessionCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """FR-1-2: 新しい会話セッションを作成する"""
-    if current_user.user_id != session_create.user_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to create session for this user")
-
-    try:
-        db_session = models.Session(
-            session_id=session_create.session_id,
-            user_id=session_create.user_id,
-            app_status='browsing',
-            language=session_create.language,
-            interaction_mode=session_create.interaction_mode
-        )
-        db.add(db_session)
-        db.commit()
-        db.refresh(db_session)
-        return db_session
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise e # グローバルハンドラへ
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
-
+@router.post("/create", response_model=schemas.SessionCreateResponse)
+def create_session(payload: schemas.SessionCreateRequest,
+                   db: Session = Depends(get_db),
+                   user: models.User = Depends(get_current_user)):
+    # 既存の同一IDは上書きせずエラー（フロントがUUID生成想定のため）
+    exists = db.query(models.Session).filter(models.Session.id == payload.session_id).first()
+    if exists:
+        raise HTTPException(status_code=400, detail="session_id already exists")
+    sess = models.Session(
+        id=payload.session_id,
+        user_id=user.id,
+        current_status="Browse",
+        active_plan_id=None,
+        language=payload.language or user.preferred_language or "ja",
+        dialogue_mode=payload.dialogue_mode or "text",
+    )
+    db.add(sess)
+    db.commit()
+    return schemas.SessionCreateResponse(session_id=sess.id, current_status=sess.current_status)
 
 @router.get("/restore/{session_id}", response_model=schemas.SessionRestoreResponse)
-def restore_session(session_id: uuid.UUID, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """FR-1-3: 既存セッションの状態と会話履歴を復元する"""
-    db_session = db.query(models.Session).filter(models.Session.session_id == session_id).first()
-    if not db_session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-
-    if db_session.user_id != current_user.user_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this session")
-
-    history = db.query(models.ConversationHistory).filter(models.ConversationHistory.session_id == session_id).order_by(models.ConversationHistory.turn).all()
-
-    return {
-        "session_id": db_session.session_id,
-        "user_id": db_session.user_id,
-        "app_status": db_session.app_status,
-        "active_plan_id": db_session.active_plan_id,
-        "language": db_session.language,
-        "interaction_mode": db_session.interaction_mode,
-        "history": history
-    }
+def restore_session(session_id: str,
+                    db: Session = Depends(get_db),
+                    user: models.User = Depends(get_current_user)):
+    sess = db.query(models.Session).filter(
+        models.Session.id == session_id, models.Session.user_id == user.id
+    ).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    # 直近 N 件の履歴（前後・SYSTEM_TRIGGER含む）
+    messages = (
+        db.query(models.ConversationMessage)
+        .filter(models.ConversationMessage.session_id == session_id)
+        .order_by(models.ConversationMessage.created_at.asc())
+        .all()
+    )
+    history = [
+        schemas.ChatMessage(
+            role=m.role, content=m.content, created_at=m.created_at, meta=m.meta
+        )
+        for m in messages
+    ]
+    return schemas.SessionRestoreResponse(
+        session_id=sess.id,
+        current_status=sess.current_status,
+        active_plan_id=sess.active_plan_id,
+        language=sess.language,
+        dialogue_mode=sess.dialogue_mode,
+        history=history,
+    )

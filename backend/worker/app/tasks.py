@@ -1,110 +1,252 @@
-# worker/app/tasks.py
+# backend/worker/app/tasks.py
+# ------------------------------------------------------------
+# 役割:
+#  - API Gateway から Celery 経由で渡されるタスクを受け取り、
+#    各専門サービス（オーケストレーション、音声、情報、経路など）
+#    に委譲する「受け口」を集約する。
+#  - タスク名は必ず shared.app.tasks のシグネチャ（名前）と一致させる。
+#  - ここではビジネスロジックは極力書かず、呼び出しと例外処理に徹する。
+#
+# ポイント:
+#  - テキスト/音声の混在に対応（音声はSTTでテキスト化）
+#  - LangGraph の実行（orchestrator）を単一のタスクに集約
+#  - ナビ開始/位置更新のトリガーを用意（Navigation Service連携）
+#  - 事前ガイド生成のタスクを用意（pre_generated_guides への保存は
+#    各サービス側の責務。ここでは委譲のみ）
+# ------------------------------------------------------------
 
-from uuid import UUID
-from celery.utils.log import get_task_logger
-from typing import Optional, Dict, Any
+from __future__ import annotations
 
-# Celeryアプリケーションのインスタンスをインポート
+import base64
+import traceback
+from typing import Any, Dict, Optional
+
 from shared.app.celery_app import celery_app
+from shared.app.tasks import (
+    TASK_ORCHESTRATE_CONVERSATION,
+    TASK_START_NAVIGATION,
+    TASK_UPDATE_LOCATION,
+    TASK_PREGENERATE_GUIDES,
+)
 
-# 各専門サービスとオーケストレーターのグラフをインポート
-# (実際にはDIコンテナ等でインスタンスを管理するのが望ましい)
-from worker.app.services.orchestration.graph import app as orchestration_graph
-from worker.app.services.orchestration.state import load_state, save_state
-# from worker.app.services.navigation.navigation_service import NavigationService # 実行時に動的に生成
+# DB 接続やスキーマ（必要に応じて使用）
+from shared.app.database import SessionLocal
+from shared.app import models, schemas
 
-# Celeryタスク用のロガーを取得
-logger = get_task_logger(__name__)
+# 各サービス（Worker 側）をインポート
+from worker.app.services.voice.voice_service import VoiceService
+from worker.app.services.orchestration import state as orch_state
+from worker.app.services.orchestration.graph import build_graph  # LangGraph 構築
+from worker.app.services.navigation.navigation_service import NavigationService
+
+# 必要に応じて利用（ナッジ・距離/時間などは内部で他サービスへ連携）
+from worker.app.services.information.information_service import InformationService
+from worker.app.services.itinerary.itinerary_service import ItineraryService
+from worker.app.services.routing.routing_service import RoutingService
 
 
-@celery_app.task(name="orchestrate_conversation_task", bind=True, max_retries=3)
-def orchestrate_conversation_task(self, *, session_id: str, user_id: int, text: Optional[str], audio_data: Optional[bytes]):
+def _ensure_text_from_audio_if_needed(
+    *,
+    message_text: Optional[str],
+    audio_b64: Optional[str],
+    source_lang: Optional[str],
+) -> str:
     """
-    [メインタスク] ユーザーとの対話全体をオーケストレーションする。
-    API Gatewayの /message エンドポイントから呼び出される。
+    音声入力が来た場合は STT でテキスト化し、テキスト入力があれば優先する。
     """
-    logger.info(f"Task 'orchestrate_conversation_task' started for session_id: {session_id}")
+    if message_text and message_text.strip():
+        return message_text.strip()
+
+    if audio_b64:
+        # base64 -> bytes -> STT
+        try:
+            audio_bytes = base64.b64decode(audio_b64)
+        except Exception:
+            raise ValueError("音声データ(base64)のデコードに失敗しました。")
+
+        vs = VoiceService()
+        # Whisper で STT。source_lang が None の場合は自動検出を期待。
+        text = vs.stt_handler.transcribe_audio_bytes(audio_bytes, language=source_lang)
+        if not text or not text.strip():
+            raise ValueError("音声のテキスト化に失敗しました。")
+        return text.strip()
+
+    raise ValueError("message_text も audio_b64 も指定されていません。")
+
+
+@celery_app.task(name=TASK_ORCHESTRATE_CONVERSATION, bind=True)
+def orchestrate_conversation_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    対話の全体オーケストレーションを実行する中核タスク。
+    - 入力: { session_id, user_id, lang, input_mode, message_text?, audio_b64? }
+    - 出力: { final_response, app_status, active_plan_id, ... }
+    """
     try:
-        # TODO: audio_dataが渡された場合、ここで音声サービスを呼び出しテキストに変換する
-        user_message = text # 現状はテキストのみを想定
+        session_id: str = payload.get("session_id")
+        user_id: Optional[int] = payload.get("user_id")
+        lang: str = payload.get("lang", "ja")
+        input_mode: str = payload.get("input_mode", "text")  # "text" or "voice"
+        message_text: Optional[str] = payload.get("message_text")
+        audio_b64: Optional[str] = payload.get("audio_b64")
 
-        # 1. 対話の初期状態をDBからロードする
-        initial_state = load_state(UUID(session_id))
-        initial_state["userInput"] = user_message
+        if not session_id:
+            raise ValueError("session_id は必須です。")
 
-        # 2. LangGraphで構築されたステートマシンを実行する
-        final_state = None
-        for event in orchestration_graph.stream(initial_state):
-            for key, value in event.items():
-                logger.debug(f"Graph node '{key}' executed for session {session_id}.")
-                final_state = value
+        # 1) 必要なら STT を実行してテキスト化
+        latest_text = _ensure_text_from_audio_if_needed(
+            message_text=message_text, audio_b64=audio_b64, source_lang=lang
+        )
 
-        # 3. 最終的な状態をDBに保存する
-        if final_state:
-            save_state(final_state)
-            logger.info(f"Task 'orchestrate_conversation_task' finished successfully for session_id: {session_id}")
-            return final_state.get("finalResponse", "No response generated.")
-        else:
-            raise ValueError("LangGraph did not produce a final state.")
+        # 2) グラフを構築（LangGraph）
+        app = build_graph()
+
+        # 3) State をロード
+        agent_state = orch_state.load_agent_state(session_id=session_id)
+
+        # 4) LangGraph を実行
+        #    - nodes 内で Information/Itinerary/Routing/LLM などへ委譲される
+        result_state = app.invoke(
+            {
+                "session_id": session_id,
+                "user_id": user_id,
+                "lang": lang,
+                "input_mode": input_mode,
+                "latest_user_message": latest_text,
+                "agent_state": agent_state,
+            }
+        )
+
+        # 5) State を永続化（会話履歴・最終応答・アプリ状態など）
+        orch_state.save_agent_state(session_id=session_id, agent_state=result_state)
+
+        # 6) フロントに返す最小限の要約（Gateway がポーリングで取得する想定）
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "app_status": result_state.get("app_status"),
+            "active_plan_id": result_state.get("active_plan_id"),
+            "final_response": result_state.get("final_response"),
+        }
 
     except Exception as e:
-        logger.error(f"Error in orchestrate_conversation_task for session {session_id}: {e}", exc_info=True)
-        # エラーが発生した場合、指数バックオフで再試行
-        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+        traceback.print_exc()
+        return {
+            "ok": False,
+            "error": str(e),
+        }
 
 
-@celery_app.task(name="start_navigation_task", bind=True, max_retries=3)
-def start_navigation_task(self, *, session_id: str, plan_id: int, user_id: int):
+@celery_app.task(name=TASK_START_NAVIGATION, bind=True)
+def navigation_start_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    [ナビゲーションタスク] ナビゲーションセッションを開始する。
-    API Gatewayの /navigation/start エンドポイントから呼び出される。
+    ナビゲーション開始のトリガー。
+    - 入力: { session_id, user_id, lang }
+    - nodes / services 側でガイド文の事前生成を行い、pre_generated_guides へ保存する想定。
     """
-    logger.info(f"Task 'start_navigation_task' started for session_id: {session_id}, plan_id: {plan_id}")
     try:
-        # ここでオーケストレーターのナビゲーション開始フローを呼び出す
-        # 例: orchestration_graph.invoke({"startNavigation": {"plan_id": plan_id, ...}})
-        # このフロー内で、ルート計算、ガイド対象スポット特定、ガイドテキスト事前生成などが行われる。
-        # そして、生成されたNavigationServiceインスタンスをセッションに紐づけてキャッシュに保存する。
-        logger.info("--- (Placeholder) Orchestrator's navigation start flow would be called here. ---")
-        
-        logger.info(f"Task 'start_navigation_task' finished successfully for session_id: {session_id}")
-        return {"status": "Navigation session initialized."}
+        session_id: str = payload.get("session_id")
+        user_id: Optional[int] = payload.get("user_id")
+        lang: str = payload.get("lang", "ja")
 
+        if not session_id:
+            raise ValueError("session_id は必須です。")
+
+        # State をナビゲーションモードへ移行＆ガイド文を事前生成
+        app = build_graph()
+        agent_state = orch_state.load_agent_state(session_id=session_id)
+
+        result_state = app.invoke(
+            {
+                "session_id": session_id,
+                "user_id": user_id,
+                "lang": lang,
+                "latest_user_message": "[SYSTEM_TRIGGER:NAVIGATION_START]",
+                "agent_state": agent_state,
+                "force_navigation_start": True,
+            }
+        )
+
+        orch_state.save_agent_state(session_id=session_id, agent_state=result_state)
+
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "app_status": result_state.get("app_status"),
+        }
     except Exception as e:
-        logger.error(f"Error in start_navigation_task for session {session_id}: {e}", exc_info=True)
-        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}
 
 
-@celery_app.task(name="update_location_task", ignore_result=True)
-def update_location_task(*, session_id: str, user_id: int, latitude: float, longitude: float):
+@celery_app.task(name=TASK_UPDATE_LOCATION, bind=True)
+def navigation_location_update_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    [ナビゲーションタスク] ユーザーの現在地を更新し、イベントを処理する。
-    API Gatewayの /navigation/location エンドポイントから呼び出される。
+    位置情報の継続アップデート（ナビ実行中）。
+    - 入力: { session_id, user_id, lat, lon }
+    - NavigationService に委譲し、逸脱/接近の検知→必要に応じて
+      オーケストレーションやリルート計算へ通知する。
     """
-    # このタスクは頻繁に呼び出されるため、ロギングは控えめにするか、DEBUGレベルにする
-    # logger.debug(f"Task 'update_location_task' for session_id: {session_id}")
     try:
-        # 1. キャッシュからセッションに紐づくNavigationServiceインスタンスを取得
-        # nav_service = get_nav_service_from_cache(session_id)
-        # if not nav_service:
-        #     logger.warning(f"NavigationService not found in cache for session {session_id}. Task ignored.")
-        #     return
+        session_id: str = payload.get("session_id")
+        user_id: Optional[int] = payload.get("user_id")
+        lat = payload.get("lat")
+        lon = payload.get("lon")
 
-        # 2. NavigationServiceに現在地を渡してイベントをチェック
-        current_location = {"latitude": latitude, "longitude": longitude}
-        # event = nav_service.update_user_location(current_location)
-        
-        # --- (Placeholder) 以下は本来のロジック ---
-        event: Optional[Dict[str, Any]] = None # ダミー
-        logger.info(f"--- (Placeholder) NavigationService would check for events at {current_location}. ---")
-        # --- (Placeholderここまで) ---
+        if not session_id:
+            raise ValueError("session_id は必須です。")
+        if lat is None or lon is None:
+            raise ValueError("lat, lon は必須です。")
 
-        if event:
-            logger.info(f"Event '{event['event_type']}' detected for session {session_id}.")
-            # 3. イベントが発生した場合、オーケストレーターに処理を依頼する新しいタスクを投入
-            # handle_navigation_event_task.delay(session_id=session_id, event=event)
+        nav = NavigationService()
+        events = nav.process_tick(
+            session_id=session_id,
+            current_location={"lat": float(lat), "lon": float(lon)},
+        )
 
+        # NavigationService 側で、
+        # - 逸脱検知→RoutingService のリルート計算トリガー
+        # - 接近検知→pre_generated_guides から該当スポットのガイド取得→TTS
+        # などを実行する想定（ここはあくまで委譲）
+
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "events": events,  # 例: [{"type":"deviation_detected"}, {"type":"proximity", "spot_id":"..."}]
+        }
     except Exception as e:
-        # このタスクは失敗しても再試行しない（次の位置情報更新でカバーされるため）
-        logger.error(f"Error in update_location_task for session {session_id}: {e}", exc_info=True)
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}
 
+
+@celery_app.task(name=TASK_PREGENERATE_GUIDES, bind=True)
+def pregenerate_guides_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ガイド文を事前生成して保存するタスク。
+    - 入力: { session_id, lang }
+    - 実体は Orchestrator/LLM/Information の連携で生成し、DB (pre_generated_guides) に保存。
+    """
+    try:
+        session_id: str = payload.get("session_id")
+        lang: str = payload.get("lang", "ja")
+        if not session_id:
+            raise ValueError("session_id は必須です。")
+
+        app = build_graph()
+        agent_state = orch_state.load_agent_state(session_id=session_id)
+
+        result_state = app.invoke(
+            {
+                "session_id": session_id,
+                "lang": lang,
+                "latest_user_message": "[SYSTEM_TRIGGER:PREGENERATE_GUIDES]",
+                "agent_state": agent_state,
+                "force_pregenerate_guides": True,
+            }
+        )
+
+        orch_state.save_agent_state(session_id=session_id, agent_state=result_state)
+
+        return {"ok": True, "session_id": session_id}
+    except Exception as e:
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}

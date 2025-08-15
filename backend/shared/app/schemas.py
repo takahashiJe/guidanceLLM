@@ -1,181 +1,68 @@
-# shared/app/schemas.py
-
-from typing import TypedDict, List, Optional, Any
-from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field
-from uuid import UUID
+# backend/shared/app/schemas.py
 from datetime import datetime
-from enum import Enum
+from typing import Optional, List, Any
+from pydantic import BaseModel, Field, EmailStr
 
-# ==============================================================================
-# LangGraph Agent State
-# ==============================================================================
-class AgentState(TypedDict):
-    """
-    LangGraphのグラフ全体で受け渡される状態オブジェクト。
-    FR-1, FR-2, FR-6, FR-7の要件を管理する。
-    """
-    # === セッション情報 ===
-    # FR-1-1: 認証されたユーザーのID
-    userId: int
-    
-    # FR-1-2: 現在の会話セッションのID
-    sessionId: str
-    
-    # FR-6-1: ユーザーが選択した言語 ('ja', 'en', 'zh')
-    language: str
+# ===== Auth =====
 
-    # FR-7-3: 現在の対話モード ('text' or 'voice')
-    interactionMode: str
-    
-    # FR-1-3: 現在のアプリの状態 ('Browse', 'planning', 'navigating')
-    appStatus: str
-    
-    # === 対話情報 ===
-    # FR-2-2: LLMに渡す直近の会話履歴
-    chatHistory: List[BaseMessage]
-
-    # フロントエンドに返却する、AIの最終応答テキスト
-    finalResponse: str
-
-    # === 計画情報 ===
-    # FR-4: 現在編集中の周遊計画ID
-    activePlanId: Optional[int]
-    
-    # --- 内部処理用 ---
-    
-    # ノード間で受け渡す一時的なデータ
-    # (例: Agentic RAGで収集した情報、推薦候補スポットリストなど)
-    intermediateData: dict
-
-# ==============================================================================
-# 認証 (Authentication) 関連スキーマ
-# ==============================================================================
-
-class UserBase(BaseModel):
-    """ユーザー情報の基本スキーマ"""
+class UserCreate(BaseModel):
     username: str
+    email: EmailStr
+    password: str
+    preferred_language: Optional[str] = "ja"
 
-class UserCreate(UserBase):
-    """[POST /register] 新規ユーザー登録時のリクエストボディ"""
+class LoginRequest(BaseModel):
+    username: str
     password: str
 
-class UserResponse(UserBase):
-    """[POST /register] 新規ユーザー登録成功時のレスポンスボディ"""
-    user_id: int
-
-    class Config:
-        from_attributes = True
-
-class Token(BaseModel):
-    """[POST /login] ログイン成功時のレスポンスボディ"""
+class TokenPair(BaseModel):
     access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-
-class RefreshToken(BaseModel):
-    """[POST /token/refresh] トークン更新時のリクエストボディ"""
     refresh_token: str
 
 class AccessToken(BaseModel):
-    """[POST /token/refresh] トークン更新成功時のレスポンスボディ"""
     access_token: str
-    token_type: str = "bearer"
+    # ローテーションの都合で新 refresh も返す
+    refresh_token: Optional[str] = None
 
-class TokenData(BaseModel):
-    """JWTトークンのペイロード（内容）を検証するための内部利用スキーマ"""
-    username: Optional[str] = None
+class TokenRefreshRequest(BaseModel):
+    refresh_token: str
 
+# ===== Sessions =====
 
-# ==============================================================================
-# セッション (Session) 関連スキーマ
-# ==============================================================================
+class SessionCreateRequest(BaseModel):
+    session_id: str
+    language: Optional[str] = "ja"
+    dialogue_mode: Optional[str] = "text"  # text / voice
 
-class SessionCreate(BaseModel):
-    """[POST /sessions/create] 新規セッション作成時のリクエストボディ"""
-    session_id: UUID
-    user_id: int
-    language: str
-    interaction_mode: str
+class SessionCreateResponse(BaseModel):
+    session_id: str
+    current_status: str
 
-class SessionResponse(BaseModel):
-    """[POST /sessions/create] 新規セッション作成成功時のレスポンスボディ"""
-    session_id: UUID
-    user_id: int
-
-    class Config:
-        from_attributes = True
-
-class ConversationHistoryResponse(BaseModel):
-    """会話履歴のレスポンス形式 (セッション復元時に使用)"""
-    turn: int
-    user_input: Optional[str]
-    ai_output: Optional[str]
+class ChatMessage(BaseModel):
+    role: str  # user / assistant / system_trigger
+    content: str
     created_at: datetime
+    meta: Optional[dict] = None
 
-    class Config:
-        from_attributes = True
-        
 class SessionRestoreResponse(BaseModel):
-    """[GET /sessions/restore/{session_id}] セッション復元成功時のレスポンスボディ"""
-    session_id: UUID
-    user_id: int
-    app_status: str
-    active_plan_id: Optional[int]
+    session_id: str
+    current_status: str
+    active_plan_id: Optional[int] = None
     language: str
-    interaction_mode: str
-    history: List[ConversationHistoryResponse]
+    dialogue_mode: str
+    history: List[ChatMessage] = []
 
+# ===== Chat / Navigation =====
 
-# ==============================================================================
-# 対話 (Chat) 関連スキーマ
-# ==============================================================================
-
-class ChatRequest(BaseModel):
-    """[POST /chat/] チャットリクエストのリクエストボディ"""
-    session_id: UUID
-    user_message: str
-
-class ChatResponse(BaseModel):
-    """[POST /chat/] チャットリクエスト受付成功時のレスポンスボディ"""
-    message: str
+class TaskAcceptedResponse(BaseModel):
     task_id: str
 
-# ==============================================================================
-# ナビゲーション (Navigation) 関連スキーマ
-# ==============================================================================
+class NavigationStartRequest(BaseModel):
+    session_id: str
 
-class NavigationStart(BaseModel):
-    """[POST /navigation/start] ナビゲーション開始時のリクエストボディ"""
-    session_id: UUID
-    plan_id: int
-
-class LocationData(BaseModel):
-    """[POST /navigation/location] 位置情報更新時のリクエストボディ"""
-    session_id: UUID
-    latitude: float
-    longitude: float
-
-# ==============================================================================
-# Intentはworker/app/services/orchestration/router.pyで使用
-# ==============================================================================
-
-class Intent(str, Enum):
-    """
-    ユーザーの意図を分類するためのカテゴリ。
-    LLMはこのEnumのメンバー名のいずれかを返すように指示される。
-    """
-    SPECIFIC_SPOT_QUESTION = "specific_spot_question" # 例: 「法体の滝について教えて」
-    GENERAL_TOURIST_SPOT_QUESTION = "general_tourist_spot_question" # 例: 「どこか良い観光地ない？」
-    CATEGORY_SPOT_QUESTION = "category_spot_question" # 例: 「泊まれるところ探して」
-    PLAN_CREATION_REQUEST = "plan_creation_request" # 例: 「旅行の計画を立てたい」
-    PLAN_EDIT_REQUEST = "plan_edit_request" # 例: 「計画に〇〇を追加して」
-    PLAN_CONFIRMATION = "plan_confirmation" # 例: 「それで確定して」
-    PLAN_CANCEL = "plan_cancel" # 例: 「計画をやめる」
-    CHITCHAT = "chitchat" # 雑談
-    UNKNOWN = "unknown" # 不明
-
-class IntentClassificationResult(BaseModel):
-    """意図分類タスクの出力スキーマ"""
-    intent: Intent = Field(description="分類されたユーザーの意図。")
-    extracted_category: Optional[str] = Field(None, description="カテゴリに関する質問の場合、抽出されたカテゴリ名（例：「温泉」、「絶景」）。")
+class NavigationLocationUpdate(BaseModel):
+    session_id: str
+    lat: float
+    lon: float
+    heading: Optional[float] = None
+    speed: Optional[float] = None

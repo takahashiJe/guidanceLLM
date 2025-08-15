@@ -1,24 +1,30 @@
-# docker-compose.prod.yml
-# version: '3.8'
-
 services:
-  frontend:
-    build: { context: ./frontend }
-
   api_gateway:
-    build: { context: ., target: production }
-    ports: ["8000:8000"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    ports:
+      - "8000:8000"
     command: uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
 
   worker:
-    build: { context: ., target: production }
-    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
     command: celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1
-  
+    restart: unless-stopped
+    # GPU は base compose 側の gpus: all が有効
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
   ollama:
     restart: always
-  
-  osrm:
+
+  osrm-car:
     restart: always
 
   osrm-foot:

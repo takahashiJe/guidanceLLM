@@ -2,17 +2,10 @@
 import os
 from celery import Celery
 
-# 環境変数から接続情報を取得
-broker_url = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
-result_backend_url = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
+BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
+RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 
-# Celeryアプリケーションのインスタンスを作成
-celery_app = Celery(
-    "worker",
-    broker=broker_url,
-    backend=result_backend_url,
-    include=["worker.app.tasks"] # 実行するタスクが定義されているモジュールを指定
-)
+celery_app = Celery("chokai_shared", broker=BROKER_URL, backend=RESULT_BACKEND)
 
 # Celeryの設定（オプション）
 celery_app.conf.update(

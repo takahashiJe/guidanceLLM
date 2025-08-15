@@ -1,75 +1,17 @@
-# docker-compose.yml
 version: '3.8'
 
 services:
-  # --- Tools ---
-  db-init:
-    profiles: ["tools"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: development
-    env_file: .env
-    depends_on:
-      db:
-        condition: service_healthy
-    volumes: ['./backend:/app/backend']
-    command: ["python", "worker/app/init_db_script.py"]
-    networks: [backend_network]
-
-  # --- Main Application Services ---
-  frontend:
-    profiles: ["dev", "api"] # devまたはapiプロファイルで起動
-    build: { context: ./frontend }
-    ports: ["8501:8501"]
-    depends_on: [api_gateway]
-    networks: [frontend_network]
-
-  api_gateway:
-    profiles: ["api"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
-    env_file: .env
-    environment:
-      - PYTHONPATH=/app/backend
-    depends_on:
-      redis: { condition: service_healthy }
-      db: { condition: service_healthy }
-    networks: [backend_network, frontend_network]
-    # command は override/prod ファイルで定義するため、ここでは記述しない
-
-  worker:
-    profiles: ["worker"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
-    deploy:
-      resources:
-        reservations:
-          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
-    runtime: nvidia
-    env_file: .env
-    environment:
-      - PYTHONPATH=/app/backend
-      - OLLAMA_HOST=http://ollama:11434
-    depends_on:
-      ollama: { condition: service_started }
-      redis: { condition: service_healthy }
-      db: { condition: service_healthy }
-      osrm-car: { condition: service_started }
-      osrm-foot: { condition: service_started }
-    networks: [backend_network]
-
-  # --- Dependencies ---
+  # =========================
+  # 依存ミドルウェア
+  # =========================
   db:
     profiles: ["api", "worker", "tools"]
     image: postgis/postgis:15-3.4
     env_file: .env
-    ports: ["5432:5432"]
-    volumes: [postgres_data:/var/lib/postgresql/data]
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -80,7 +22,8 @@ services:
   redis:
     profiles: ["api", "worker"]
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -88,34 +31,130 @@ services:
       retries: 5
     networks: [backend_network]
 
+  # =========================
+  # GPU を使うサービス
+  # =========================
   ollama:
     profiles: ["worker"]
     image: ollama/ollama:latest
-    ports: ["11434:11434"]
-    volumes: [ollama_data:/root/.ollama]
-    deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
-    runtime: nvidia
+    env_file: .env
+    environment:
+      - OLLAMA_HOST=${OLLAMA_HOST}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    gpus: all
     networks: [backend_network]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   osrm-car:
     profiles: ["worker"]
     image: osrm/osrm-backend:latest
-    ports: ["5000:5000"]
-    volumes: ['./backend/worker/data/map/car:/data']
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend/worker/data/map/car:/data
     command: osrm-routed --algorithm mld /data/japan-latest.osrm
     networks: [backend_network]
 
   osrm-foot:
     profiles: ["worker"]
     image: osrm/osrm-backend:latest
-    ports: ["5001:5000"]
-    volumes: ['./backend/worker/data/map/foot:/data']
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./backend/worker/data/map/foot:/data
     command: osrm-routed --algorithm mld /data/japan-latest-foot.osrm
     networks: [backend_network]
 
+  # =========================
+  # アプリ本体
+  # =========================
+  api_gateway:
+    profiles: ["api"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app/backend
+      - APP_ENV=${APP_ENV}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS}
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    networks: [backend_network, frontend_network]
+
+  worker:
+    profiles: ["worker"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app/backend
+      - APP_ENV=${APP_ENV}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - OLLAMA_HOST=${OLLAMA_HOST}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    depends_on:
+      ollama:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      osrm-car:
+        condition: service_started
+      osrm-foot:
+        condition: service_started
+    # gpus: all
+    networks: [backend_network]
+
+  frontend:
+    profiles: ["dev", "api"]
+    build:
+      context: ./frontend
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api_gateway
+    networks: [frontend_network]
+
+  # =========================
+  # DB 初期化ツール
+  # =========================
+  db-init:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+    command: ["python", "backend/worker/app/init_db_script.py"]
+    networks: [backend_network]
+
 volumes:
-  ollama_data:
   postgres_data:
+  ollama_data:
 
 networks:
   backend_network:

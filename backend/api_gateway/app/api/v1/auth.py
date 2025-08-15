@@ -1,71 +1,79 @@
 # backend/api_gateway/app/api/v1/auth.py
-
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
+import uuid
 
 from shared.app.database import get_db
 from shared.app import models, schemas
-from api_gateway.app import security
+from api_gateway.app.security import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    create_refresh_token,
+)
 
 router = APIRouter()
 
-@router.post("/register", response_model=schemas.UserResponse, status_code=status.HTTP_201_CREATED)
-def register_user(user_create: schemas.UserCreate, db: Session = Depends(get_db)):
-    """FR-1-1: 新規ユーザー登録"""
-    db_user = db.query(models.User).filter(models.User.username == user_create.username).first()
-    if db_user:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already registered")
-    
-    try:
-        hashed_password = security.get_password_hash(user_create.password)
-        db_user = models.User(username=user_create.username, hashed_password=hashed_password)
-        db.add(db_user)
-        db.commit()
-        db.refresh(db_user)
-        return db_user
-    except SQLAlchemyError as e:
-        db.rollback()
-        # main.pyのグローバルハンドラに捕捉させるため、再度raiseする
-        raise e
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
+@router.post("/register", response_model=schemas.TokenPair)
+def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
+    exists = db.query(models.User).filter(
+        (models.User.username == payload.username) | (models.User.email == payload.email)
+    ).first()
+    if exists:
+        raise HTTPException(status_code=400, detail="User already exists")
+    user = models.User(
+        username=payload.username,
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        preferred_language=payload.preferred_language or "ja",
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    # refresh token の jti をユーザーに保存（ローテーション前提）
+    jti = str(uuid.uuid4())
+    user.refresh_token_jti = jti
+    db.commit()
+    access = create_access_token(sub=user.username)
+    refresh = create_refresh_token(sub=user.username, jti=jti)
+    return schemas.TokenPair(access_token=access, refresh_token=refresh)
 
+@router.post("/login", response_model=schemas.TokenPair)
+def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.username == payload.username).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    # ログイン時も refresh をローテーション
+    import uuid
+    jti = str(uuid.uuid4())
+    user.refresh_token_jti = jti
+    db.commit()
+    access = create_access_token(sub=user.username)
+    refresh = create_refresh_token(sub=user.username, jti=jti)
+    return schemas.TokenPair(access_token=access, refresh_token=refresh)
 
-@router.post("/login", response_model=schemas.Token)
-def login_for_access_token(db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()):
-    """FR-1-1: ログイン処理とトークン発行"""
-    user = authenticate_user(db, form_data.username, form_data.password)
-    if not user or not security.verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    access_token = security.create_access_token(data={"sub": user.username})
-    refresh_token = security.create_refresh_token(data={"sub": user.username})
-    
-    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
-
-# /token/refresh エンドポイントは現在の実装で十分堅牢なため、変更なし
 @router.post("/token/refresh", response_model=schemas.AccessToken)
-def refresh_access_token(refresh_token: schemas.RefreshToken, db: Session = Depends(get_db)):
-    """FR-1-1: リフレッシュトークンを使ったアクセストークンの再発行"""
+def refresh_token(payload: schemas.TokenRefreshRequest, db: Session = Depends(get_db)):
+    from jose import JWTError
+    from api_gateway.app.security import decode_token
     try:
-        payload = security.jwt.decode(refresh_token.refresh_token, security.SECRET_KEY, algorithms=[security.ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
-        
-        user = db.query(models.User).filter(models.User.username == username).first()
-        if user is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found for token")
-
-        access_token = security.create_access_token(data={"sub": user.username})
-        return {"access_token": access_token, "token_type": "bearer"}
-
-    except security.JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
+        decoded = decode_token(payload.refresh_token)
+        if decoded.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        username = decoded.get("sub")
+        jti = decoded.get("jti")
+        if not username or not jti:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if not user or user.refresh_token_jti != jti:
+        raise HTTPException(status_code=401, detail="Refresh token is not recognized (rotated)")
+    # Refresh ローテーション：新しい jti を付与
+    new_jti = str(uuid.uuid4())
+    user.refresh_token_jti = new_jti
+    db.commit()
+    from api_gateway.app.security import create_access_token, create_refresh_token
+    new_access = create_access_token(sub=username)
+    new_refresh = create_refresh_token(sub=username, jti=new_jti)
+    return schemas.AccessToken(access_token=new_access, refresh_token=new_refresh)
