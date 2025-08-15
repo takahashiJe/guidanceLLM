@@ -1,115 +1,119 @@
-# worker/app/services/orchestration/graph.py
+# -*- coding: utf-8 -*-
+"""
+graph.py
+- LangGraph 配線（router → nodes）
+- worker/app/tasks.py から呼び出されるエントリ runnable を公開
+"""
+
+from __future__ import annotations
+from typing import Any, Dict
 
 from langgraph.graph import StateGraph, END
-from typing import Literal
 
-from shared.app.schemas import AgentState
-
-# 各ファイルからノードとルーター、そして条件分岐用の関数をインポート
-from .router import route_conversation
-from .nodes.shared_nodes import chitchat_node, error_node
+from .state import AgentState, load_state
+from .router import route_next
 from .nodes.information_nodes import (
-    find_candidate_spots_node,
-    gather_nudge_data_node,
-    select_best_spot_node,
-    generate_nudge_proposal_node,
-    check_spot_found, # 条件分岐用の関数
-    handle_no_spot_found_node
+    information_entry,
+    gather_nudge_and_pick_best,
+    compose_nudge_response,
 )
 from .nodes.itinerary_nodes import (
-    create_plan_node,
-    summarize_plan_node,
-    extract_plan_edit_node,
-    execute_plan_edit_node,
-    check_plan_edit_extraction # 条件分岐用の関数
+    upsert_plan,
+    calc_preview_route_and_summarize,
 )
-
-# --- グラフの定義 ---
-workflow = StateGraph(AgentState)
-
-# --- 全ノードの登録 ---
-# Shared
-workflow.add_node("chitchat", chitchat_node)
-workflow.add_node("error", error_node)
-
-# Information (Nudge) Flow
-workflow.add_node("find_candidate_spots", find_candidate_spots_node)
-workflow.add_node("gather_nudge_data", gather_nudge_data_node)
-workflow.add_node("select_best_spot", select_best_spot_node)
-workflow.add_node("generate_nudge_proposal", generate_nudge_proposal_node)
-workflow.add_node("handle_no_spot_found", handle_no_spot_found_node)
-workflow.add_node("check_spot_found", check_spot_found)
-
-# Itinerary (Planning) Flow
-workflow.add_node("create_plan", create_plan_node)
-workflow.add_node("summarize_plan", summarize_plan_node)
-workflow.add_node("extract_plan_edit", extract_plan_edit_node)
-workflow.add_node("execute_plan_edit", execute_plan_edit_node)
-workflow.add_node("check_plan_edit_extraction", check_plan_edit_extraction)
+from .nodes.shared_nodes import chitchat_node, error_node
 
 
-# --- グラフのエントリーポイントとメインルーター ---
-workflow.set_entry_point("router")
+def _information_flow(state: AgentState) -> AgentState:
+    """
+    情報提供フロー：候補抽出 → ナッジ材料収集・最適日決定 → 提案文生成
+    """
+    try:
+        state = information_entry(state)
+        state = gather_nudge_and_pick_best(state)
+        state = compose_nudge_response(state)
+    except Exception as e:
+        state = error_node(state, f"情報提供フローでエラー: {e}")
+    return state
 
-# メインの条件分岐: ユーザーの意図に応じて各フローの入り口へ
-workflow.add_conditional_edges(
-    "router",
-    route_conversation,
-    {
-        "chitchat": "chitchat",
-        "find_candidate_spots": "find_candidate_spots", # 情報提供フローへ
-        "create_plan": "create_plan",                 # 新規計画作成フローへ
-        "extract_plan_edit": "extract_plan_edit",     # 計画編集フローへ
-        "summarize_plan": "summarize_plan",           # 計画要約フローへ
-        "error": "error",
-        END: END # 会話を終了する場合
-    },
-)
 
-# --- 情報提供 (育成型ナッジ) フローの配線 ---
-# 1. 候補スポットを検索
-workflow.add_edge("find_candidate_spots", "check_spot_found")
-# 2. 検索結果に応じて分岐
-workflow.add_conditional_edges(
-    "find_candidate_spots", # ← 開始点を修正
-    check_spot_found,
-    {
-        "continue": "gather_nudge_data", # 見つかった場合 -> ナッジ情報収集へ
-        "stop": "handle_no_spot_found"   # 見つからなかった場合 -> 専用の応答生成へ
+def _planning_flow(state: AgentState) -> AgentState:
+    """
+    計画フロー：CRUD → 暫定ルート計算 → LLM要約
+    """
+    try:
+        state = upsert_plan(state)
+        state = calc_preview_route_and_summarize(state)
+    except Exception as e:
+        state = error_node(state, f"計画フローでエラー: {e}")
+    return state
+
+
+def build_graph():
+    """
+    StateGraph を構築し、Runnable にコンパイルして返す。
+    - 入口で router により information/planning/chitchat/__END__ に分岐
+    - 各フローは単発実行（1ターン処理）。結果は state.final_response に格納。
+    """
+    sg = StateGraph(AgentState)
+
+    # --- ノード定義 ---
+    sg.add_node("information_flow", _information_flow)
+    sg.add_node("planning_flow", _planning_flow)
+    sg.add_node("chitchat", chitchat_node)
+
+    # Entry: router ノード
+    def _router(state: AgentState) -> AgentState:
+        route = route_next(state)
+        state.route = route
+        return state
+
+    sg.add_node("router", _router)
+
+    # --- 条件分岐（router → 次ノード） ---
+    def cond(state: AgentState) -> str:
+        # route_next が返したラベルをそのまま次ノードとして使う
+        return state.route or "__END__"
+
+    sg.add_conditional_edges(
+        "router",
+        cond,
+        {
+            "information_flow": "information_flow",
+            "planning_flow": "planning_flow",
+            "chitchat": "chitchat",
+            "__END__": END,
+        },
+    )
+
+    # --- 各フローの終端 ---
+    sg.add_edge("information_flow", END)
+    sg.add_edge("planning_flow", END)
+    sg.add_edge("chitchat", END)
+
+    # --- エントリポイント ---
+    sg.set_entry_point("router")
+
+    return sg.compile()
+
+
+# ====== 外部公開ランナブル（tasks.py から呼び出し） ======
+graph_app = build_graph()
+
+
+def run_orchestration(session_id: str) -> Dict[str, Any]:
+    """
+    Celery タスクから呼び出される実行関数。
+      1) DBからセッション状態を復元（直近5往復＋SYSTEM_TRIGGER を短期記憶として含む）
+      2) LangGraph を 1ターン実行
+      3) 最終応答やプレビューGeoJSON等を返却
+    """
+    state = load_state(session_id)
+    result_state: AgentState = graph_app.invoke(state)
+    return {
+        "session_id": result_state.session_id,
+        "final_response": result_state.final_response,
+        "app_status": result_state.app_status,
+        "active_plan_id": result_state.active_plan_id,
+        "bag": result_state.bag,  # 例: {"preview_geojson": ..., "nudge_materials": ...}
     }
-)
-# 3. ナッジ情報を収集 -> 最適スポットを選択 -> 提案文を生成
-workflow.add_edge("gather_nudge_data", "select_best_spot")
-workflow.add_edge("select_best_spot", "generate_nudge_proposal")
-
-
-# --- 周遊計画フローの配線 ---
-# 1. 新規計画を作成した後は、必ず計画を要約してユーザーに提示
-workflow.add_edge("create_plan", "summarize_plan")
-
-# 2. 計画編集の指示を抽出
-workflow.add_edge("extract_plan_edit", "check_plan_edit_extraction")
-# 3. 抽出結果に応じて分岐
-workflow.add_conditional_edges(
-    "check_plan_edit_extraction",
-    check_plan_edit_extraction,
-    {
-        "success": "execute_plan_edit", # 抽出成功 -> 編集実行へ
-        "failure": "summarize_plan"     # 抽出失敗 -> 現在の計画を要約して聞き直す
-    }
-)
-# 4. 計画編集を実行した後は、必ず計画を要約してユーザーに結果を報告
-workflow.add_edge("execute_plan_edit", "summarize_plan")
-
-
-# --- 全ての終点ノード ---
-# これらのノードが実行されたら、グラフの実行は終了
-workflow.add_edge("chitchat", END)
-workflow.add_edge("error", END)
-workflow.add_edge("generate_nudge_proposal", END)
-workflow.add_edge("handle_no_spot_found", END)
-workflow.add_edge("summarize_plan", END)
-
-
-# --- グラフのコンパイル ---
-app = workflow.compile()

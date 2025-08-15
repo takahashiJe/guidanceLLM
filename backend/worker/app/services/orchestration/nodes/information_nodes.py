@@ -1,122 +1,126 @@
-# worker/app/services/orchestration/nodes/information_nodes.py
+# -*- coding: utf-8 -*-
+"""
+information_nodes.py
+- 情報提供フロー：候補抽出→ナッジ材料収集→最適提案文（LLM）
+"""
 
-from datetime import date, timedelta
-from typing import Dict, Any, Literal
-import logging
+from __future__ import annotations
+from typing import Any, Dict, List
 
-from shared.app.schemas import AgentState
-from shared.app.database import session_scope
 from worker.app.services.information.information_service import InformationService
 from worker.app.services.llm.llm_service import LLMInferenceService
-
-logger = logging.getLogger(__name__)
-info_service = InformationService()
-llm_service = LLMInferenceService()
-
-def find_candidate_spots_node(state: AgentState) -> Dict[str, Any]:
-    """[ナッジフェーズ1] ユーザーの意図に合った候補スポットを検索する。"""
-    logger.info("Executing find_candidate_spots_node...")
-    try:
-        intent_result = state["intermediateData"].get("intent_result", {})
-        intent = intent_result.get("intent")
-        query = intent_result.get("extracted_entity") or state["userInput"]
-
-        intent_map = {
-            "specific_spot_question": "specific",
-            "general_tourist_spot_question": "general_tourist",
-            "category_spot_question": "category",
-        }
-        intent_type = intent_map.get(intent, "general_tourist")
-
-        with session_scope() as db:
-            found_spots = info_service.find_spots_by_intent(
-                db, intent_type=intent_type, query=query, language=state["language"]
-            )
-        
-        logger.info(f"Found {len(found_spots)} candidate spots.")
-        return {"intermediateData": {"candidate_spots": found_spots}}
-    except Exception as e:
-        logger.error(f"Failed to find candidate spots: {e}", exc_info=True)
-        return {"intermediateData": {"candidate_spots": []}}
+from .shared_nodes import safe_set_final_response
+from ..state import AgentState, save_message
 
 
-def check_spot_found(state: AgentState) -> Literal["continue", "stop"]:
-    """[本実装] 候補スポットが見つかったかどうかを判定する条件分岐用の関数。"""
-    logger.info("Executing check_spot_found...")
-    if state.get("intermediateData", {}).get("candidate_spots"):
-        return "continue"
+def information_entry(state: AgentState) -> AgentState:
+    """
+    情報提供フローのエントリ。
+    意図分類の結果に応じて、find_spots_by_intent の intent_type を決定し候補抽出。
+    """
+    info = InformationService()
+    llm = LLMInferenceService()
+
+    user_msg = state.latest_user_message or ""
+    # classify は router 済みだが、intentの詳細は LLM から再取得する方が堅牢
+    intent = llm.classify_intent(
+        user_message=user_msg,
+        app_status=state.app_status,
+        history=[m.model_dump() for m in state.short_history],
+        lang=state.user_lang,
+    )
+
+    # intent_type を Information Service の規約に合わせて決定
+    if intent.intent == "specific_question":
+        intent_type = "specific"
+        query = intent.parameters.get("entity_name") or user_msg
+    elif intent.intent == "general_question":
+        # 「どこか良いところ」=> tourist_spot 固定
+        intent_type = "general_tourist"
+        query = intent.parameters.get("category") or user_msg
     else:
-        return "stop"
+        # それ以外はひとまずカテゴリ推測
+        intent_type = "category"
+        query = intent.parameters.get("category") or user_msg
+
+    spots = info.find_spots_by_intent(
+        intent_type=intent_type,
+        query=query,
+        language=state.user_lang,
+    )
+
+    state.bag["candidate_spots"] = [s.id for s in spots]
+    return state
 
 
-def handle_no_spot_found_node(state: AgentState) -> Dict[str, Any]:
-    """[本実装] 候補スポットが見つからなかった場合の応答を生成する。"""
-    logger.info("Executing handle_no_spot_found_node...")
-    # TODO: LLMを使って、より文脈に合わせた応答を生成することも可能
-    return {"finalResponse": "申し訳ありません、ご要望に合うスポットが見つかりませんでした。別のキーワードでお探ししますか？"}
+def gather_nudge_and_pick_best(state: AgentState) -> AgentState:
+    """
+    候補全件に対して：
+      - get_distance_and_duration（routing連携）
+      - 天気（山タグ→crawler→fallback API）
+      - 混雑（Itinerary Service のJOIN集計）
+    を収集・スコアし、スポット毎の最適日を決定。
+    その中から総合的に最適なスポットを1つ選ぶ。
+    """
+    info = InformationService()
+
+    spot_ids: List[int] = state.bag.get("candidate_spots", [])
+    if not spot_ids:
+        # 候補ゼロならここで終了
+        safe_set_final_response(state, "該当する候補を見つけられませんでした。別の条件でお試しください。")
+        return state
+
+    # フロント側でユーザー現在地を送ってきている想定なら state.bag に入っている
+    # なければ便宜的に None を渡す（Information Service 側で扱えるようにしておく）
+    user_location = state.bag.get("user_location")
+    date_range = state.bag.get("date_range")  # {"start": "YYYY-MM-DD", "end":"YYYY-MM-DD"} を想定
+
+    # Information Service でナッジ材料を収集し、最適日を決定
+    result: Dict[int, Dict[str, Any]] = info.find_best_day_and_gather_nudge_data(
+        spot_ids=spot_ids, user_location=user_location, date_range=date_range
+    )
+    state.bag["nudge_materials"] = result
+
+    # 単純にスコア（Information Service 側で持たせた total_score）最大のスポットを選ぶ
+    best_spot_id = None
+    best_score = -1
+    for sid, payload in result.items():
+        score = payload.get("total_score", -1)
+        if score > best_score:
+            best_score = score
+            best_spot_id = sid
+
+    state.bag["best_spot_id"] = best_spot_id
+    return state
 
 
-def gather_nudge_data_node(state: AgentState) -> Dict[str, Any]:
-    """[ナッジフェーズ2-A] 候補スポットのナッジ情報を収集する。"""
-    logger.info("Executing gather_nudge_data_node...")
-    candidate_spots = state["intermediateData"].get("candidate_spots", [])
-    if not candidate_spots:
-        return {}
+def compose_nudge_response(state: AgentState) -> AgentState:
+    """
+    ベストスポットの詳細を取得し、LLMで「説得力あるナッジ応答」を生成。
+    """
+    info = InformationService()
+    llm = LLMInferenceService()
 
-    try:
-        # TODO: ユーザーの発言から期間を抽出する
-        today = date.today()
-        start_date = today + timedelta(days=(5 - today.weekday() + 7) % 7)
-        end_date = start_date + timedelta(days=1)
+    best_spot_id = state.bag.get("best_spot_id")
+    nudge = state.bag.get("nudge_materials", {}).get(best_spot_id)
+    if not best_spot_id or not nudge:
+        safe_set_final_response(state, "良さそうな候補を特定できませんでした。条件を変えてもう一度お試しください。")
+        return state
 
-        with session_scope() as db:
-            nudge_data = info_service.find_best_day_and_gather_nudge_data(
-                db=db,
-                spots=candidate_spots,
-                user_location={"latitude": 39.0, "longitude": 140.0}, # TODO: ユーザーの実際の場所を使う
-                date_range={"start": start_date, "end": end_date}
-            )
-        
-        return {"intermediateData": {"nudge_data_map": nudge_data}}
-    except Exception as e:
-        logger.error(f"Failed to gather nudge data: {e}", exc_info=True)
-        return {"intermediateData": {"nudge_data_map": {}}}
+    spot = info.get_spot_details(spot_id=best_spot_id)
+    text = llm.generate_nudge_proposal(
+        lang=state.user_lang,
+        spot={
+            "official_name": spot.official_name,
+            "description": spot.description,
+            "social_proof": spot.social_proof,
+        },
+        materials=nudge,
+    )
 
+    # 応答を最終レスポンスに反映
+    state.final_response = text
 
-def select_best_spot_node(state: AgentState) -> Dict[str, Any]:
-    """[ナッジフェーズ2-B] 最適なスポットを1つ選択する。"""
-    logger.info("Executing select_best_spot_node...")
-    nudge_data_map = state["intermediateData"].get("nudge_data_map", {})
-    if not nudge_data_map:
-        return {"intermediateData": {"best_spot_to_propose": None}}
-
-    # TODO: より高度な選択ロジックを実装
-    best_spot_id = list(nudge_data_map.keys())[0]
-    best_spot_nudge_data = nudge_data_map[best_spot_id]
-
-    with session_scope() as db:
-        spot_details = info_service.get_spot_details(db, spot_id=best_spot_id)
-
-    return {"intermediateData": {"best_spot_to_propose": {
-        "details": spot_details,
-        "nudge_data": best_spot_nudge_data
-    }}}
-
-def generate_nudge_proposal_node(state: AgentState) -> Dict[str, Any]:
-    """[ナッジフェーズ2-C] LLMを使い、説得力のあるナッジ提案文を生成する。"""
-    logger.info("Executing generate_nudge_proposal_node...")
-    best_spot_info = state["intermediateData"].get("best_spot_to_propose")
-
-    if not best_spot_info or not best_spot_info.get("details"):
-        return {"finalResponse": "申し訳ありません、おすすめのスポットが見つかりませんでした。"}
-
-    try:
-        proposal_text = llm_service.generate_nudge_proposal(
-            nudge_data=best_spot_info["nudge_data"],
-            spot_details=best_spot_info["details"],
-            language=state["language"]
-        )
-        return {"finalResponse": proposal_text or "おすすめのスポット情報を作成できませんでした。"}
-    except Exception as e:
-        logger.error(f"Failed to generate nudge proposal: {e}", exc_info=True)
-        return {"finalResponse": "おすすめ情報の作成中にエラーが発生しました。"}
+    # 履歴保存（assistant）
+    save_message(state.session_id, "assistant", text, meta={"type": "nudge"})
+    return state

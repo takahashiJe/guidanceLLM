@@ -1,63 +1,44 @@
-# worker/app/services/orchestration/router.py
+# -*- coding: utf-8 -*-
+"""
+router.py
+- ユーザー意図の分類（LLM推論サービス）→ LangGraphの遷移先を決定
+"""
 
-from shared.app.schemas import AgentState, Intent
+from __future__ import annotations
+from typing import Literal
+
 from worker.app.services.llm.llm_service import LLMInferenceService
-import logging
+from .state import AgentState
 
-logger = logging.getLogger(__name__)
-llm_service = LLMInferenceService()
 
-def route_conversation(state: AgentState) -> str:
+def route_next(state: AgentState) -> Literal["information_flow", "planning_flow", "chitchat", "__END__"]:
     """
-    LLMを使ってユーザーの意図を分類し、次に遷移すべきノード名を返す。
+    LLMにより意図分類し、LangGraphの遷移先ラベルを返す。
+    app_statusも加味して、planning中は編集リクエストを優先などのルールを実装。
     """
-    logger.info(f"Routing conversation for session {state['sessionId']}...")
-    
-    try:
-        intent_result = llm_service.classify_intent(
-            user_input=state["userInput"],
-            history=state["chatHistory"],
-            app_status=state["appStatus"],
-            language=state["language"]
-        )
+    llm = LLMInferenceService()
 
-        if not intent_result or not intent_result.get("intent"):
-            logger.warning("Intent classification failed. Routing to error node.")
-            return "error"
+    # 空入力などはEND
+    if not state.latest_user_message:
+        return "__END__"
 
-        intent = intent_result.get("intent")
-        logger.info(f"LLM classified intent as: {intent}")
-        
-        # 意図分類の結果を後続のノードで使えるようにstateに保存
-        state["intermediateData"]["intent_result"] = intent_result
+    intent = llm.classify_intent(
+        user_message=state.latest_user_message,
+        app_status=state.app_status,
+        history=[m.model_dump() for m in state.short_history],
+        lang=state.user_lang,
+    )
 
-        # アプリの状態（appStatus）に応じたルーティング
-        if state["appStatus"] == "planning":
-            if intent == Intent.PLAN_EDIT_REQUEST:
-                return "extract_plan_edit" # まず編集内容の抽出へ
-            if intent == Intent.PLAN_CONFIRMATION:
-                # TODO: 計画を確定し、ナビゲーションモードに移行するノードへ
-                logger.info("Routing to (not implemented) confirm_plan_node")
-                return "summarize_plan" # 仮
-            if intent == Intent.PLAN_CANCEL:
-                # TODO: 計画を中止し、ブラウズモードに戻るノードへ
-                logger.info("Routing to (not implemented) cancel_plan_node")
-                state["appStatus"] = "browsing"
-                return "chitchat" # 仮
-            # 上記以外は、計画の現状を要約して確認を促す
-            return "summarize_plan"
+    intent_type = intent.intent  # e.g., "general_question", "specific_question", "plan_creation_request", "plan_edit_request", "chitchat"
 
-        # ブラウズモード（通常時）の場合
-        if intent == Intent.PLAN_CREATION_REQUEST:
-            return "create_plan"
-        if intent in [Intent.SPECIFIC_SPOT_QUESTION, Intent.GENERAL_TOURIST_SPOT_QUESTION, Intent.CATEGORY_SPOT_QUESTION]:
-            return "find_candidate_spots"
-        if intent == Intent.CHITCHAT:
-            return "chitchat"
-        
-        logger.warning(f"Unknown intent '{intent}' for appStatus '{state['appStatus']}'.")
-        return "error"
+    # アプリ状態と意図で分岐
+    if intent_type in ("general_question", "specific_question"):
+        return "information_flow"
 
-    except Exception as e:
-        logger.error(f"An exception occurred during routing: {e}", exc_info=True)
-        return "error"
+    if intent_type in ("plan_creation_request", "plan_edit_request") or state.app_status == "planning":
+        return "planning_flow"
+
+    if intent_type == "chitchat":
+        return "chitchat"
+
+    return "__END__"
