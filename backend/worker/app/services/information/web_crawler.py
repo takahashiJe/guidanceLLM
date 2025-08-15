@@ -1,180 +1,219 @@
-# -*- coding: utf-8 -*-
-"""
-tenki.jp 鳥海山ページの山域天気をクローリングして、指定日の概況を抽出する。
-- 入力: date_str="YYYY-MM-DD"
-- 出力: {"date": "YYYY-MM-DD", "summary": "晴れ/曇り/雨", "source": "crawler", "note": None}
-
-実装ノート:
-- tenki.jp の構造は変更されることがあるため、複数の探索戦略を組み合わせる。
-- ベストエフォートで「当日/指定日」の文字列とアイコン/テキストから天気語を推定。
-- 失敗した場合は CrawlError を投げ、呼び出し側で API フォールバックへ。
-"""
-
+# backend/worker/app/services/information/web_crawler.py
+# tenki.jp（鳥海山：百名山ページ）の週間予報から、指定日の天気文言を抽出する本実装
 from __future__ import annotations
+from typing import Optional, Dict, List
 import os
 import re
-from typing import Dict, Optional
-from datetime import datetime
+from datetime import datetime, date
 
-import httpx
+import requests
 from bs4 import BeautifulSoup
 
 
-class CrawlError(Exception):
-    pass
-
-
-# .env から鳥海山の山域天気ページURLを与える（例）
-# TENKI_JP_CHOKAI_URL="https://tenki.jp/mountain/famous100/point-23.html"
-TENKI_JP_CHOKAI_URL = os.getenv("TENKI_JP_CHOKAI_URL", "").strip()
-
-
-def get_mountain_weather_chokai(date_str: str) -> Dict:
-    if not TENKI_JP_CHOKAI_URL:
-        raise CrawlError("TENKI_JP_CHOKAI_URL が設定されていません")
-
-    # リクエスト
-    timeout = httpx.Timeout(connect=5.0, read=8.0)
-    headers = {
-        "User-Agent": "guidanceLLM-crawler/1.0 (+https://example.com)",
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    }
-    try:
-        with httpx.Client(timeout=timeout, headers=headers) as client:
-            resp = client.get(TENKI_JP_CHOKAI_URL)
-            resp.raise_for_status()
-            html = resp.text
-    except Exception as e:
-        raise CrawlError(f"HTTPエラー: {e}")
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1) data-date 属性や日付見出しを持つブロックを優先的に探索
-    normalized = _find_weather_label_by_date_block(soup, date_str)
-    if not normalized:
-        # 2) テーブル/リストから「今日/明日/◯日」の見出しを頼りに抽出
-        normalized = _fallback_find_by_text_patterns(soup, date_str)
-
-    if not normalized:
-        raise CrawlError("対象日の山域天気が抽出できませんでした")
-
-    return {"date": date_str, "summary": normalized, "source": "crawler", "note": None}
-
-
-# ---------------- 内部ユーティリティ ---------------- #
-
-def _normalize_to_sunny_cloudy_rain(text: str) -> Optional[str]:
-    """
-    アイコンの alt やテキストから 3値（晴れ/曇り/雨）を推定
-    """
-    t = text.strip()
-    if not t:
-        return None
-
-    # 代表語
-    if re.search(r"(快晴|晴|晴れ)", t):
+def _normalize_condition(raw: str) -> str:
+    """tenki.jp の表示文言/alt を代表カテゴリに正規化（日本語ベース）"""
+    t = (raw or "").strip()
+    # 代表語を先に判定（含む判定）
+    if any(k in t for k in ["快晴"]):
+        return "快晴"
+    if any(k in t for k in ["晴", "晴れ"]):
         return "晴れ"
-    if re.search(r"(曇|くもり|雲)", t):
+    if any(k in t for k in ["薄曇", "曇", "くもり"]):
         return "曇り"
-    if re.search(r"(雨|雷|雪|みぞれ|霙|氷|吹雪|にわか|強雨)", t):
+    if any(k in t for k in ["雪", "みぞれ", "霙"]):
+        return "雪"
+    if any(k in t for k in ["雷", "雷雨", "雷を伴う"]):
+        return "雷雨"
+    if any(k in t for k in ["雨", "小雨", "にわか雨", "強雨", "大雨"]):
         return "雨"
-    # 他は保守的に「曇り」
-    return "曇り"
+    if any(k in t for k in ["霧"]):
+        return "霧"
+    # 未知はそのまま返す（上位ロジックでスコア中庸扱い）
+    return t or "不明"
 
 
-def _find_weather_label_by_date_block(soup: BeautifulSoup, date_str: str) -> Optional[str]:
+def _guess_year_for_month_day(month: int, day: int) -> int:
+    """週間予報は年が明示されないことが多いので、現在日付を基準に年を推定"""
+    today = date.today()
+    y = today.year
+    # 年またぎ対策：例えば 12月末に 1月表記が来たら翌年扱い
+    if today.month == 12 and month == 1:
+        return y + 1
+    # 逆（1月頭に12月表記）は前年扱い（通常は出ないが安全側）
+    if today.month == 1 and month == 12:
+        return y - 1
+    return y
+
+
+def _parse_mmdd_to_iso(mmdd_text: str) -> Optional[str]:
     """
-    data-date="YYYY-MM-DD" を持つ要素や、日付テキストに一致するブロックを見て
-    近傍のアイコン/文言から天気を抽出
+    '8月9日(金)' や '08/09' のような表示から 'YYYY-MM-DD' を生成
     """
-    # 直接マッチ
-    date_nodes = soup.select(f'[data-date="{date_str}"]')
-    for node in date_nodes:
-        # 近辺の img[alt], span, p などからテキストを拾う
-        label = _extract_label_near(node)
-        if label:
-            return label
+    s = (mmdd_text or "").strip()
+    # 例: "8月9日(金)" 形式
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", s)
+    if m:
+        mon = int(m.group(1))
+        day = int(m.group(2))
+        year = _guess_year_for_month_day(mon, day)
+        try:
+            return date(year, mon, day).isoformat()
+        except Exception:
+            return None
 
-    # 日付テキストで探索（例: 2025年8月12日 / 08月12日 など）
-    try:
-        d = datetime.fromisoformat(date_str)
-        patterns = [
-            f"{d.year}年{d.month}月{d.day}日",
-            f"{d.month}月{d.day}日",
-            d.strftime("%m/%d"),
-        ]
-    except Exception:
-        patterns = [date_str]
-
-    text_nodes = []
-    for pat in patterns:
-        text_nodes.extend(soup.find_all(string=re.compile(re.escape(pat))))
-
-    for t in text_nodes:
-        label = _extract_label_near(t.parent if hasattr(t, "parent") else None)
-        if label:
-            return label
+    # 例: "08/09" 形式
+    m = re.search(r"(\d{1,2})\s*/\s*(\d{1,2})", s)
+    if m:
+        mon = int(m.group(1))
+        day = int(m.group(2))
+        year = _guess_year_for_month_day(mon, day)
+        try:
+            return date(year, mon, day).isoformat()
+        except Exception:
+            return None
 
     return None
 
 
-def _extract_label_near(node) -> Optional[str]:
+class TenkiCrawler:
     """
-    任意のノード近傍から天気ラベルを抽出。
-    - 先に img[alt] を優先
-    - 次に同胞/親のテキスト
+    鳥海山の週間予報テーブル（百名山ページ）から、指定日の天気を抽出するスクレイパー。
+    - .env の TENKI_JP_CHOKAI_URL を参照
+    - 週間予報ブロックの各「日付セル」に紐づく「天気セル（img alt / テキスト）」を拾う
+    - DOM 変更にある程度耐えるように複数セレクタをフォールバック
     """
-    if not node:
+
+    def __init__(self, url: Optional[str] = None, timeout: int = 12):
+        self.url = url or os.getenv("TENKI_JP_CHOKAI_URL", "https://tenki.jp/mountain/famous100/point-23.html")
+        self.timeout = timeout
+
+    def fetch_day_condition(self, target_date: str, lang: str = "ja") -> Optional[str]:
+        """
+        :param target_date: 'YYYY-MM-DD'
+        :return: '晴れ' / '曇り' / '雨' / ...（代表語）。取得できなければ None。
+        """
+        try:
+            resp = requests.get(self.url, timeout=self.timeout, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+        except Exception:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # --- 週間予報セクションの候補を拾う ---
+        # 実ページでは、以下のような構造のいずれか：
+        # - section#mountain-week 内に table.week-forecast / div/ul の日別ブロック
+        # - div.mountain-week / div#mountain-week など
+        week_sections = []
+        for sel in [
+            "section#mountain-week", "section.mountain-week", "div#mountain-week", "div.mountain-week",
+            "section#forecast-week", "section.week", "div.week", "section#oneweek", "section#weekly", "div#weekly"
+        ]:
+            week_sections.extend(soup.select(sel))
+        if not week_sections:
+            # テーブルだけ露出しているケース
+            week_sections = soup.select("table, div, section")
+
+        # --- セクション内から日別セルを抽出 ---
+        # パターン1: テーブル行ごとに日付/天気がある
+        pairs: Dict[str, str] = {}
+
+        def try_register(iso_date: Optional[str], condition: Optional[str]):
+            if iso_date and condition:
+                pairs[iso_date] = _normalize_condition(condition)
+
+        # テーブル構造: thead に日付、tbody に天気img/テキスト などのケースに対応
+        for section in week_sections:
+            # 1) テーブルのヘッダに日付、ボディに天気（列対応）
+            tables = section.find_all("table")
+            for tbl in tables:
+                # ヘッダから日付列を取得
+                header_cells: List[str] = []
+                thead = tbl.find("thead")
+                if thead:
+                    ths = thead.find_all(["th", "td"])
+                    header_cells = [th.get_text(" ", strip=True) for th in ths]
+
+                # ボディから天気列（img alt またはテキスト）を取得
+                body_rows = tbl.find_all("tr")
+                # 天気が入っていそうな行を優先して探索（class 名でヒューリスティック）
+                weather_rows = [r for r in body_rows if any(k in (r.get("class") or []) for k in ["weather", "weathers"])]
+                if not weather_rows and body_rows:
+                    # fallback: 全行から「天気っぽいセル」を探索
+                    weather_rows = body_rows
+
+                for row in weather_rows:
+                    cells = row.find_all(["td", "th"])
+                    for idx, c in enumerate(cells):
+                        date_label = None
+                        if header_cells and idx < len(header_cells):
+                            date_label = header_cells[idx]
+                        else:
+                            # 同じ列の先頭行/直近のthから拾う
+                            pass
+
+                        # セル内の img alt / テキストを候補に
+                        alt = None
+                        img = c.find("img")
+                        if img and img.has_attr("alt"):
+                            alt = img["alt"]
+                        txt = c.get_text(" ", strip=True)
+                        cond = alt or txt
+
+                        iso = _parse_mmdd_to_iso(date_label or txt)
+                        if iso:
+                            try_register(iso, cond)
+
+            # 2) li / div の日別カード（カード内に日付と天気）
+            for li in section.select("ul li, div.item, div.day, div.daily, article"):
+                label = ""
+                # 日付の候補
+                for dsel in [".date", ".day", ".label", "time", "h3", "h4", "header", "p", "span"]:
+                    el = li.select_one(dsel)
+                    if el:
+                        label = el.get_text(" ", strip=True)
+                        if re.search(r"\d{1,2}\s*月\s*\d{1,2}\s*日", label) or re.search(r"\d{1,2}\s*/\s*\d{1,2}", label):
+                            break
+
+                # 天気の候補（alt優先）
+                alt = None
+                img = li.find("img")
+                if img and img.has_attr("alt"):
+                    alt = img["alt"]
+                wx_txt = None
+                for wsel in [".weather", ".weather-txt", ".weathers", ".wx", ".text", "p", "span"]:
+                    el = li.select_one(wsel)
+                    if el:
+                        wx_txt = el.get_text(" ", strip=True)
+                        if wx_txt:
+                            break
+                condition = alt or wx_txt or ""
+
+                iso = _parse_mmdd_to_iso(label)
+                if iso:
+                    try_register(iso, condition)
+
+        # 3) 最後の手段：ページ全体テキストから順番マッチ（脆いので最終フォールバック）
+        if not pairs:
+            text = soup.get_text(" ", strip=True)
+            # 直近の 1週間分の "M月D日" を順に抜いて、周辺の天気語を拾う
+            for m, d in re.findall(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", text):
+                iso = _parse_mmdd_to_iso(f"{m}月{d}日")
+                if not iso:
+                    continue
+                # 周辺に含まれる代表語を推定
+                # （実装簡略化：全体からの代表語のみ拾う。厳密には前後数十文字を抽出するとより精度UP）
+                cond = None
+                for key in ["快晴", "晴れ", "晴", "薄曇", "曇り", "曇", "雪", "みぞれ", "雷雨", "雷", "雨"]:
+                    if key in text:
+                        cond = key
+                        break
+                if cond:
+                    pairs.setdefault(iso, _normalize_condition(cond))
+
+        # 指定日を返す
+        condition = pairs.get(target_date)
+        if condition:
+            return condition
+
         return None
-
-    # 1) 直下/近傍のアイコンALT
-    for img in node.find_all("img"):
-        if img.has_attr("alt"):
-            lab = _normalize_to_sunny_cloudy_rain(img["alt"])
-            if lab:
-                return lab
-
-    # 2) 同階層のテキスト
-    combined = " ".join(node.get_text(" ", strip=True)[:200].split())
-    lab = _normalize_to_sunny_cloudy_rain(combined)
-    if lab:
-        return lab
-
-    # 3) 親側も軽く探索
-    parent = node.parent
-    if parent:
-        combined = " ".join(parent.get_text(" ", strip=True)[:200].split())
-        lab = _normalize_to_sunny_cloudy_rain(combined)
-        if lab:
-            return lab
-
-    return None
-
-
-def _fallback_find_by_text_patterns(soup: BeautifulSoup, date_str: str) -> Optional[str]:
-    """
-    セクションの見出し（例: 今日/明日/◯日）とリストを総当りで確認する。
-    ここでも img[alt] / テキスト一致で推定。
-    """
-    # よくある構造: li > img[alt] + span などを総当り
-    for li in soup.select("li"):
-        # アイコン優先
-        img = li.find("img", alt=True)
-        if img and img.get("alt"):
-            lab = _normalize_to_sunny_cloudy_rain(img["alt"])
-            if lab:
-                return lab
-        text = li.get_text(" ", strip=True)
-        lab = _normalize_to_sunny_cloudy_rain(text)
-        if lab:
-            return lab
-
-    # テーブル構造の場合
-    for tr in soup.select("table tr"):
-        text = tr.get_text(" ", strip=True)
-        lab = _normalize_to_sunny_cloudy_rain(text)
-        if lab:
-            return lab
-
-    # 見つからず
-    return None

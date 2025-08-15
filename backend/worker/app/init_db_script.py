@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, create_engine, text
 
 from shared.app.database import SessionLocal, engine
 from shared.app.models import Spot, AccessPoint
@@ -42,6 +42,8 @@ RAG_REBUILD_IF_EMPTY_ONLY = os.getenv("RAG_REBUILD_IF_EMPTY_ONLY", "true").lower
 
 SPOTS_JSON = Path("/app/worker/app/data/POI.json")
 ACCESS_POINTS_GEOJSON = Path("/app/scripts/access_points.geojson")
+DB_URL = os.getenv("DATABASE_URL")  # 例: postgresql+psycopg2://user:pass@db:5432/app
+engine = create_engine(DB_URL, future=True)
 
 
 # ---------- ユーティリティ ----------
@@ -170,6 +172,34 @@ def build_vectorstore_if_needed():
     except Exception as e:
         logger.exception("Vectorstore build failed: %s", e)
 
+def create_materialized_view():
+    # 既存有無チェックしつつ作成（冪等）
+    create_sql = """
+    CREATE MATERIALIZED VIEW IF NOT EXISTS spot_congestion_mv
+    AS
+    SELECT p.start_date AS visit_date,
+           s.spot_id    AS spot_id,
+           COUNT(DISTINCT p.id) AS plan_count
+    FROM plans p
+    JOIN stops s ON s.plan_id = p.id
+    WHERE p.start_date IS NOT NULL
+    GROUP BY p.start_date, s.spot_id
+    WITH NO DATA;
+    """
+    index_sql = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_spot_congestion_mv_unique
+      ON spot_congestion_mv (visit_date, spot_id);
+    """
+    refresh_sql = "REFRESH MATERIALIZED VIEW CONCURRENTLY spot_congestion_mv;"
+
+    with engine.begin() as conn:
+        conn.execute(text(create_sql))
+        conn.execute(text(index_sql))
+        # 初回のみ CONCURRENTLY は使えないため try/except で通常 REFRESH にフォールバック
+        try:
+            conn.execute(text(refresh_sql))
+        except Exception:
+            conn.execute(text("REFRESH MATERIALIZED VIEW spot_congestion_mv;"))
 
 def main():
     logger.info("=== DB init started ===")
@@ -202,6 +232,7 @@ def main():
         build_vectorstore_if_needed()
 
     logger.info("=== DB init completed ===")
+    create_materialized_view()
 
 
 if __name__ == "__main__":

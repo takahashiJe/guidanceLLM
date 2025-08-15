@@ -1,5 +1,6 @@
 # backend/shared/app/schemas.py
 # API 入出力で使う Pydantic スキーマ（Gateway / Worker 共有）
+from datetime import date
 from typing import Optional, List
 from pydantic import BaseModel, Field
 
@@ -65,3 +66,35 @@ class NavigationLocationRequest(BaseModel):
     session_id: str
     lat: float
     lng: float
+
+class PlanCreateRequest(BaseModel):
+    user_id: int
+    session_id: str
+    start_date: Optional[date] = None
+    language: str = Field(default="ja")
+
+
+class PlanResponse(BaseModel):
+    id: int
+    user_id: int
+    session_id: str
+    start_date: Optional[date] = None
+    language: str
+
+
+class StopCreateRequest(BaseModel):
+    plan_id: int
+    spot_id: int
+    position: Optional[int] = None  # None -> 末尾
+
+
+class StopsReorderRequest(BaseModel):
+    plan_id: int
+    stop_ids: List[int]  # 新順序（stop.id の配列）
+
+
+class CongestionStatusResponse(BaseModel):
+    spot_id: int
+    date: date
+    count: int
+    status: str

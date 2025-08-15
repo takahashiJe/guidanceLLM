@@ -1,123 +1,154 @@
-# worker/app/services/itinerary/crud_plan.py
+# -*- coding: utf-8 -*-
+"""
+Itinerary（周遊計画）に関するDB CRUDを担当するモジュール。
+- 要件: 滞在時間の概念なし、訪問順序のリストのみを管理（FR-4）
+- ここでは spot_type によるフィルタは行わない（宿泊も観光も可）
+- レースコンディション対策として、stop.order_index の整合性をトランザクション内で維持
 
+提供関数:
+- create_new_plan
+- add_spot_to_plan
+- remove_spot_from_plan
+- reorder_plan_stops
+- get_plan_count_for_spot_on_date（JOIN集計 or マテビュー利用のフォールバック付き）
+"""
+
+from datetime import date
 from typing import List, Optional
+
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import select, func, text
 
-from shared.app.models import Plan, Stop
+from shared.app.models import Plan, Stop, Spot, Session as UserSession  # セッションは名称衝突回避のためUserSessionで参照
 
-# ==============================================================================
-# Planテーブルに対するCRUD操作
-# ==============================================================================
 
-def create_plan(db: Session, user_id: int, plan_name: Optional[str] = "新しい計画") -> Plan:
+def create_new_plan(db: Session, *, user_id: int, session_id: str, start_date: Optional[date], language: str) -> Plan:
     """
-    新しいPlanレコードをデータベースに作成する。
-
-    Args:
-        db (Session): SQLAlchemyのデータベースセッション。
-        user_id (int): 計画を作成するユーザーのID。
-        plan_name (Optional[str]): 計画の名称。
-
-    Returns:
-        Plan: 作成されたPlanオブジェクト。
+    新しい計画を作成し、sessions.active_plan_id を更新する。
+    - start_date は混雑集計のキーに使われるため、可能なら指定する
     """
-    new_plan = Plan(user_id=user_id, plan_name=plan_name)
-    db.add(new_plan)
+    # プラン作成
+    plan = Plan(user_id=user_id, session_id=session_id, start_date=start_date, language=language)
+    db.add(plan)
+    db.flush()  # plan.id を取得
+
+    # セッションの active_plan_id を更新
+    sess = db.execute(
+        select(UserSession).where(UserSession.session_id == session_id)
+    ).scalar_one_or_none()
+    if sess:
+        sess.active_plan_id = plan.id
+        sess.current_status = "planning"
+
     db.commit()
-    db.refresh(new_plan)
-    return new_plan
+    db.refresh(plan)
+    return plan
 
-def get_plan_by_id(db: Session, plan_id: int) -> Optional[Plan]:
+
+def _get_next_order_index(db: Session, plan_id: int) -> int:
+    """当該プランの末尾 order_index を取得し、その+1を返す。"""
+    max_idx = db.execute(
+        select(func.coalesce(func.max(Stop.order_index), -1)).where(Stop.plan_id == plan_id)
+    ).scalar_one()
+    return int(max_idx) + 1
+
+
+def add_spot_to_plan(db: Session, *, plan_id: int, spot_id: int, position: Optional[int] = None) -> Stop:
     """
-    指定されたplan_idを持つPlanレコードをデータベースから取得する。
-
-    Args:
-        db (Session): SQLAlchemyのデータベースセッション。
-        plan_id (int): 取得したい計画のID。
-
-    Returns:
-        Optional[Plan]: 発見されたPlanオブジェクト。見つからない場合はNone。
+    計画にスポットを追加。
+    - position が None の場合は末尾に追加
+    - position を指定した場合、挿入位置以降の order_index を +1 してから挿入
     """
-    return db.query(Plan).filter(Plan.plan_id == plan_id).first()
+    if position is None:
+        order_index = _get_next_order_index(db, plan_id)
+    else:
+        # position 以降をシフト
+        db.query(Stop).filter(Stop.plan_id == plan_id, Stop.order_index >= position).update(
+            {Stop.order_index: Stop.order_index + 1}, synchronize_session=False
+        )
+        order_index = position
 
-# ==============================================================================
-# Stopテーブルに対するCRUD操作
-# ==============================================================================
-
-def get_stops_by_plan_id(db: Session, plan_id: int) -> List[Stop]:
-    """
-    特定の計画に紐づく全てのStopレコードを、stop_orderの昇順で取得する。
-
-    Args:
-        db (Session): SQLAlchemyのデータベースセッション。
-        plan_id (int): 訪問先リストを取得したい計画のID。
-
-    Returns:
-        List[Stop]: 発見されたStopオブジェクトのリスト。
-    """
-    return db.query(Stop).filter(Stop.plan_id == plan_id).order_by(Stop.stop_order).all()
-
-def get_highest_stop_order(db: Session, plan_id: int) -> int:
-    """
-    特定の計画内で現在最も大きいstop_orderの値を返す。Stopがなければ0を返す。
-
-    Args:
-        db (Session): SQLAlchemyのデータベースセッション。
-        plan_id (int): 計画のID。
-
-    Returns:
-        int: 最も大きいstop_orderの値。
-    """
-    max_order = db.query(func.max(Stop.stop_order)).filter(Stop.plan_id == plan_id).scalar()
-    return max_order or 0
-
-def create_stop(db: Session, plan_id: int, spot_id: str, stop_order: int) -> Stop:
-    """
-    新しいStopレコードをデータベースに作成する。
-
-    Args:
-        db (Session): SQLAlchemyのデータベースセッション。
-        plan_id (int): Stopを追加する計画のID。
-        spot_id (str): 追加するスポットのID。
-        stop_order (int): このStopの訪問順。
-
-    Returns:
-        Stop: 作成されたStopオブジェクト。
-    """
-    new_stop = Stop(plan_id=plan_id, spot_id=spot_id, stop_order=stop_order)
-    db.add(new_stop)
+    stop = Stop(plan_id=plan_id, spot_id=spot_id, order_index=order_index)
+    db.add(stop)
     db.commit()
-    db.refresh(new_stop)
-    return new_stop
+    db.refresh(stop)
+    return stop
 
-def delete_stop_by_id(db: Session, stop_id: int) -> bool:
+
+def remove_spot_from_plan(db: Session, *, plan_id: int, stop_id: int) -> None:
     """
-    指定されたstop_idを持つStopレコードをデータベースから削除する。
-
-    Args:
-        db (Session): SQLAlchemyのデータベースセッション。
-        stop_id (int): 削除したいStopのID。
-
-    Returns:
-        bool: 削除が成功した場合はTrue、対象が見つからなかった場合はFalse。
+    指定 stop_id を削除し、後続の order_index を -1 で詰める。
     """
-    stop_to_delete = db.query(Stop).filter(Stop.stop_id == stop_id).first()
-    if stop_to_delete:
-        db.delete(stop_to_delete)
-        db.commit()
-        return True
-    return False
+    stop = db.execute(
+        select(Stop).where(Stop.id == stop_id, Stop.plan_id == plan_id)
+    ).scalar_one_or_none()
+    if not stop:
+        return
 
-def bulk_update_stop_orders(db: Session, plan_id: int, stop_updates: List[dict]):
-    """
-    特定の計画内の複数のStopのstop_orderを一括で更新する。
-
-    Args:
-        db (Session): SQLAlchemyのデータベースセッション。
-        plan_id (int): 更新対象の計画のID。
-        stop_updates (List[dict]): 更新内容のリスト。各辞書は{'stop_id': int, 'stop_order': int}の形式。
-    """
-    # SQLAlchemyのbulk_update_mappingsを使うことで、効率的な一括更新が可能
-    db.bulk_update_mappings(Stop, stop_updates)
+    removed_index = stop.order_index
+    db.delete(stop)
+    # 後続の order_index を詰める
+    db.query(Stop).filter(Stop.plan_id == plan_id, Stop.order_index > removed_index).update(
+        {Stop.order_index: Stop.order_index - 1}, synchronize_session=False
+    )
     db.commit()
+
+
+def reorder_plan_stops(db: Session, *, plan_id: int, new_order_stop_ids: List[int]) -> None:
+    """
+    訪問順序の入れ替え。
+    - new_order_stop_ids は新しい順序で並んだ stop.id の配列
+    - 長さの整合性と当該 plan_id 所属チェックを行う
+    """
+    # 現状の stops を取得
+    stops = db.execute(select(Stop).where(Stop.plan_id == plan_id).order_by(Stop.order_index)).scalars().all()
+    if len(stops) != len(new_order_stop_ids):
+        raise ValueError("new_order_stop_ids の長さが現在の Stops 数と一致しません。")
+
+    # 所属チェック
+    stop_ids_set = {s.id for s in stops}
+    if set(new_order_stop_ids) != stop_ids_set:
+        raise ValueError("new_order_stop_ids に未知の stop.id が含まれています。")
+
+    # id -> Stop を辞書化して一括更新
+    id_to_stop = {s.id: s for s in stops}
+    for idx, sid in enumerate(new_order_stop_ids):
+        id_to_stop[sid].order_index = idx
+
+    db.commit()
+
+
+def get_plan_count_for_spot_on_date(db: Session, *, target_date: date, spot_id: int) -> int:
+    """
+    指定日付・スポットの混雑件数を返す。
+    - 可能であればマテリアライズドビュー(spot_congestion_mv)を優先
+    - ない場合はJOIN集計にフォールバック
+    """
+    # まずマテビュー存在チェック→読み取り
+    try:
+        cnt = db.execute(
+            text("""
+                SELECT plan_count
+                FROM spot_congestion_mv
+                WHERE visit_date = :d AND spot_id = :sid
+                LIMIT 1
+            """),
+            {"d": target_date, "sid": spot_id}
+        ).scalar_one_or_none()
+        if cnt is not None:
+            return int(cnt)
+    except Exception:
+        # ビュー未作成や権限エラー時はJOINにフォールバック
+        pass
+
+    # JOIN集計
+    cnt2 = db.execute(
+        text("""
+            SELECT COUNT(DISTINCT p.id)
+            FROM plans p
+            JOIN stops s ON s.plan_id = p.id
+            WHERE p.start_date = :d AND s.spot_id = :sid
+        """),
+        {"d": target_date, "sid": spot_id}
+    ).scalar_one()
+    return int(cnt2)

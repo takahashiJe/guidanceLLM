@@ -1,53 +1,36 @@
-# -*- coding: utf-8 -*-
-"""
-Routing Service（同期向け公開インターフェース）。
-ここでは FR-3-3 で使われる get_distance_and_duration のみ使用。
-OSRM 連携は client に隠蔽されている想定。
-"""
+# backend/worker/app/services/routing/routing_service.py
+# OSRMクライアントをラップし、公開インターフェースを提供（FR-5）
+from __future__ import annotations
+from typing import List, Dict, Any, Tuple, Optional
 
-from typing import List, Tuple
+# 既存の client.py（OSRMClient）を利用する前提
 from worker.app.services.routing.client import OSRMClient
 
-
 class RoutingService:
-    def __init__(self):
-        self.client = OSRMClient()
+    """OSRM クライアントの薄いファサード"""
 
-    def get_distance_and_duration(
-        self,
-        *,
-        origin: Tuple[float, float],
-        destination: Tuple[float, float],
-        profile: str = "car",
-    ) -> Tuple[float, float]:
-        """
-        2点間の距離[km]・時間[分]を返す。OSRM の最短経路の先頭ルートを採用。
-        """
-        distance_km, duration_min = self.client.fetch_distance_and_duration(
-            origin, destination, mode="car" if profile == "car" else "foot"
-        )
-        return distance_km, duration_min
+    def __init__(self, osrm_car_base: str = "http://osrm-car:5000", osrm_foot_base: str = "http://osrm-foot:5000"):
+        self.client = OSRMClient(osrm_car_base=osrm_car_base, osrm_foot_base=osrm_foot_base)
 
-    def calculate_reroute(
-        self,
-        current_location: Dict[str, float],
-        remaining_waypoints: List[Dict[str, float]],
-        profile: Literal["car", "foot"]
-    ) -> Optional[Dict[str, Any]]:
+    def calculate_full_itinerary_route(self, waypoints: List[Tuple[float, float]], profile: str = "car", roundtrip: bool = False) -> Dict[str, Any]:
         """
-        [達成事項3] ナビ中のリルート計算を行う。
+        :param waypoints: [(lon, lat), ...] の配列（OSRM 準拠）
+        :param profile: "car" or "foot"
+        :param roundtrip: True の場合は最終地点に出発点を追加（FR-5-2）
         """
-        # 入力値の検証
-        if not remaining_waypoints or not isinstance(remaining_waypoints, list) or \
-           not all(k in current_location for k in ["latitude", "longitude"]):
-            logger.warning("calculate_reroute received invalid arguments.")
-            return None
-            
-        route_points = [current_location] + remaining_waypoints
-        
-        try:
-            route_data = self.client.fetch_route(route_points, profile)
-            return route_data.get("geometry") if route_data else None
-        except Exception as e:
-            logger.error(f"Unexpected error in calculate_reroute: {e}", exc_info=True)
-            return None
+        if roundtrip and waypoints and waypoints[0] != waypoints[-1]:
+            waypoints = list(waypoints) + [waypoints[0]]
+        return self.client.fetch_route(waypoints=waypoints, profile=profile)
+
+    def get_distance_and_duration(self, origin: Tuple[float, float], destination: Tuple[float, float], profile: str = "car") -> Dict[str, float]:
+        """ナッジ用の軽量距離/時間取得（km / 分）"""
+        res = self.client.fetch_distance_and_duration(origin=origin, destination=destination, profile=profile)
+        return {
+            "distance_km": float(res.get("distance_km", 0.0)),
+            "duration_min": float(res.get("duration_min", 0.0)),
+        }
+
+    def calculate_reroute(self, current_location: Tuple[float, float], remaining_waypoints: List[Tuple[float, float]], profile: str = "car") -> Dict[str, Any]:
+        """リルート用。現在地 + 残りウェイポイントで新ルートを生成"""
+        waypoints = [current_location] + list(remaining_waypoints)
+        return self.client.fetch_route(waypoints=waypoints, profile=profile)

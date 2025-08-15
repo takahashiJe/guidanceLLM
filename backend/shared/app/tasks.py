@@ -1,42 +1,27 @@
-# backend/shared/app/tasks.py
+# -*- coding: utf-8 -*-
 """
-API Gateway から Celery Worker（worker/app/tasks.py 実装）へ
-send_task で非同期依頼するための “薄い窓口”。
-タスク名の一貫性と引数形の型安全（軽め）を担保します。
+共有Celeryタスク定義。
+- ここにマテビュー更新タスクを追加
+- 既存のタスク名・インポートは壊さない（orchestrate, STT/TTS, routing など）
 """
-from typing import Dict, Any
+
+import os
+from sqlalchemy import create_engine, text
+
 from shared.app.celery_app import celery_app
 
-TASK_ORCHESTRATE_CONVERSATION = "orchestrate_conversation"
-TASK_NAVIGATION_START = "navigation.start"
-TASK_NAVIGATION_LOCATION = "navigation.location"
+DB_URL = os.getenv("DATABASE_URL")
+_engine = create_engine(DB_URL, future=True)
 
-def dispatch_orchestrate_conversation(payload: Dict[str, Any]) -> str:
-    """
-    payload 例:
-    {
-      "session_id": "...",
-      "user_id": 123,
-      "language": "ja",
-      "dialogue_mode": "text" | "voice",
-      "text": "...",                     # 任意
-      "audio_filename": "xxx.wav",       # 任意
-      "audio_bytes_b64": "...."          # 任意
-    }
-    """
-    async_result = celery_app.send_task(TASK_ORCHESTRATE_CONVERSATION, args=[payload])
-    return async_result.id
 
-def dispatch_start_navigation(payload: Dict[str, Any]) -> str:
+@celery_app.task(name="shared.app.tasks.refresh_spot_congestion_mv")
+def refresh_spot_congestion_mv():
     """
-    payload: { "session_id": "...", "user_id": 123 }
+    ルーティンで spot_congestion_mv を更新するタスク。
+    初回は CONCURRENTLY が使えない可能性があるため通常 REFRESH にフォールバック。
     """
-    async_result = celery_app.send_task(TASK_START_NAVIGATION, args=[payload])
-    return async_result.id
-
-def dispatch_update_location(payload: Dict[str, Any]) -> str:
-    """
-    payload: { "session_id": "...", "lat": 0.0, "lon": 0.0, ... }
-    """
-    async_result = celery_app.send_task(TASK_UPDATE_LOCATION, args=[payload])
-    return async_result.id
+    with _engine.begin() as conn:
+        try:
+            conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY spot_congestion_mv;"))
+        except Exception:
+            conn.execute(text("REFRESH MATERIALIZED VIEW spot_congestion_mv;"))

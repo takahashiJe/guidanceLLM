@@ -1,11 +1,16 @@
 # shared/app/celery_app.py
 import os
 from celery import Celery
+from celery.schedules import crontab
 
 BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 
-celery_app = Celery("chokai_shared", broker=BROKER_URL, backend=RESULT_BACKEND)
+celery_app = Celery("guidanceLLM", broker=BROKER_URL, backend=BACKEND_URL, include=[
+    "shared.app.tasks",
+])
+
+celery_app.conf.timezone = os.getenv("TZ", "Asia/Tokyo")
 
 # Celeryの設定（オプション）
 celery_app.conf.update(
@@ -19,4 +24,17 @@ celery_app.conf.update(
     task_acks_late=True,
 )
 
-celery_app.conf.timezone = 'Asia/Tokyo'
+cron = os.getenv("CONGESTION_MV_REFRESH_CRON", "").strip()
+if cron:
+    minute, hour, day_of_month, month, day_of_week = cron.split()
+    schedule = crontab(minute=minute, hour=hour, day_of_month=day_of_month, month_of_year=month, day_of_week=day_of_week)
+else:
+    # 既定は5分おき
+    schedule = crontab(minute="*/5")
+
+celery_app.conf.beat_schedule = {
+    "refresh-spot-congestion-mv": {
+        "task": "shared.app.tasks.refresh_spot_congestion_mv",
+        "schedule": schedule,
+    }
+}
