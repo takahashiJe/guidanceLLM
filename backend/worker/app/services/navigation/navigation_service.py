@@ -1,91 +1,190 @@
-# worker/app/services/navigation/navigation_service.py
+# backend/worker/app/services/navigation/navigation_service.py
+# =========================================================
+# 目的:
+# - ナビゲーション中のイベント検知（逸脱/接近）を行い、
+#   オーケストレーターへ通知すべきイベントだけを返す。
+# - 実アクション（リルート計算/TTS再生等）は行わない。
+#
+# 提供メソッド:
+# - check_for_deviation(current_location, current_route_geojson, threshold_m=None)
+# - check_for_proximity(current_location, guide_spots, default_radius_m=None, already_triggered=None)
+#
+# 返却仕様:
+# - 逸脱あり:
+#   {"event": "REROUTE_REQUESTED",
+#    "data": {
+#        "current_location": {"lat": ..., "lon": ...},
+#        "distance_to_route_m": 123.4
+#    }}
+# - 接近あり（複数回り得る）:
+#   [{"event": "PROXIMITY_SPOT_ID",
+#     "data": {
+#        "spot_id": "...",
+#        "distance_m": 87.6,
+#        "current_location": {"lat": ..., "lon": ...}
+#     }} , ...]
+#
+# 設計メモ:
+# - 閾値は geospatial_utils.get_env_distance_thresholds() を既定で使用
+# - ルートは GeoJSON LineString / MultiLineString のどちらにも対応
+# - guide_spots は spot_type='tourist_spot' のみを想定（呼び出し側で絞り込み推奨）
+# - 接近は同じスポットに対して重複通知しないための already_triggered セットを受け取り可能
+# =========================================================
 
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+import math
 
-# 地理空間計算のためのユーティリティ関数をインポート
-from worker.app.services.navigation import geospatial_utils
+from worker.app.services.navigation.geospatial_utils import (
+    point_to_linestring_distance_m,
+    haversine_distance_m,
+    get_env_distance_thresholds,
+)
+
+LatLon = Tuple[float, float]
+GeoJSON = Dict[str, Any]
+
+
+def _collect_linestring_coords(geojson: GeoJSON) -> List[List[LatLon]]:
+    """
+    GeoJSON の LineString / MultiLineString から、座標列の配列を返す。
+    - 戻り値: [ [(lat,lon), ...], [(lat,lon), ...], ... ]
+    """
+    if not geojson or "type" not in geojson:
+        return []
+
+    gtype = geojson.get("type")
+    if gtype == "Feature":
+        return _collect_linestring_coords(geojson.get("geometry") or {})
+    if gtype == "FeatureCollection":
+        coords: List[List[LatLon]] = []
+        for feat in geojson.get("features", []):
+            coords.extend(_collect_linestring_coords(feat))
+        return coords
+
+    if gtype == "LineString":
+        # GeoJSONは [lon, lat]、内部では (lat,lon) で統一
+        coords_ll = geojson.get("coordinates", [])
+        return [[(lat, lon) for lon, lat in coords_ll]]
+
+    if gtype == "MultiLineString":
+        multi = geojson.get("coordinates", [])
+        return [[(lat, lon) for lon, lat in part] for part in multi]
+
+    # それ以外は非対応
+    return []
+
 
 class NavigationService:
-    """
-    ナビゲーション中のリアルタイムイベント処理を担うサービスクラス。
-    ユーザーの現在地を受け取り、ルート逸脱やスポットへの接近を検知する。
-    このクラスのインスタンスは、ナビゲーションセッションごとに生成・維持されることを想定。
-    """
+    """逸脱検知・接近検知の軽量ロジックを提供するサービス層。"""
 
     def __init__(
         self,
-        route_geojson: Dict[str, Any],
-        guide_spots: List[Dict[str, Any]],
-        deviation_threshold_meters: float = 50.0
-    ):
+        deviation_threshold_m: Optional[float] = None,
+        default_proximity_radius_m: Optional[float] = None,
+    ) -> None:
+        th = get_env_distance_thresholds()
+        self.deviation_threshold_m = deviation_threshold_m or th["deviation_m"]
+        self.default_proximity_radius_m = default_proximity_radius_m or th["proximity_m"]
+
+    # -----------------------------------------------------
+    # 逸脱検知: 現在地とルート最近傍点の距離が threshold を超えれば逸脱
+    # -----------------------------------------------------
+    def check_for_deviation(
+        self,
+        current_location: Dict[str, float],
+        current_route_geojson: GeoJSON,
+        threshold_m: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        ナビゲーションセッションを初期化する。
-
-        Args:
-            route_geojson (Dict[str, Any]): 現在走行中のルートのGeoJSONデータ。
-            guide_spots (List[Dict[str, Any]]): 案内対象スポットのリスト。
-                各要素は {"spot_id": str, "latitude": float, "longitude": float, "trigger_radius_meters": float} の形式。
-            deviation_threshold_meters (float): ルート逸脱と判断する距離の閾値。
+        :param current_location: {"lat": float, "lon": float}
+        :param current_route_geojson: LineString/MultiLineString/Feature(...) などの GeoJSON
+        :param threshold_m: 上書き用の判定閾値（未指定なら環境値）
+        :return: 逸脱イベント or None
         """
-        if not route_geojson or not route_geojson.get("coordinates"):
-            raise ValueError("Route GeoJSON is invalid or missing coordinates.")
-            
-        self.route_geojson = route_geojson
-        self.guide_spots = guide_spots
-        self.deviation_threshold = deviation_threshold_meters
-        # 一度のナビゲーションセッションで、同じガイドが何度も再生されるのを防ぐためのセット
-        self.triggered_spot_ids = set()
+        lat = float(current_location["lat"])
+        lon = float(current_location["lon"])
+        th = threshold_m if threshold_m is not None else self.deviation_threshold_m
 
-    def update_user_location(self, current_location: Dict[str, float]) -> Optional[Dict[str, Any]]:
+        # ルート座標列を取得
+        lines = _collect_linestring_coords(current_route_geojson)
+        if not lines:
+            return None  # ルートがない場合は何もしない
+
+        # 複数の LineString があれば最短距離を採用
+        min_dist = math.inf
+        for line in lines:
+            d = point_to_linestring_distance_m((lat, lon), line)
+            if d < min_dist:
+                min_dist = d
+
+        if min_dist > th:
+            return {
+                "event": "REROUTE_REQUESTED",
+                "data": {
+                    "current_location": {"lat": lat, "lon": lon},
+                    "distance_to_route_m": float(min_dist),
+                },
+            }
+        return None
+
+    # -----------------------------------------------------
+    # 接近検知: tourist_spot のみ対象。半径に入ったらイベントを列挙
+    # -----------------------------------------------------
+    def check_for_proximity(
+        self,
+        current_location: Dict[str, float],
+        guide_spots: Iterable[Dict[str, Any]],
+        default_radius_m: Optional[float] = None,
+        already_triggered: Optional[Set[Union[int, str]]] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        ユーザーの現在地を更新し、発生したイベントを返す。
-        このメソッドが、外部から定期的に呼び出されるメインの処理となる。
-
-        Args:
-            current_location (Dict[str, float]): ユーザーの最新の座標。 {"latitude": ..., "longitude": ...}
-
-        Returns:
-            Optional[Dict[str, Any]]: 検知したイベント。なければNone。
-                - ルート逸脱時: {"event_type": "reroute_request"}
-                - スポット接近時: {"event_type": "proximity_alert", "spot_id": "spot_xxx"}
+        :param current_location: {"lat": float, "lon": float}
+        :param guide_spots: [{ "spot_id": ID, "lat": float, "lon": float,
+                               "spot_type": "tourist_spot", "radius_m": optional }, ...]
+                           ※ 呼び出し側で spot_type='tourist_spot' のみ渡すのが理想
+        :param default_radius_m: 既定半径（未指定なら環境値）
+        :param already_triggered: 既にガイド済みの spot_id 集合（重複通知防止用）
+        :return: 発火すべきイベントの配列
         """
-        if not all(k in current_location for k in ["latitude", "longitude"]):
-            print("Error: Invalid current_location format.")
-            return None
+        lat = float(current_location["lat"])
+        lon = float(current_location["lon"])
+        base_radius = default_radius_m if default_radius_m is not None else self.default_proximity_radius_m
 
-        # [達成事項1: FR-5-3] ルート逸脱検知
-        # geospatial_utilsを使い、現在地とルートの最短距離を計算
-        deviation_distance = geospatial_utils.calculate_distance_from_route(
-            current_location, self.route_geojson
-        )
-        
-        # 閾値を超えていたら、リルート要求イベントを返す
-        if deviation_distance > self.deviation_threshold:
-            print(f"Deviation detected! Distance: {deviation_distance:.2f}m. Threshold: {self.deviation_threshold}m")
-            return {"event_type": "reroute_request"}
+        fired: List[Dict[str, Any]] = []
+        seen: Set[Union[int, str]] = already_triggered or set()
 
-        # [達成事項2: FR-5-4] スポットへの接近検知
-        for spot in self.guide_spots:
-            spot_id = spot.get("spot_id")
-            # spot_idがない、または既にこのセッションでガイド済みの場合はスキップ
-            if not spot_id or spot_id in self.triggered_spot_ids:
+        for s in guide_spots:
+            spot_type = s.get("spot_type")
+            if spot_type and spot_type != "tourist_spot":
+                # 念のため防御。アプリ設計上は呼び出し前にフィルタ済みのはず。
+                continue
+
+            spot_id = s.get("spot_id")
+            if spot_id in seen:
+                # 重複防止
                 continue
 
             try:
-                spot_location = {"latitude": spot["latitude"], "longitude": spot["longitude"]}
-                trigger_radius = spot["trigger_radius_meters"]
-
-                # geospatial_utilsを使い、現在地がスポットのトリガー半径内に入ったか判定
-                if geospatial_utils.is_within_radius(current_location, spot_location, trigger_radius):
-                    print(f"Proximity alert for spot: {spot_id}")
-                    # このスポットを「ガイド済み」として記録
-                    self.triggered_spot_ids.add(spot_id)
-                    # スポット接近イベントを返す
-                    return {"event_type": "proximity_alert", "spot_id": spot_id}
-            except (KeyError, TypeError) as e:
-                # guide_spotsのデータ構造が不正な場合に備える
-                print(f"Error processing spot {spot_id}: {e}")
+                s_lat = float(s["lat"])
+                s_lon = float(s["lon"])
+            except (KeyError, ValueError, TypeError):
                 continue
-        
-        # イベントが発生しなかった場合はNoneを返す
-        return None
+
+            radius_m = float(s.get("radius_m", base_radius))
+            dist = haversine_distance_m(lat, lon, s_lat, s_lon)
+            if dist <= radius_m:
+                fired.append(
+                    {
+                        "event": "PROXIMITY_SPOT_ID",
+                        "data": {
+                            "spot_id": spot_id,
+                            "distance_m": float(dist),
+                            "current_location": {"lat": lat, "lon": lon},
+                        },
+                    }
+                )
+                # 呼び出し側の集合も更新して欲しいケースが多いので、参照が来ていれば加える
+                if already_triggered is not None:
+                    already_triggered.add(spot_id)
+
+        return fired
