@@ -7,10 +7,9 @@ send_task で非同期依頼するための “薄い窓口”。
 from typing import Dict, Any
 from shared.app.celery_app import celery_app
 
-# Worker 側で定義されているタスク名（must be in worker/app/tasks.py）
-TASK_ORCHESTRATE_CONVERSATION = "worker.tasks.orchestrate_conversation_task"
-TASK_START_NAVIGATION = "worker.tasks.start_navigation_task"
-TASK_UPDATE_LOCATION = "worker.tasks.update_location_task"
+TASK_ORCHESTRATE_CONVERSATION = "orchestrate_conversation"
+TASK_NAVIGATION_START = "navigation.start"
+TASK_NAVIGATION_LOCATION = "navigation.location"
 
 def dispatch_orchestrate_conversation(payload: Dict[str, Any]) -> str:
     """

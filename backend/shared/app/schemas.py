@@ -1,68 +1,67 @@
 # backend/shared/app/schemas.py
-from datetime import datetime
-from typing import Optional, List, Any
-from pydantic import BaseModel, Field, EmailStr
+# API 入出力で使う Pydantic スキーマ（Gateway / Worker 共有）
+from typing import Optional, List
+from pydantic import BaseModel, Field
 
-# ===== Auth =====
 
-class UserCreate(BaseModel):
+# ========== Auth ==========
+class RegisterRequest(BaseModel):
+    username: str = Field(..., description="一意のユーザー名")
+    password: str = Field(..., description="パスワード")
+
+class RegisterResponse(BaseModel):
+    user_id: str
     username: str
-    email: EmailStr
-    password: str
-    preferred_language: Optional[str] = "ja"
 
 class LoginRequest(BaseModel):
     username: str
     password: str
 
-class TokenPair(BaseModel):
+class LoginResponse(BaseModel):
     access_token: str
     refresh_token: str
+    token_type: str = "bearer"
 
-class AccessToken(BaseModel):
-    access_token: str
-    # ローテーションの都合で新 refresh も返す
-    refresh_token: Optional[str] = None
-
-class TokenRefreshRequest(BaseModel):
+class RefreshRequest(BaseModel):
     refresh_token: str
 
-# ===== Sessions =====
+class RefreshResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
 
+
+# ========== Sessions ==========
 class SessionCreateRequest(BaseModel):
-    session_id: str
-    language: Optional[str] = "ja"
-    dialogue_mode: Optional[str] = "text"  # text / voice
+    session_id: str = Field(..., description="フロント側で生成した一意ID")
 
 class SessionCreateResponse(BaseModel):
     session_id: str
-    current_status: str
+    current_status: Optional[str] = None
+    active_plan_id: Optional[int] = None
 
-class ChatMessage(BaseModel):
-    role: str  # user / assistant / system_trigger
+class ConversationItem(BaseModel):
+    role: str  # "user" / "assistant" / "SYSTEM_TRIGGER" 等
     content: str
-    created_at: datetime
-    meta: Optional[dict] = None
+    created_at: Optional[str] = None
 
 class SessionRestoreResponse(BaseModel):
     session_id: str
-    current_status: str
+    current_status: Optional[str] = None
     active_plan_id: Optional[int] = None
-    language: str
-    dialogue_mode: str
-    history: List[ChatMessage] = []
+    history: List[ConversationItem] = []
 
-# ===== Chat / Navigation =====
 
-class TaskAcceptedResponse(BaseModel):
+# ========== Chat / Navigation ==========
+class ChatSubmitResponse(BaseModel):
     task_id: str
+    accepted: bool = True
 
 class NavigationStartRequest(BaseModel):
     session_id: str
+    language: Optional[str] = "ja"
 
-class NavigationLocationUpdate(BaseModel):
+class NavigationLocationRequest(BaseModel):
     session_id: str
     lat: float
-    lon: float
-    heading: Optional[float] = None
-    speed: Optional[float] = None
+    lng: float

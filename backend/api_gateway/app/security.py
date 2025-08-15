@@ -1,67 +1,118 @@
 # backend/api_gateway/app/security.py
-import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+# 認証とセキュリティ：パスワードハッシュ、JWT アクセス/リフレッシュ、依存関係など。
+# 「アクセストークン(短命)」「リフレッシュトークン(長命)」を厳密に分離。
 
+import os
+import time
+from typing import Optional, Tuple
+
+from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import jwt, JWTError
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from shared.app.database import get_db
-from shared.app import models
+from shared.app.models import User
 
-PWD_CTX = CryptContext(schemes=["bcrypt"], deprecated="auto")
+load_dotenv()
 
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_IN_PROD")
+# ==== 設定値（.env から取得）====
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SECRET")
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "90"))
 
-http_bearer = HTTPBearer(auto_error=False)
+ACCESS_TOKEN_EXPIRE_SECONDS = int(os.getenv("ACCESS_TOKEN_EXPIRE_SECONDS", "3600"))       # 1h
+REFRESH_TOKEN_EXPIRE_SECONDS = int(os.getenv("REFRESH_TOKEN_EXPIRE_SECONDS", "7776000"))  # 90d
 
-def hash_password(password: str) -> str:
-    return PWD_CTX.hash(password)
+# OAuth2PasswordBearerは「Authorization: Bearer <access_token>」を想定
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
-def verify_password(password: str, hashed: str) -> bool:
-    return PWD_CTX.verify(password, hashed)
+# パスワードハッシュ
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
-def create_access_token(sub: str) -> str:
-    exp = _now() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {"sub": sub, "type": "access", "exp": exp}
+# ===== パスワードユーティリティ =====
+def hash_password(raw_password: str) -> str:
+    return pwd_context.hash(raw_password)
+
+def verify_password(raw_password: str, hashed: str) -> bool:
+    return pwd_context.verify(raw_password, hashed)
+
+
+# ===== JWT ユーティリティ =====
+def _create_token(sub: str, token_type: str, expires_in: int) -> str:
+    now = int(time.time())
+    payload = {
+        "sub": sub,
+        "type": token_type,  # "access" or "refresh"
+        "iat": now,
+        "exp": now + expires_in,
+    }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
-def create_refresh_token(sub: str, jti: Optional[str] = None) -> str:
-    exp = _now() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    payload = {"sub": sub, "type": "refresh", "exp": exp}
-    if jti:
-        payload["jti"] = jti
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+def create_access_token(user_id: str) -> str:
+    return _create_token(sub=user_id, token_type="access", expires_in=ACCESS_TOKEN_EXPIRE_SECONDS)
+
+def create_refresh_token(user_id: str) -> str:
+    return _create_token(sub=user_id, token_type="refresh", expires_in=REFRESH_TOKEN_EXPIRE_SECONDS)
 
 def decode_token(token: str) -> dict:
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
 
+
 def get_current_user(
-    creds: HTTPAuthorizationCredentials = Depends(http_bearer),
+    token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
-) -> models.User:
-    if creds is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    token = creds.credentials
+) -> User:
+    """
+    アクセストークンを検証し、現在ユーザーを返す依存関数。
+    - type=access のみ許可
+    """
+    credentials_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
         payload = decode_token(token)
         if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        sub = payload.get("sub")
-        if not sub:
-            raise HTTPException(status_code=401, detail="Invalid token subject")
+            raise credentials_exc
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise credentials_exc
     except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    user = db.query(models.User).filter(models.User.username == sub).first()
+        raise credentials_exc
+
+    user: Optional[User] = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise credentials_exc
+    return user
+
+
+def rotate_access_token_from_refresh(
+    refresh_token: str,
+    db: Session,
+) -> Tuple[str, str]:
+    """
+    リフレッシュトークンを検証し、新しいアクセストークンを発行する。
+    - リフレッシュも再発行（ローリング）する方針。必要に応じて変更可。
+    """
+    try:
+        payload = decode_token(refresh_token)
+        if payload.get("type") != "refresh":
+            raise JWTError("invalid token type")
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise JWTError("no subject")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    # ユーザー存在確認（失効ユーザー等のガード）
+    user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-    return user
+
+    new_access = create_access_token(user_id=user_id)
+    new_refresh = create_refresh_token(user_id=user_id)
+    return new_access, new_refresh

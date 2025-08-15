@@ -1,77 +1,99 @@
 # backend/api_gateway/app/api/v1/chat.py
+# ユーザーのメッセージ（テキスト or 音声）を受け取り、Celery タスクに非同期投入。
+# - audio は multipart/form-data で受信→base64 化してタスクへ
+# - 202 Accepted を返し、フロントはポーリングで結果取得（設計どおり）
+
+import base64
+import os
 from typing import Optional
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
+
+from dotenv import load_dotenv
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from shared.app.database import get_db
-from shared.app import models, schemas, tasks as shared_tasks
 from api_gateway.app.security import get_current_user
+from shared.app.database import get_db
+from shared.app.celery_app import celery_app
+from shared.app.schemas import ChatSubmitResponse, NavigationStartRequest, NavigationLocationRequest
+
+load_dotenv()
+
+# タスク名は環境変数で上書き可能（Worker 側の実装に合わせられる）
+ORCH_TASK_NAME = os.getenv("ORCH_TASK_NAME", "orchestrate_conversation")
+NAV_START_TASK_NAME = os.getenv("NAV_START_TASK_NAME", "navigation.start")
+NAV_LOCATION_TASK_NAME = os.getenv("NAV_LOCATION_TASK_NAME", "navigation.location")
 
 router = APIRouter()
 
-@router.post("/chat/message", response_model=schemas.TaskAcceptedResponse, status_code=202)
-async def post_message(
-    session_id: str = Form(...),
-    text: Optional[str] = Form(None),
-    language: Optional[str] = Form(None),
-    dialogue_mode: Optional[str] = Form(None),  # "text" or "voice"
-    audio_file: Optional[UploadFile] = File(None),
+
+@router.post("/chat/message", response_model=ChatSubmitResponse, status_code=202)
+async def submit_message(
+    session_id: str = Form(..., description="フロント生成のsession_id"),
+    message: Optional[str] = Form(None, description="テキストメッセージ（音声がある場合は省略可）"),
+    language: Optional[str] = Form("ja", description="ユーザーの選択言語（ja/en/zh）"),
+    audio_file: Optional[UploadFile] = File(None, description="音声ファイル（任意）"),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
+    user=Depends(get_current_user),
 ):
-    sess = db.query(models.Session).filter(
-        models.Session.id == session_id, models.Session.user_id == user.id
-    ).first()
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
+    # テキスト or 音声のいずれかは必須
+    if not message and not audio_file:
+        raise HTTPException(status_code=400, detail="message or audio_file is required")
 
-    if not text and not audio_file:
-        raise HTTPException(status_code=400, detail="Either text or audio_file is required")
-
-    payload = {
-        "session_id": session_id,
-        "user_id": user.id,
-        "language": language or sess.language or user.preferred_language or "ja",
-        "dialogue_mode": dialogue_mode or sess.dialogue_mode or "text",
-        "text": text,
-        "audio_filename": None,
-        "audio_bytes_b64": None,
-    }
-
+    audio_b64 = None
+    audio_mime = None
+    audio_name = None
     if audio_file:
-        b = await audio_file.read()
-        import base64
-        payload["audio_filename"] = audio_file.filename
-        payload["audio_bytes_b64"] = base64.b64encode(b).decode("utf-8")
+        raw = await audio_file.read()
+        audio_b64 = base64.b64encode(raw).decode("utf-8")
+        audio_mime = audio_file.content_type or "application/octet-stream"
+        audio_name = audio_file.filename or "audio_input"
 
-    # 重い処理は Celery に委譲
-    task_id = shared_tasks.dispatch_orchestrate_conversation(payload)
-    return schemas.TaskAcceptedResponse(task_id=task_id)
+    # Celery タスクに投入
+    # Worker 側のタスクは session_id / user_id / message / language / audio_* を受け取る想定
+    task = celery_app.send_task(
+        ORCH_TASK_NAME,
+        kwargs={
+            "session_id": session_id,
+            "user_id": str(user.id),
+            "message": message,
+            "language": language,
+            "audio_b64": audio_b64,
+            "audio_mime": audio_mime,
+            "audio_name": audio_name,
+        },
+    )
 
-@router.post("/navigation/start", response_model=schemas.TaskAcceptedResponse, status_code=202)
-def start_navigation(
-    payload: schemas.NavigationStartRequest,
-    db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
+    return ChatSubmitResponse(task_id=task.id, accepted=True)
+
+
+@router.post("/navigation/start", status_code=202)
+def navigation_start(
+    payload: NavigationStartRequest,
+    user=Depends(get_current_user),
 ):
-    sess = db.query(models.Session).filter(
-        models.Session.id == payload.session_id, models.Session.user_id == user.id
-    ).first()
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
-    task_id = shared_tasks.dispatch_start_navigation({"session_id": payload.session_id, "user_id": user.id})
-    return schemas.TaskAcceptedResponse(task_id=task_id)
+    task = celery_app.send_task(
+        NAV_START_TASK_NAME,
+        kwargs={
+            "session_id": payload.session_id,
+            "user_id": str(user.id),
+            "language": payload.language or "ja",
+        },
+    )
+    return {"task_id": task.id, "accepted": True}
 
-@router.post("/navigation/location", response_model=schemas.TaskAcceptedResponse, status_code=202)
-def update_location(
-    payload: schemas.NavigationLocationUpdate,
-    db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
+
+@router.post("/navigation/location", status_code=202)
+def navigation_location(
+    payload: NavigationLocationRequest,
+    user=Depends(get_current_user),
 ):
-    sess = db.query(models.Session).filter(
-        models.Session.id == payload.session_id, models.Session.user_id == user.id
-    ).first()
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
-    task_id = shared_tasks.dispatch_update_location(payload.dict())
-    return schemas.TaskAcceptedResponse(task_id=task_id)
+    task = celery_app.send_task(
+        NAV_LOCATION_TASK_NAME,
+        kwargs={
+            "session_id": payload.session_id,
+            "user_id": str(user.id),
+            "lat": payload.lat,
+            "lng": payload.lng,
+        },
+    )
+    return {"task_id": task.id, "accepted": True}
