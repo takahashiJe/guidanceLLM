@@ -5,6 +5,7 @@ from celery.schedules import crontab
 
 BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
+REFRESH_EVERY_MIN = int(os.getenv("MV_REFRESH_MINUTES", "5"))
 
 celery_app = Celery("guidanceLLM", broker=BROKER_URL, backend=BACKEND_URL, include=[
     "shared.app.tasks",
@@ -33,8 +34,9 @@ else:
     schedule = crontab(minute="*/5")
 
 celery_app.conf.beat_schedule = {
-    "refresh-spot-congestion-mv": {
-        "task": "shared.app.tasks.refresh_spot_congestion_mv",
-        "schedule": schedule,
+    "refresh-congestion-mv-interval": {
+        "task": "worker.app.tasks.refresh_congestion_mv_task",
+        "schedule": crontab(minute=f"*/{REFRESH_EVERY_MIN}"),
+        "options": {"queue": "default"},
     }
 }

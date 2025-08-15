@@ -45,6 +45,31 @@ ACCESS_POINTS_GEOJSON = Path("/app/scripts/access_points.geojson")
 DB_URL = os.getenv("DATABASE_URL")  # 例: postgresql+psycopg2://user:pass@db:5432/app
 engine = create_engine(DB_URL, future=True)
 
+MV_SQL = """
+CREATE MATERIALIZED VIEW IF NOT EXISTS congestion_by_date_spot AS
+SELECT
+  s.spot_id AS spot_id,
+  p.start_date::date AS visit_date,
+  COUNT(DISTINCT p.user_id) AS user_count
+FROM plans p
+JOIN stops s ON s.plan_id = p.id
+GROUP BY s.spot_id, p.start_date
+WITH NO DATA;
+"""
+
+# CONCURRENTLY リフレッシュにはユニークインデックスが必須
+MV_UNIQUE_IDX_SQL = """
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE indexname = 'uq_congestion_by_date_spot'
+  ) THEN
+    CREATE UNIQUE INDEX uq_congestion_by_date_spot
+      ON congestion_by_date_spot(spot_id, visit_date);
+  END IF;
+END $$;
+"""
+
 
 # ---------- ユーティリティ ----------
 
@@ -233,6 +258,11 @@ def main():
 
     logger.info("=== DB init completed ===")
     create_materialized_view()
+
+    with engine.connect() as conn:
+        conn.execute(text(MV_SQL))
+        conn.execute(text(MV_UNIQUE_IDX_SQL))
+        conn.commit()
 
 
 if __name__ == "__main__":

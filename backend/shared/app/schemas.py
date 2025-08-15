@@ -98,3 +98,4 @@ class CongestionStatusResponse(BaseModel):
     date: date
     count: int
     status: str
+
