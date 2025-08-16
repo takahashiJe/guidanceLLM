@@ -1,7 +1,6 @@
 # backend/shared/app/database.py
 import os
 import time
-from contextlib import contextmanager
 from typing import Iterator
 
 from sqlalchemy import create_engine
@@ -17,12 +16,12 @@ _connect_args = {}
 if DATABASE_URL.startswith("sqlite"):
     _connect_args = {"check_same_thread": False}
 else:
-    # PostgreSQL / psycopg2 用の堅牢化オプション
+    # PostgreSQL / psycopg2 用の保守的プール設定
     _engine_opts.update(
         dict(
-            pool_pre_ping=True,        # 接続前に ping（死んだ接続を自動で捨てる）
-            pool_recycle=1800,         # 30分で再作成（NAT/ALB 越えの古い接続対策）
-            pool_size=5,               # 低めで保守的
+            pool_pre_ping=True,   # 死んだ接続を自動で捨てる
+            pool_recycle=1800,    # 30分で再作成
+            pool_size=5,
             max_overflow=10,
         )
     )
@@ -30,13 +29,14 @@ else:
 # 初回 DNS/接続レースに備えて軽いリトライ
 def _create_engine_with_retry(url: str, retries: int = 5, wait: float = 1.0):
     last_err = None
-    for i in range(retries):
+    for _ in range(retries):
         try:
             eng = create_engine(url, connect_args=_connect_args, **_engine_opts)
             # 明示的に一度接続を確立しておく（DNS/起動順の即死を避ける）
             if not url.startswith("sqlite"):
                 with eng.connect() as conn:
-                    conn.execute("SELECT 1")
+                    # SQLAlchemy 2.0 互換の生 SQL 実行
+                    conn.exec_driver_sql("SELECT 1")
             return eng
         except OperationalError as e:
             last_err = e
@@ -45,7 +45,6 @@ def _create_engine_with_retry(url: str, retries: int = 5, wait: float = 1.0):
     try:
         return create_engine(url, connect_args=_connect_args, **_engine_opts)
     except Exception:
-        # どうしてもダメな場合は最後の例外を投げ直す
         if last_err:
             raise last_err
         raise
