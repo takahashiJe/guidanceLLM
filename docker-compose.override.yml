@@ -26,7 +26,7 @@ services:
       else:
           print("DB not reachable, but continue (pool_pre_ping will retry)"); 
       PY
-              uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000 --reload
+              uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000 --reload --access-log
             '
 
   worker:

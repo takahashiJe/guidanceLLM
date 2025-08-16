@@ -1,4 +1,4 @@
-# backend/shared/app/database.py （完全置き換え）
+# backend/shared/app/database.py
 import os
 import time
 from contextlib import contextmanager

@@ -35,3 +35,12 @@ def create_app() -> FastAPI:
     return app
 
 app = create_app()
+
+@health_router.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@health_router.get("/healthz/db")
+def healthz_db(db: Session = Depends(get_db)):
+    db.execute(text("SELECT 1"))
+    return {"ok": True}
