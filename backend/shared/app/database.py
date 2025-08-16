@@ -1,6 +1,7 @@
 # backend/shared/app/database.py
 import os
 import time
+from contextlib import contextmanager
 from typing import Iterator
 
 from sqlalchemy import create_engine
@@ -16,26 +17,27 @@ _connect_args = {}
 if DATABASE_URL.startswith("sqlite"):
     _connect_args = {"check_same_thread": False}
 else:
-    # PostgreSQL / psycopg2 用の保守的プール設定
+    # PostgreSQL / psycopg2 用の堅牢化オプション
     _engine_opts.update(
         dict(
             pool_pre_ping=True,   # 死んだ接続を自動で捨てる
-            pool_recycle=1800,    # 30分で再作成
+            pool_recycle=1800,    # 30分で再作成（NAT/ALB 越え対策）
             pool_size=5,
             max_overflow=10,
         )
     )
 
-# 初回 DNS/接続レースに備えて軽いリトライ
 def _create_engine_with_retry(url: str, retries: int = 5, wait: float = 1.0):
+    """
+    初回 DNS/接続レースに備えて軽いリトライを実施。
+    """
     last_err = None
     for _ in range(retries):
         try:
             eng = create_engine(url, connect_args=_connect_args, **_engine_opts)
-            # 明示的に一度接続を確立しておく（DNS/起動順の即死を避ける）
             if not url.startswith("sqlite"):
+                # exec_driver_sql を使って軽く疎通チェック
                 with eng.connect() as conn:
-                    # SQLAlchemy 2.0 互換の生 SQL 実行
                     conn.exec_driver_sql("SELECT 1")
             return eng
         except OperationalError as e:
@@ -51,15 +53,16 @@ def _create_engine_with_retry(url: str, retries: int = 5, wait: float = 1.0):
 
 engine = _create_engine_with_retry(DATABASE_URL)
 
+# scoped_session を使う場合は remove() で破棄するのが正解
 SessionLocal = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 
 def get_db() -> Iterator:
     """
     FastAPI 依存関係：各リクエストでセッションを供給。
-    接続エラーは SQLAlchemy 側の pool_pre_ping / 再接続に委ねる。
+    scoped_session のため close() ではなく remove() を呼ぶ。
     """
-    db = SessionLocal()
     try:
-        yield db
+        yield SessionLocal()
     finally:
-        db.close()
+        # スレッド/タスクローカルに紐づくセッションを完全破棄
+        SessionLocal.remove()

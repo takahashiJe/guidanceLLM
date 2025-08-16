@@ -1,5 +1,4 @@
-# docker-compose.yml （更新版：フェーズ2）
-version: '3.8'
+# docker-compose.yml
 
 services:
   # =========================
@@ -104,9 +103,7 @@ services:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
-      ollama:
-        condition: service_started
+        condition: service_healthy
       db-init:
         condition: service_completed_successfully
     networks:
@@ -208,7 +205,6 @@ services:
     restart: "no"
 
 volumes:
-  postgres_data:
   ollama_data:
   pgdata:
 

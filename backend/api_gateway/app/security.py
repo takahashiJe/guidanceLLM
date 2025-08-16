@@ -15,22 +15,37 @@ from shared.app.models import User
 
 load_dotenv()
 
-# ==== 設定値（.env から取得）====
+# ==== 設定値（.env から取得 / 互換）====
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SECRET")
-JWT_ALG = os.getenv("JWT_ALG", "HS256")
+# .env は JWT_ALGORITHM を使っているので後方互換で拾う
+JWT_ALG = os.getenv("JWT_ALG") or os.getenv("JWT_ALGORITHM", "HS256")
 
-ACCESS_TOKEN_EXPIRE_SECONDS = int(os.getenv("ACCESS_TOKEN_EXPIRE_SECONDS", "3600"))       # 1h
-REFRESH_TOKEN_EXPIRE_SECONDS = int(os.getenv("REFRESH_TOKEN_EXPIRE_SECONDS", "7776000"))  # 90d
+# 互換: 秒指定があれば優先。無ければ分/日の指定を秒に変換
+_access_sec_env  = os.getenv("ACCESS_TOKEN_EXPIRE_SECONDS")
+_refresh_sec_env = os.getenv("REFRESH_TOKEN_EXPIRE_SECONDS")
+
+if _access_sec_env is not None:
+    ACCESS_TOKEN_EXPIRE_SECONDS = int(_access_sec_env)
+else:
+    ACCESS_TOKEN_EXPIRE_SECONDS = int(os.getenv("ACCESS_TOKEN_EXPIRES_MIN", "60")) * 60  # 既定 60分
+
+if _refresh_sec_env is not None:
+    REFRESH_TOKEN_EXPIRE_SECONDS = int(_refresh_sec_env)
+else:
+    REFRESH_TOKEN_EXPIRE_SECONDS = int(os.getenv("REFRESH_TOKEN_EXPIRES_DAYS", "90")) * 24 * 60 * 60  # 既定 90日
+
+# bcrypt のコスト（未設定時は12）
+_BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
 
 # OAuth2PasswordBearerは「Authorization: Bearer <access_token>」を想定
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 # パスワードハッシュ
 pwd_context = CryptContext(
-    schemes=["bcrypt"], 
+    schemes=["bcrypt"],
     deprecated="auto",
     bcrypt__rounds=_BCRYPT_ROUNDS,
-    )
+)
 
 
 # ===== パスワードユーティリティ =====
