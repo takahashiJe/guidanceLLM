@@ -1,9 +1,9 @@
 # backend/shared/app/schemas.py
 # API 入出力で使う Pydantic スキーマ（Gateway / Worker 共有）
-from datetime import date
+from __future__ import annotations
+from datetime import date, datetime
 from typing import Optional, List
 from pydantic import BaseModel, Field, validator
-from __future__ import annotations
 from typing import List, Literal, Optional
 
 

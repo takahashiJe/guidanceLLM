@@ -8,10 +8,26 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app/backend
+    # command: >
+    #   uvicorn api_gateway.app.main:app
+    #   --host 0.0.0.0 --port 8000
+    #   --reload --reload-dir /app/backend
     command: >
-      uvicorn api_gateway.app.main:app
-      --host 0.0.0.0 --port 8000
-      --reload --reload-dir /app/backend
+      sh -lc '
+        python - <<PY
+      import socket, time, os, sys
+      host="db"; port=5432
+      for i in range(20):
+          try:
+              with socket.create_connection((host, port), timeout=2): 
+                  print("DB reachable"); break
+          except OSError:
+              print("Waiting for DB..."); time.sleep(1)
+      else:
+          print("DB not reachable, but continue (pool_pre_ping will retry)"); 
+      PY
+              uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000 --reload
+            '
 
   worker:
     build:

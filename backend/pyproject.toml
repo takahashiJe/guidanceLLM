@@ -4,16 +4,24 @@ version = "0.1.0"
 description = "Backend services for the Guidance LLM application."
 authors = ["Your Name <you@example.com>"]
 readme = "README.md"
+package-mode = false  # ルートをパッケージとしては扱わない（配布しない）運用なら true/false 適宜
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.12"
 
+# --- DB/ベクトル ---
+pgvector = "^0.3.2"
+psycopg2-binary = "^2.9.9"
+sqlalchemy = "^2.0.30"
+geoalchemy2 = "^0.14.6"
+
+# --- Vectorstore (RAG) ---
+chromadb = "^0.5.4"
+sentence-transformers = "^3.0.1"
+
 # --- API Gateway & Core ---
 fastapi = "^0.111.0"
 uvicorn = {extras = ["standard"], version = "^0.29.0"}
-sqlalchemy = "^2.0.30"
-geoalchemy2 = "^0.14.6"
-psycopg2-binary = "^2.9.9"
 pydantic = "^2.7.1"
 
 # --- Security ---
@@ -35,10 +43,9 @@ ollama = "^0.2.1"
 # --- Voice Services ---
 TTS = "^0.22.0"
 pyyaml = "^6.0.1"
-# whisper-cpp-python = "0.4.0"
 pydub = "^0.25.1"
 numpy = "^1.26.4"
-torch = "^2.3.0"
+torch = "^2.3.0"  # 必要に応じてCPU/GPU版を環境で切替
 
 # --- Information Services ---
 requests = "^2.31.0"
@@ -50,8 +57,9 @@ pyproj = "^3.6.1"
 geojson = "^3.1.0"
 
 [tool.poetry.group.dev.dependencies]
-# 今後、テストライブラリ(pytest)やリンター(ruff)などをここに追加していく
-# 例: pytest = "^8.2.2"
+# 今後、テストライブラリ(pytest)やリンター(ruff)などをここに追加
+# pytest = "^8.2.2"
+# ruff = "^0.6.9"
 
 [build-system]
 requires = ["poetry-core"]

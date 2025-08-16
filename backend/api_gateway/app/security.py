@@ -1,7 +1,4 @@
 # backend/api_gateway/app/security.py
-# 認証とセキュリティ：パスワードハッシュ、JWT アクセス/リフレッシュ、依存関係など。
-# 「アクセストークン(短命)」「リフレッシュトークン(長命)」を厳密に分離。
-
 import os
 import time
 from typing import Optional, Tuple
@@ -58,6 +55,7 @@ def create_refresh_token(user_id: str) -> str:
     return _create_token(sub=user_id, token_type="refresh", expires_in=REFRESH_TOKEN_EXPIRE_SECONDS)
 
 def decode_token(token: str) -> dict:
+    # 将来の余裕を見て leeway を設けたい場合は options で調整可
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
 
 
@@ -81,13 +79,42 @@ def get_current_user(
         user_id = payload.get("sub")
         if user_id is None:
             raise credentials_exc
-    except JWTError:
+        # sub は文字列で保持しているため DB の int に明示変換
+        user_id_int = int(user_id)
+    except (JWTError, ValueError):
+        # ValueError は int 変換失敗時
         raise credentials_exc
 
-    user: Optional[User] = db.query(User).filter(User.id == user_id).first()
+    user: Optional[User] = db.query(User).filter(User.id == user_id_int).first()
     if user is None:
         raise credentials_exc
     return user
+
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
+
+def get_current_user_optional(
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """
+    アクセストークンが無い/不正でも例外にせず None を返す依存関数。
+    認証任意エンドポイントで使用。
+    """
+    if not token:
+        return None
+
+    try:
+        payload = decode_token(token)
+        if payload.get("type") != "access":
+            return None
+        user_id = payload.get("sub")
+        if user_id is None:
+            return None
+        user_id_int = int(user_id)
+    except (JWTError, ValueError):
+        return None
+
+    return db.query(User).filter(User.id == user_id_int).first()
 
 
 def rotate_access_token_from_refresh(
@@ -105,14 +132,15 @@ def rotate_access_token_from_refresh(
         user_id = payload.get("sub")
         if user_id is None:
             raise JWTError("no subject")
-    except JWTError:
+        user_id_int = int(user_id)
+    except (JWTError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     # ユーザー存在確認（失効ユーザー等のガード）
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(User.id == user_id_int).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
-    new_access = create_access_token(user_id=user_id)
-    new_refresh = create_refresh_token(user_id=user_id)
+    new_access = create_access_token(user_id=str(user_id_int))
+    new_refresh = create_refresh_token(user_id=str(user_id_int))
     return new_access, new_refresh

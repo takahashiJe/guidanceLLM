@@ -1,4 +1,5 @@
 # shared/app/celery_app.py
+from __future__ import annotations
 import os
 from celery import Celery
 from celery.schedules import crontab
@@ -7,7 +8,7 @@ BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 REFRESH_EVERY_MIN = int(os.getenv("MV_REFRESH_MINUTES", "5"))
 
-celery_app = Celery("guidanceLLM", broker=BROKER_URL, backend=BACKEND_URL, include=[
+celery_app = Celery("guidanceLLM", broker=BROKER_URL, backend=RESULT_BACKEND, include=[
     "shared.app.tasks",
 ])
 

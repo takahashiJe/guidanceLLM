@@ -13,9 +13,17 @@ from sqlalchemy import (
     Text, Float, Enum, Boolean, Index, UniqueConstraint
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column, declarative_base
+from sqlalchemy.dialects.postgresql import JSONB
 import enum
 
 Base = declarative_base()
+
+try:
+    from pgvector.sqlalchemy import Vector
+    HAS_PGVECTOR = True
+except Exception:
+    Vector = None  # type: ignore
+    HAS_PGVECTOR = False
 
 # ------------------------------------------------------------
 # 列挙型の定義
@@ -206,35 +214,38 @@ class PreGeneratedGuide(Base):
 # =========================================================
 class ConversationEmbedding(Base):
     """
-    長期記憶の保存先（会話埋め込み）
-    - session_id: どのセッションの会話か
-    - speaker: 'user' | 'assistant' | 'system'
-    - lang: 'ja'|'en'|'zh' など
-    - ts: タイムスタンプ（会話時刻）
-    - text: 元テキスト
-    - embedding: ベクトル（pgvector / フォールバック時は JSON）
-    - embedding_version: "mxbai-embed-large@<hash or date>" などバージョン識別
+    長期記憶：会話の埋め込み保存テーブル
+    - セッション識別は sessions.session_id（フロント生成の一意ID）に合わせる
+    - pgvector が使えるなら Vector 型、無ければ JSONB にフォールバック
     """
     __tablename__ = "conversation_embeddings"
 
-    id = Column(Integer, primary_key=True)
-    session_id = Column(String(64), ForeignKey("sessions.id"), index=True, nullable=False)
-    speaker = Column(String(16), nullable=False)  # 'user'|'assistant'|'system'
-    lang = Column(String(8), nullable=True)
-    ts = Column(DateTime, default=datetime.utcnow, nullable=False)
-    text = Column(Text, nullable=False)
-    embedding_version = Column(String(64), nullable=False, default="mxbai-embed-large")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # FK は sessions.session_id を参照（型は String(64)）
+    session_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("sessions.session_id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    speaker: Mapped[str] = mapped_column(String(16), nullable=False)  # "user" / "assistant"
+    lang: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_version: Mapped[str] = mapped_column(String(64), nullable=False)
 
     if HAS_PGVECTOR:
-        # mxbai-embed-large は 1024 次元
-        embedding = Column(Vector(1024), nullable=False)
-        # KNN 用インデックスは init スクリプトで作成（IVFFLAT / lists=100 など）
+        # mxbai-embed-large の次元数は 1024
+        embedding = mapped_column(Vector(1024), nullable=False)
     else:
-        # フォールバック: JSONB に格納（KNN は不可）
-        embedding = Column(JSONB, nullable=False)
-
-    session = relationship("Session")
+        # フォールバック（DBに pgvector 無い場合）：JSONB に embedding 配列を保存
+        from sqlalchemy.dialects.postgresql import JSONB  # lazy import
+        embedding = mapped_column(JSONB, nullable=False)
 
     __table_args__ = (
+        # よく使う検索パターン用の複合インデックス（任意）
         Index("ix_convemb_session_ts", "session_id", "ts"),
     )

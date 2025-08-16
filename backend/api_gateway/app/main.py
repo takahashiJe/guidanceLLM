@@ -1,8 +1,6 @@
 # backend/api_gateway/app/main.py
-# FastAPI アプリのエントリーポイント。CORS、ルーター登録、基本ヘルスチェックなど。
-
-from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 
 from api_gateway.app.api.v1 import auth as auth_router
 from api_gateway.app.api.v1 import sessions as sessions_router
@@ -14,7 +12,7 @@ APP_VERSION = "v1"
 def create_app() -> FastAPI:
     app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
-    # CORS 設定（必要に応じて .env で制御してもOK）
+    # CORS 設定（必要に応じて .env の許可オリジンに変更）
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],  # 本番は必要最小限のオリジンに絞る
@@ -31,6 +29,7 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz", tags=["health"])
     def healthz():
+        # 依存サービスの詳細ヘルスは将来ここで拡張（DB/Redis/Ping 等）
         return {"status": "ok"}
 
     return app
