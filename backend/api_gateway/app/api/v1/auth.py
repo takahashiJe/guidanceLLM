@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, status, Body
-from pydantic import BaseModel, EmailStr, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, EmailStr, Field, TypeAdapter, ValidationError, field_validator
 from sqlalchemy.orm import Session
 
 from api_gateway.app.security import (
@@ -61,6 +61,27 @@ def issue_access_token(user_id: int | str) -> str:
 def issue_refresh_token(user_id: int | str) -> str:
     return _encode_jwt_for_user(user_id, timedelta(days=REFRESH_D), "refresh")
 
+def _issue_access_token_for(user_id: int) -> str:
+    # 既存ユーティリティの名前/シグネチャ揺れに耐性を持たせる
+    try:
+        return issue_access_token(user_id)  # 新名
+    except NameError:
+        # 古い関数名
+        try:
+            return create_access_token(user_id=user_id)
+        except TypeError:
+            return create_access_token(user_id)  # 位置引数版
+
+def _issue_refresh_token_for(user_id: int) -> str:
+    try:
+        return issue_refresh_token(user_id)
+    except NameError:
+        try:
+            return create_refresh_token(user_id=user_id)
+        except TypeError:
+            return create_refresh_token(user_id)
+
+
 # ------------------------------------------------------------
 # 入出力スキーマ（shared を壊さないためにローカル定義）
 # ------------------------------------------------------------
@@ -76,11 +97,50 @@ class RegisterRequest(BaseModel):
     display_name: Optional[str] = None
     password: str = Field(min_length=8)
 
+class RegisterIn(BaseModel):
+    email: Optional[EmailStr] = None
+    username: Optional[str] = None
+    password: str
+    display_name: Optional[str] = None
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def normalize_username(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("password")
+    @classmethod
+    def check_password(cls, v):
+        if not v:
+            raise ValueError("password required")
+        return v
+
+    # email/username どちらも未指定ならエラー
+    def model_post_init(self, _):
+        if not (self.email or self.username):
+            raise ValueError("email or username is required")
+
 class RegisterResponse(BaseModel):
     user_id: int
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+
+class LoginIn(BaseModel):
+    email: Optional[str] = None
+    username: Optional[str] = None
+    password: str
+
+    def model_post_init(self, _):
+        if not (self.email or self.username):
+            raise ValueError("email or username is required")
+        if not self.password:
+            raise ValueError("password is required")
 
 class LoginRequest(BaseModel):
     """
@@ -152,51 +212,39 @@ def _derive_email_and_username(payload: RegisterRequest) -> Tuple[str, Optional[
 # エンドポイント
 # ------------------------------------------------------------
 @router.post("/register", response_model=RegisterResponse, status_code=201)
-def register_user(
-    payload: dict = Body(...),
-    db: Session = Depends(get_db),
-):
+def register_user(payload: RegisterIn, db: Session = Depends(get_db)):
     """
     新規ユーザー登録。
     - 入力は email / username のどちらでも可
-    - DB に email カラムが無いため、email は User.username に保存する
-    - display_name があれば User.display_name へ（存在しない環境でも壊さない）
-    - レスポンスは user_id とトークンを返す（テスト準拠）
+    - DB に email カラムが無いため、email は User.username に保存する（テスト実装準拠）
+    - display_name は存在すれば User.display_name に入れる（存在しないスキーマでも壊さない）
+    - レスポンスは user_id + トークン（bearer）
     """
-    # email / username どちらでも受け付ける
-    raw_email = (payload.get("email") or payload.get("username") or "").strip()
-    if not raw_email:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="email/username is required")
-    password = payload.get("password")
-    if not password:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="password is required")
-    display_name = payload.get("display_name")
+    # 実際に username カラムへ格納する値を決定（email があればそれを使う）
+    username_value = (payload.email or payload.username).strip()
 
-    email_str = raw_email
-
-    # 既存チェック（username カラムで一意）
-    existing = db.query(models.User).filter(models.User.username == email_str).first()
+    # 重複チェック（username カラムで一意）
+    existing = db.query(models.User).filter(models.User.username == username_value).first()
     if existing:
-        # e2e は 200/201/400/409 を許容しているので 409 を返す
+        # e2e テストは 200/201/400/409 を許容 → 409 を返す
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
 
-    # パスワードハッシュ化（既存ヘルパ）
-    password_hash = hash_password(password)
+    # パスワードハッシュ
+    password_hash = hash_password(payload.password)
 
-    # ユーザー作成（email は username に格納）
-    user = models.User(username=email_str, password_hash=password_hash)
-    if hasattr(models.User, "display_name") and display_name:
-        setattr(user, "display_name", display_name)
+    # ユーザー作成
+    user = models.User(username=username_value, password_hash=password_hash)
+    if hasattr(models.User, "display_name") and payload.display_name:
+        setattr(user, "display_name", payload.display_name)
 
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    # トークン即時発行（既存の issue_* を使用）
-    access_token  = issue_access_token(user.id)
-    refresh_token = issue_refresh_token(user.id)
+    # トークン
+    access_token  = _issue_access_token_for(user.id)
+    refresh_token = _issue_refresh_token_for(user.id)
 
-    # RegisterResponse に合う dict を返す
     return {
         "user_id": user.id,
         "access_token": access_token,
@@ -206,22 +254,23 @@ def register_user(
 
 
 @router.post("/login", response_model=AuthTokens)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+def login_user(payload: LoginIn, db: Session = Depends(get_db)):
     """
-    ログイン:
-    - クライアントからは email フィールドで渡される
-    - DB では username カラムにメールが格納されているため username で検索
+    ログイン（JSON ボディ）
+    - email / username のどちらでも受付
+    - 既存の仕様に合わせて DB は User.username に email を格納しているため、そのまま一致検索
     """
-    user = db.query(models.User).filter(models.User.username == str(payload.email)).first()
-    if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
+    key = (payload.email or payload.username).strip()
 
-    access_token = create_access_token(user_id=user.id)
-    refresh_token = create_refresh_token(user_id=user.id)
-    return AuthTokens(access_token=access_token, refresh_token=refresh_token)
+    user = db.query(models.User).filter(models.User.username == key).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+    return {
+        "access_token": _issue_access_token_for(user.id),
+        "refresh_token": _issue_refresh_token_for(user.id),
+        "token_type": "bearer",
+    }
 
 
 @router.post("/token/refresh", response_model=AccessTokenOnly)
