@@ -2,7 +2,7 @@
 """
 認証・ユーザー管理エンドポイント
 - POST /api/v1/auth/register
-- POST /api/v1/auth/login        ← JSON と x-www-form-urlencoded の両方を受け付ける
+- POST /api/v1/auth/login
 - POST /api/v1/auth/token/refresh
 
 要点:
@@ -11,27 +11,73 @@
 - /register は
     1) {"email", "password"} 形式（E2E）
     2) {"username"(=メール文字列), "password", "display_name"} 形式（ユニット）
-  の両対応（display_name は DB に保存しない）
-- /login は JSON でも form（application/x-www-form-urlencoded）でも受け付ける
+  の両対応（display_name は DB には保存しない）
+- /login は JSON でも form-encoded でも受け付ける（E2E は form を送る）
 - Pydantic v2: EmailStr 検証は TypeAdapter を使用
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from datetime import timedelta, datetime
+from typing import Optional, Tuple, Dict, Any
+import json
+from urllib.parse import parse_qs
 
-from fastapi import Body, Form, APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError, field_validator
 from sqlalchemy.orm import Session
 
+from api_gateway.app import security
 from shared.app.database import get_db
 from shared.app import models
-from api_gateway.app import security
+
+
+# ------------------------------------------------------------
+# 入出力スキーマ（shared を壊さないためにローカル定義）
+# ------------------------------------------------------------
+class RegisterRequest(BaseModel):
+    # テストは email で送る（E2E）場合と username で送る（単体）場合があるので両対応
+    email: Optional[EmailStr] = None
+    username: Optional[EmailStr] = None
+    password: str
+    # display_name は入力は許容するが、DB には保存しない（モデルに無いため）
+    display_name: Optional[str] = None
+
+    @field_validator("password")
+    @classmethod
+    def _pw_len(cls, v: str) -> str:
+        if len(v or "") < 8:
+            raise ValueError("password too short")
+        return v
+
+    @property
+    def login_id(self) -> str:
+        # email 優先、なければ username
+        if self.email:
+            return str(self.email)
+        if self.username:
+            return str(self.username)
+        raise ValueError("either email or username is required")
+
+
+class TokenRefreshRequest(BaseModel):
+    refresh_token: str
+
+
+# レスポンス系（テストで参照されるので残す）
+class AuthTokens(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class AccessTokenOnly(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
 
 # ------------------------------------------------------------
 # ルーター
-# (/api/v1 は main.py でまとめて付与されるため、ここは /auth のみ)
 # ------------------------------------------------------------
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -40,135 +86,160 @@ _EMAIL_ADAPTER = TypeAdapter(EmailStr)
 
 
 # ------------------------------------------------------------
-# 入出力スキーマ（shared を壊さないためにローカル定義）
-# ------------------------------------------------------------
-
-class RegisterRequest(BaseModel):
-    # テストは email で送る（E2E）場合と username で送る（単体）場合があるので両対応
-    email: Optional[EmailStr] = None
-    username: Optional[str] = None  # username にメール文字列が入ってくる想定
-    password: str
-    display_name: Optional[str] = None  # DB に保存はしない（互換のため受けるだけ）
-
-    @field_validator("password")
-    @classmethod
-    def _pw_len(cls, v: str) -> str:
-        if not v:
-            raise ValueError("password required")
-        if len(v) < 8:
-            raise ValueError("password too short")
-        return v
-
-class RegisterResponse(BaseModel):
-    user_id: int
-
-class LoginRequest(BaseModel):
-    # JSON で来た時に利用（フォームには使わない）
-    email: Optional[str] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-
-class TokenRefreshRequest(BaseModel):
-    refresh_token: str
-
-
-# ------------------------------------------------------------
 # ユーティリティ
 # ------------------------------------------------------------
-def _resolve_email_and_display(payload: RegisterRequest) -> Tuple[str, Optional[str]]:
+def _extract_login_fields_from_mapping(payload: Any) -> Tuple[Optional[str], Optional[str]]:
     """
-    入力から (email_str, display_name_or_none) を確定する。
-    - email が入っていればそれを採用
-    - email が無く、username がメール形式ならそれを email として採用
-    - それ以外は 422
+    dict 互換オブジェクトや Starlette の FormData などから (login_id, password) を抽出。
+    email / username のいずれかを login_id として扱う。
     """
-    if payload.email:
-        return str(payload.email), (payload.display_name or None)
+    try:
+        get = payload.get  # type: ignore[attr-defined]
+    except Exception:
+        return None, None
 
-    if payload.username:
-        # username がメールっぽい → 検証して email として扱う
-        try:
-            validated: EmailStr = _EMAIL_ADAPTER.validate_python(payload.username)
-        except ValidationError:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Invalid email format.",
-            )
-        return str(validated), (payload.display_name or None)
+    raw_username = get("username")
+    raw_email = get("email")
+    password = get("password")
+    login_id = None
 
-    raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail="Either 'email' must be provided or 'username' must be a valid email string.",
-    )
+    if raw_email:
+        login_id = str(raw_email).strip()
+    elif raw_username:
+        login_id = str(raw_username).strip()
+
+    return login_id, (str(password) if password is not None else None)
+
+
+def _normalize_email_like(value: str) -> str:
+    """メールっぽい文字列を EmailStr で検証し、正規化して返す。失敗時は HTTP 422。"""
+    try:
+        validated: EmailStr = _EMAIL_ADAPTER.validate_python(value)
+        return str(validated)
+    except ValidationError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid email format.",
+        )
 
 
 # ------------------------------------------------------------
 # エンドポイント
 # ------------------------------------------------------------
-
 @router.post("/register", status_code=201)
-def register_user(payload: RegisterRequest, db: Session = Depends(get_db)):
+def register_user(payload: RegisterRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
-    ユーザーを作成する。DB の User モデルに email カラムは無い前提のため、
-    email 文字列は username に保存する。
+    - email もしくは username（どちらもメール文字列）＋ password を受け取る
+    - User.username にメールを保存
+    - display_name はモデルに無いので保存しない
+    - レスポンスは user_id を返す（E2E/ユニットの期待どちらにも合う）
     """
-    email, display_name = _resolve_email_and_display(payload)
+    email_like = payload.login_id
+    email_norm = _normalize_email_like(email_like)
     raw_password = payload.password
 
-    # username（=メール文字列）での重複チェック
-    existing = db.query(models.User).filter(models.User.username == email).first()
+    # 重複チェック
+    existing = db.query(models.User).filter(models.User.username == email_norm).first()
     if existing:
         # 409 を返しても E2E 側は許容（400/409 は「すでに存在」扱い）
         raise HTTPException(status_code=409, detail="user already exists")
 
     user = models.User(
-        username=email,
+        username=email_norm,
         password_hash=security.hash_password(raw_password),
-        # display_name は User のカラムに無い想定なので DB には保存しない
     )
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    # register では user_id のみ返す（テストはこれを期待）
-    return {"user_id": user.id}
+    # register ではトークンを返さない（ユニット側も user_id を参照）
+    return {
+        "user_id": user.id,
+        "username": user.username,
+    }
 
 
 @router.post("/login")
-def login_user(
-    db: Session = Depends(get_db),
-    payload: LoginIn | None = Body(None),
-    username: str | None = Form(None),
-    password: str | None = Form(None),
-) -> dict:
-    # JSON 優先、なければ form
-    if payload is not None:
-        login_id = payload.email or payload.username
-        raw_pw = payload.password
-    else:
-        login_id = username
-        raw_pw = password
+async def login_user(request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """
+    - JSON でも form-encoded でも受け付ける
+    - body が JSON の場合: {"username" or "email", "password"}
+    - body が form の場合: username=...&password=...（E2E 想定）
+    - 取り出しに失敗した場合は raw body の parse / QueryString までフォールバック
+    """
+    login_id: Optional[str] = None
+    password: Optional[str] = None
 
-    if not login_id or not raw_pw:
+    # 1) Content-Type 判定は小文字化して部分一致
+    ctype = (request.headers.get("content-type") or "").lower()
+
+    # 2) フォーム（x-www-form-urlencoded / multipart）
+    if ("application/x-www-form-urlencoded" in ctype) or ("multipart/form-data" in ctype):
+        form = await request.form()
+        # まずは FormData として
+        login_id, password = _extract_login_fields_from_mapping(form)
+        # だめなら dict(form) 経由で再取得
+        if not login_id or not password:
+            login_id, password = _extract_login_fields_from_mapping(dict(form))
+        # さらにダメなら raw body を parse_qs
+        if not login_id or not password:
+            body_bytes = await request.body()
+            try:
+                parsed = {k: v[0] for k, v in parse_qs(body_bytes.decode(errors="ignore")).items() if v}
+            except Exception:
+                parsed = {}
+            login_id, password = _extract_login_fields_from_mapping(parsed)
+
+    # 3) JSON（application/json やその他でも json() が通る場合がある）
+    else:
+        data: Any = {}
+        try:
+            data = await request.json()
+        except Exception:
+            # raw body を JSON として再解釈
+            body_bytes = await request.body()
+            try:
+                data = json.loads(body_bytes.decode(errors="ignore"))
+            except Exception:
+                data = {}
+
+        if isinstance(data, dict):
+            login_id, password = _extract_login_fields_from_mapping(data)
+
+    # 4) 最後のフォールバック：クエリ文字列も見る
+    if not login_id or not password:
+        qs = parse_qs(str(request.url.query))
+        parsed_qs = {k: v[0] for k, v in qs.items() if v}
+        q_login, q_pass = _extract_login_fields_from_mapping(parsed_qs)
+        login_id = login_id or q_login
+        password = password or q_pass
+
+    if not login_id or not password:
         raise HTTPException(status_code=422, detail="username/email and password are required")
 
-    # email は username カラムに保存する方針
-    user = db.query(models.User).filter(models.User.username == login_id).first()
-    if not user or not security.verify_password(raw_pw, user.password_hash):
+    # username 側にメール文字列を保存している前提
+    email_norm = _normalize_email_like(login_id)
+    user = db.query(models.User).filter(models.User.username == email_norm).first()
+    if not user or not security.verify_password(password, user.password_hash):
         raise HTTPException(status_code=401, detail="invalid credentials")
 
+    # 既存の security ユーティリティを使用（サブジェクトは user.id）
     access = security.create_access_token(sub=str(user.id))
     refresh = security.create_refresh_token(sub=str(user.id))
+
     return {
         "access_token": access,
         "refresh_token": refresh,
         "token_type": "bearer",
     }
 
+
 @router.post("/token/refresh")
-def refresh_access_token(payload: TokenRefreshRequest) -> dict:
+def refresh_access_token(payload: TokenRefreshRequest) -> Dict[str, Any]:
     """
-    refresh_token から新しいアクセストークンと新しいリフレッシュトークンを発行する。
+    - refresh_token を security.decode_token で検証
+    - type が refresh かつ sub が存在することを確認
+    - 新しい access / refresh を払い出す
     """
     try:
         decoded = security.decode_token(payload.refresh_token)
@@ -179,9 +250,8 @@ def refresh_access_token(payload: TokenRefreshRequest) -> dict:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     user_id = str(decoded["sub"])
-    # security 側の jti / nonce 実装により毎回異なるトークンが発行される想定
     new_access = security.create_access_token(sub=user_id)
-    new_refresh = security.create_refresh_token(sub=user_id)
+    new_refresh = security.create_refresh_token(sub=user_id)  # テストが refresh も期待
 
     return {
         "access_token": new_access,
