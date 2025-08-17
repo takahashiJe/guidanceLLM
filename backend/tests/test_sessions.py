@@ -7,8 +7,8 @@ def test_sessions_create_and_restore(client: TestClient, token_pair):
     at = tokens["access_token"]
     headers = {"Authorization": f"Bearer {at}"}
 
-    # create
-    r = client.post("/api/v1/sessions/create", headers=headers)
+    # ✅ /sessions/create は「body必須」になっている実装に合わせて空JSONを送る
+    r = client.post("/api/v1/sessions/create", headers=headers, json={})
     assert r.status_code in (200, 201), r.text
     body = r.json()
     session_id = body.get("session_id")

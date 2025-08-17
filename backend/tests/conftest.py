@@ -1,4 +1,3 @@
-# backend/tests/conftest.py
 # -*- coding: utf-8 -*-
 import random
 import string
@@ -44,7 +43,7 @@ def register_and_login(client: TestClient) -> Tuple[Dict, Dict]:
     user_id = reg.get("user_id") or reg.get("id")
     assert user_id, f"register response unexpected: {reg}"
 
-    # login（サーバ実装が JSON ボディを期待しているため json=... を送る）
+    # ✅ login は JSON ボディ必須に合わせる（フォームではなく JSON）
     r = client.post(
         "/api/v1/auth/login",
         json={"username": username, "password": password},
