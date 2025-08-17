@@ -46,9 +46,10 @@ def create_app() -> FastAPI:
 
     # 重要：/api/v1 のバージョン接頭辞は **ここで** 付ける
     # 各ルーター(auth/sessions/chat)側のAPIRouterは、prefix="/auth" 等の想定。
-    app.include_router(auth_router, prefix="/api/v1")      # => /api/v1/auth/...
-    app.include_router(sessions_router, prefix="/api/v1")  # => /api/v1/sessions/...
-    app.include_router(chat_router, prefix="/api/v1")      # => /api/v1/chat/...
+    app.include_router(auth_router,     prefix="/api/v1",     tags=["auth"])
+    app.include_router(sessions_router, prefix="/api/v1", tags=["sessions"])
+    app.include_router(chat_router,     prefix="/api/v1",     tags=["chat"])
+    
 
     # ルート（任意）：サービス概要
     @app.get("/")
