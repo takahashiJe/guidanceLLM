@@ -21,6 +21,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Response, status, Body
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.sqltypes import Integer as SAInteger
 
 from shared.app.database import get_db
 from shared.app import models
@@ -90,19 +91,24 @@ def create_session(
     )
 
     if found:
-        # --- 既存セッションの初期化（状態リセット） ---
-        # 会話履歴の削除
         db.query(models.ConversationHistory).filter(
-            models.ConversationHistory.session_id == session_id
+        models.ConversationHistory.session_id == found.id   # ← ここを found.id に
         ).delete(synchronize_session=False)
 
-        # 事前生成ガイドの削除（モデルが存在する場合のみ）
+        # PreGeneratedGuide 側はスキーマ次第:
+        # もし PreGeneratedGuide.session_id が "文字列の public id" なら現状のまま（== session_id）
+        # もし int の FK なら found.id に揃える
         if hasattr(models, "PreGeneratedGuide"):
-            db.query(getattr(models, "PreGeneratedGuide")).filter(
-                getattr(models, "PreGeneratedGuide").session_id == session_id
-            ).delete(synchronize_session=False)
-
-        # セッション状態の初期化（current_status は DB デフォルト/現値のまま）
+            PG = getattr(models, "PreGeneratedGuide")
+            # best-effort で両方試す（存在する方だけ効く）
+            try:
+                db.query(PG).filter(PG.session_id == session_id).delete(synchronize_session=False)
+            except Exception:
+                pass
+            try:
+                db.query(PG).filter(PG.session_id == found.id).delete(synchronize_session=False)
+            except Exception:
+                pass
         found.active_plan_id = None
         db.add(found)
         db.commit()
@@ -142,13 +148,12 @@ def create_session(
 # -----------------------------
 # /restore/{session_id}
 # -----------------------------
-@router.get("/restore/{session_id}", response_model=SessionRestoreResponse)
+@router.get("/restore/{session_id}")
 def restore_session(
     session_id: str,
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    # session_id で検索（自分のセッションのみ）
     rec = (
         db.query(models.Session)
         .filter(models.Session.session_id == session_id, models.Session.user_id == user.id)
@@ -157,9 +162,34 @@ def restore_session(
     if not rec:
         raise HTTPException(status_code=404, detail="session not found")
 
-    # appStatus（camelCase）で返すためにエイリアス付モデルを利用
-    return SessionRestoreResponse(
-        session_id=rec.session_id,
-        app_status=rec.current_status or "idle",
-        active_plan_id=rec.active_plan_id,
+    app_status = rec.current_status or "idle"
+    active_plan_id = rec.active_plan_id
+
+    q = (
+        db.query(models.ConversationHistory)
+        .filter(models.ConversationHistory.session_id == rec.id)  # ← ここを rec.id に
+        .order_by(models.ConversationHistory.created_at.desc())
+        .limit(10)
+        .all()
     )
+    history = []
+    for h in reversed(q):
+        history.append({
+            "role": getattr(h, "role", None) or "user",                  # 例: "user" / "assistant"
+            "type": getattr(h, "message_type", None) or "text",           # 例: "text" / "audio"
+            "content": getattr(h, "content", None)
+                    or getattr(h, "message_text", None) or "",
+            "createdAt": (getattr(h, "created_at", None) or "").isoformat()
+                        if getattr(h, "created_at", None) else None,
+        })
+
+    app_status = rec.current_status or "idle"
+    active_plan_id = rec.active_plan_id
+
+    return {
+        "session_id": rec.session_id,
+        "appStatus": app_status,          # 互換のため camel を維持
+        "activePlanId": active_plan_id,   # 同上
+        "active_plan_id": active_plan_id, # 既存テスト互換
+        "history": history,               # ← 実データを返す
+    }
