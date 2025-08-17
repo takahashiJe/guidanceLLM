@@ -14,7 +14,7 @@ from shared.app.database import get_db
 from shared.app import models
 from api_gateway.app.security import get_current_user
 
-router = APIRouter(prefix="/chat", tags=["chat"])
+router = APIRouter(prefix="/chat")
 
 # 上限（バイト）。未設定なら 10MB
 MAX_AUDIO_BYTES = int(os.getenv("CHAT_MAX_AUDIO_BYTES", str(10 * 1024 * 1024)))
@@ -66,7 +66,7 @@ def _validate_voice_file(file: Any) -> None:
         )
 
 
-@router.post("message", status_code=202)
+@router.post("/message", status_code=202)
 async def submit_message(
     request: Request,
     db: Session = Depends(get_db),

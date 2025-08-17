@@ -27,8 +27,7 @@ from shared.app.database import get_db
 from shared.app import models
 from api_gateway.app.security import get_current_user
 
-router = APIRouter(prefix="/sessions", tags=["sessions"])
-
+router = APIRouter(prefix="/sessions")
 
 # -----------------------------
 # モデル
