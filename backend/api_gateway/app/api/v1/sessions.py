@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status, Body
 from pydantic import BaseModel, Field
@@ -59,6 +59,43 @@ class SessionRestoreResponse(BaseModel):
 
 
 # -----------------------------
+# 内部 util
+# -----------------------------
+def _load_history(db: Session, session_rec: models.Session, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    会話履歴を新しい順に取り、返却は古い→新しいの時系列に整えて返す。
+    ConversationHistory.session_id が Integer / String どちらのスキーマでも動くように、
+    カラム型を見て join キーを切り替える。
+    """
+    # どの値で比較するかをカラム型から決める
+    col = models.ConversationHistory.session_id
+    key_value: Any = session_rec.id if isinstance(col.type, SAInteger) else session_rec.session_id
+
+    rows = (
+        db.query(models.ConversationHistory)
+        .filter(col == key_value)
+        .order_by(models.ConversationHistory.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    out: List[Dict[str, Any]] = []
+    for h in reversed(rows):
+        created_at = getattr(h, "created_at", None)
+        out.append(
+            {
+                "role": getattr(h, "role", None) or "user",           # 例: "user" / "assistant"
+                "type": getattr(h, "message_type", None) or "text",   # 例: "text" / "audio"
+                "content": getattr(h, "content", None)
+                or getattr(h, "message_text", None)
+                or "",
+                "createdAt": created_at.isoformat() if created_at else None,
+            }
+        )
+    return out
+
+
+# -----------------------------
 # /create
 # -----------------------------
 @router.post("/create", response_model=SessionCreateResponse)
@@ -91,24 +128,17 @@ def create_session(
     )
 
     if found:
+        # --- 既存セッションの初期化（状態リセット） ---
         db.query(models.ConversationHistory).filter(
-        models.ConversationHistory.session_id == found.id   # ← ここを found.id に
+            models.ConversationHistory.session_id
+            == (found.id if isinstance(models.ConversationHistory.session_id.type, SAInteger) else found.session_id)
         ).delete(synchronize_session=False)
 
-        # PreGeneratedGuide 側はスキーマ次第:
-        # もし PreGeneratedGuide.session_id が "文字列の public id" なら現状のまま（== session_id）
-        # もし int の FK なら found.id に揃える
         if hasattr(models, "PreGeneratedGuide"):
-            PG = getattr(models, "PreGeneratedGuide")
-            # best-effort で両方試す（存在する方だけ効く）
-            try:
-                db.query(PG).filter(PG.session_id == session_id).delete(synchronize_session=False)
-            except Exception:
-                pass
-            try:
-                db.query(PG).filter(PG.session_id == found.id).delete(synchronize_session=False)
-            except Exception:
-                pass
+            db.query(getattr(models, "PreGeneratedGuide")).filter(
+                getattr(models, "PreGeneratedGuide").session_id == session_id
+            ).delete(synchronize_session=False)
+
         found.active_plan_id = None
         db.add(found)
         db.commit()
@@ -123,16 +153,15 @@ def create_session(
 
     # --- 新規作成 ---
     rec = models.Session(
-        session_id=session_id,  # 文字列IDはここ
+        session_id=session_id,
         user_id=user.id,
-        # current_status は指定しない（DB デフォルトに任せる）
         active_plan_id=None,
+        # current_status は指定しない（DB デフォルトに任せる）
     )
     db.add(rec)
     db.commit()
     db.refresh(rec)
 
-    # 201 Created を明示
     return Response(
         content=SessionCreateResponse(
             session_id=rec.session_id,
@@ -164,32 +193,13 @@ def restore_session(
 
     app_status = rec.current_status or "idle"
     active_plan_id = rec.active_plan_id
+    history = _load_history(db, session_rec=rec, limit=10)
 
-    q = (
-        db.query(models.ConversationHistory)
-        .filter(models.ConversationHistory.session_id == rec.id)  # ← ここを rec.id に
-        .order_by(models.ConversationHistory.created_at.desc())
-        .limit(10)
-        .all()
-    )
-    history = []
-    for h in reversed(q):
-        history.append({
-            "role": getattr(h, "role", None) or "user",                  # 例: "user" / "assistant"
-            "type": getattr(h, "message_type", None) or "text",           # 例: "text" / "audio"
-            "content": getattr(h, "content", None)
-                    or getattr(h, "message_text", None) or "",
-            "createdAt": (getattr(h, "created_at", None) or "").isoformat()
-                        if getattr(h, "created_at", None) else None,
-        })
-
-    app_status = rec.current_status or "idle"
-    active_plan_id = rec.active_plan_id
-
+    # 互換のため camel / snake を併記
     return {
         "session_id": rec.session_id,
-        "appStatus": app_status,          # 互換のため camel を維持
-        "activePlanId": active_plan_id,   # 同上
-        "active_plan_id": active_plan_id, # 既存テスト互換
-        "history": history,               # ← 実データを返す
+        "appStatus": app_status,
+        "activePlanId": active_plan_id,
+        "active_plan_id": active_plan_id,
+        "history": history,
     }
