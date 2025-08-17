@@ -1,20 +1,19 @@
-# backend/api_gateway/app/health.py
+# -*- coding: utf-8 -*-
+"""
+シンプルなヘルスチェック用エンドポイント。
+- 依存先に負荷をかけない軽量チェック（ルーティング登録の確認が主目的）
+- /health: 200 OK を返す
+"""
+
 from fastapi import APIRouter
-from sqlalchemy import text
-from shared.app.database import SessionLocal
 
-router = APIRouter(prefix="/api/v1/healthz", tags=["health"])
+router = APIRouter(tags=["health"])
 
-@router.get("")
-def alive():
-    return {"ok": True}
-
-@router.get("/db")
-def db_ok():
-    db = SessionLocal()
-    try:
-        # SQLAlchemy 2.x 互換の text() 経由
-        val = db.execute(text("SELECT 1")).scalar()
-        return {"ok": bool(val == 1)}
-    finally:
-        db.close()
+@router.get("/health")
+async def health() -> dict:
+    # ここでは「FastAPI が起動し、ルーターが正しく登録されている」ことのみを確認する。
+    # 依存コンポーネント（DB/Celery/OSRM等）の詳細チェックは別の /healthz 等で行うのが安全。
+    return {
+        "status": "ok",
+        "service": "api-gateway",
+    }
