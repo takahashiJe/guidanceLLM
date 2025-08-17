@@ -66,7 +66,7 @@ def _validate_voice_file(file: Any) -> None:
         )
 
 
-@router.post("/chat/message", status_code=202)
+@router.post("message", status_code=202)
 async def submit_message(
     request: Request,
     db: Session = Depends(get_db),
