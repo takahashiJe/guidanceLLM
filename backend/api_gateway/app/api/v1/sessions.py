@@ -1,9 +1,10 @@
+# backend/api_gateway/app/api/v1/sessions.py
 # -*- coding: utf-8 -*-
 """
 セッション管理 API
 - /api/v1/sessions/create : セッション作成（body 任意、session_id 未指定ならサーバで生成）
   - 既存の session_id が指定された場合は「初期化（状態リセット）」を行う
-    * app_status = "idle"
+    * current_status = "idle"
     * active_plan_id = NULL
     * ConversationHistory / PreGeneratedGuides をクリア
   - 既存が無ければ新規作成
@@ -37,20 +38,18 @@ class SessionCreateRequest(BaseModel):
     # 任意。未指定ならサーバで UUID を払い出す
     session_id: Optional[str] = None
 
-
 class SessionCreateResponse(BaseModel):
-    session_id: str
-    app_status: str
-    active_plan_id: Optional[int] = None
-    # 既存セッションを初期化したかどうか（新規作成時は False）
+    session_id: str = Field(serialization_alias="session_id")
+    app_status: str = Field(serialization_alias="appStatus")
+    active_plan_id: Optional[int] = Field(default=None, serialization_alias="active_plan_id")
     reset: bool = False
-
+    model_config = ConfigDict(populate_by_name=True)
 
 class SessionRestoreResponse(BaseModel):
-    session_id: str
-    app_status: str
-    active_plan_id: Optional[int] = None
-
+    session_id: str = Field(serialization_alias="session_id")
+    app_status: str = Field(serialization_alias="appStatus")
+    active_plan_id: Optional[int] = Field(default=None, serialization_alias="active_plan_id")
+    model_config = ConfigDict(populate_by_name=True)
 
 # -----------------------------
 # /create
@@ -67,8 +66,8 @@ def create_session(
     - session_id 未指定ならサーバで UUID を払い出し。
     - 指定された session_id が既に存在する場合は「既存セッションの初期化（状態リセット）」を行う。
       * ConversationHistory を削除
-      * PreGeneratedGuides を削除（存在する場合のみ）
-      * app_status = 'idle', active_plan_id = NULL
+      * PreGeneratedGuides を削除（モデルがある場合のみ）
+      * current_status = 'idle', active_plan_id = NULL
       * 200 OK を返す
     - 新規作成の場合は 201 Created を返す
     """
@@ -77,10 +76,10 @@ def create_session(
 
     session_id = payload.session_id or uuid.uuid4().hex
 
-    # 自分のセッションのみ対象
+    # ✅ ここは整数PKの id ではなく、文字列の session_id で検索する
     found = (
         db.query(models.Session)
-        .filter(models.Session.id == session_id, models.Session.user_id == user.id)
+        .filter(models.Session.session_id == session_id, models.Session.user_id == user.id)
         .first()
     )
 
@@ -97,34 +96,45 @@ def create_session(
                 getattr(models, "PreGeneratedGuide").session_id == session_id
             ).delete(synchronize_session=False)
 
-        # セッション状態の初期化
-        found.app_status = "idle"
+        # セッション状態の初期化（モデル列は current_status）
+        # found.current_status = "idle"
         found.active_plan_id = None
         db.add(found)
         db.commit()
 
-        return SessionCreateResponse(
-            session_id=found.id,
-            app_status=found.app_status or "idle",
+        payload = SessionCreateResponse(
+            session_id=found.session_id,
+            app_status=found.current_status or "idle",
             active_plan_id=found.active_plan_id,
             reset=True,
+        )
+        return Response(
+            content=payload.model_dump_json(by_alias=True),
+            media_type="application/json",
+            status_code=status.HTTP_200_OK,
         )
 
     # --- 新規作成 ---
     rec = models.Session(
-        id=session_id,
+        session_id=session_id,  # ← 文字列IDはここ
         user_id=user.id,
-        app_status="idle",
+        # current_status="idle",
         active_plan_id=None,
     )
     db.add(rec)
     db.commit()
+    db.refresh(rec)
 
-    # 201 Created を明示
+    # 201 Created を明示（pydantic → JSON）
+    # 新規作成パス
+    payload = SessionCreateResponse(
+        session_id=rec.session_id,
+        app_status=rec.current_status or "idle",
+        active_plan_id=rec.active_plan_id,
+        reset=False,
+    )
     return Response(
-        content=SessionCreateResponse(
-            session_id=session_id, app_status="idle", active_plan_id=None, reset=False
-        ).model_dump_json(),
+        content=payload.model_dump_json(by_alias=True),
         media_type="application/json",
         status_code=status.HTTP_201_CREATED,
     )
@@ -139,16 +149,22 @@ def restore_session(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
+    # ✅ ここも session_id で検索
     rec = (
         db.query(models.Session)
-        .filter(models.Session.id == session_id, models.Session.user_id == user.id)
+        .filter(models.Session.session_id == session_id, models.Session.user_id == user.id)
         .first()
     )
     if not rec:
         raise HTTPException(status_code=404, detail="session not found")
 
-    return SessionRestoreResponse(
-        session_id=rec.id,
-        app_status=rec.app_status or "idle",
+    payload = SessionRestoreResponse(
+        session_id=rec.session_id,
+        app_status=rec.current_status or "idle",
         active_plan_id=rec.active_plan_id,
+    )
+    return Response(
+        content=payload.model_dump_json(by_alias=True),
+        media_type="application/json",
+        status_code=status.HTTP_200_OK,
     )
