@@ -213,21 +213,19 @@ def _derive_email_and_username(payload: RegisterRequest) -> Tuple[str, Optional[
 # エンドポイント
 # ------------------------------------------------------------
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
-def register_user(payload: RegisterIn, db: Session = Depends(get_db)):
-    # e2e は email のみを渡してくるので、email 優先で拾い、なければ username
-    raw = payload.email if payload.email is not None else payload.username
-    username_value = str(raw).strip() if raw is not None else ""   # 空判定もできるように
-
+def register_user(payload: RegisterRequest, db: Session = Depends(get_db)):
+    # e2e は email だけで来るので email 優先、なければ username
+    raw = payload.email if getattr(payload, "email", None) else getattr(payload, "username", None)
+    username_value = (str(raw).strip() if raw is not None else "")
     if not username_value:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="username/email required")
 
-    # 既存チェック（username に email を格納する運用）
+    # 重複は 409
     existing = db.query(models.User).filter(models.User.username == username_value).first()
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
 
     password_hash = hash_password(payload.password)
-
     user = models.User(username=username_value, password_hash=password_hash)
     if hasattr(models.User, "display_name") and getattr(payload, "display_name", None):
         setattr(user, "display_name", payload.display_name)
@@ -237,13 +235,15 @@ def register_user(payload: RegisterIn, db: Session = Depends(get_db)):
         db.commit()
     except IntegrityError:
         db.rollback()
+        # 競合は 409 に正規化
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
     db.refresh(user)
 
+    uid_str = str(user.id)
     return {
         "user_id": user.id,
-        "access_token": _issue_access_token_for(user.id),
-        "refresh_token": _issue_refresh_token_for(user.id),
+        "access_token": create_access_token(sub=uid_str),
+        "refresh_token": create_refresh_token(sub=uid_str),
         "token_type": "bearer",
     }
 
@@ -272,14 +272,14 @@ def refresh_access_token(payload: TokenRefreshRequest):
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
-    token_type = decoded.get("type")
-    user_id = decoded.get("sub")
-    if token_type != "refresh" or not user_id:
+    if decoded.get("type") != "refresh" or not decoded.get("sub"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
-    uid = int(user_id)
-    new_access  = _issue_access_token_for(uid)
-    new_refresh = _issue_refresh_token_for(uid)   # ← リフレッシュもローテーション
+    uid_str = str(decoded["sub"])  # ← 常に str で渡す
+    # 毎回新規発行（前回の文字列を再利用しない！）
+    new_access  = create_access_token(sub=uid_str)
+    new_refresh = create_refresh_token(sub=uid_str)
+
     return {
         "access_token": new_access,
         "refresh_token": new_refresh,
