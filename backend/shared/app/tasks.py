@@ -1,42 +1,51 @@
 # -*- coding: utf-8 -*-
 """
-共有Celeryタスク定義 / タスクフォワーダ
-- API ノードから Worker 専用タスクを直接 import しないためのフォワーダを提供
-- ここにマテビュー更新タスクや軽量タスクを配置
-- 既存のタスク名・インポートは壊さない（routing など）
+共有Celeryタスク定義（Gateway/Worker 双方でインポートされるモジュール）
+- ここに「タスク名の定数」を定義して、Gateway 側が Celery に投げる際のシグネチャとして使う
+- 既存のタスク（マテビュー更新、Routing I/F）も保持
+- Worker 側の実体タスク名と一致させること
 """
 
+from __future__ import annotations
+
 import os
-from typing import Dict, Any
-from celery.result import AsyncResult
+from typing import Any, Dict
+from datetime import date
+
 from sqlalchemy import create_engine, text
 
 from shared.app.celery_app import celery_app
 from shared.app.database import SessionLocal
 
-# ---------------------------------------------------------------------
-# DB 接続（マテビュー更新用）
-# ---------------------------------------------------------------------
+# =========================================================
+# タスク名の定数（Gateway/Worker で共有）
+#  - Worker 側の @celery_app.task(name=...) と一致させる
+# =========================================================
+TASK_ORCHESTRATE_CONVERSATION = "worker.app.tasks.orchestrate_conversation_task"
+TASK_START_NAVIGATION = "worker.app.tasks.navigation_start_task"
+TASK_UPDATE_LOCATION = "worker.app.tasks.navigation_location_update_task"
+TASK_PREGENERATE_GUIDES = "worker.app.tasks.pregenerate_guides_task"
+
+__all__ = [
+    "TASK_ORCHESTRATE_CONVERSATION",
+    "TASK_START_NAVIGATION",
+    "TASK_UPDATE_LOCATION",
+    "TASK_PREGENERATE_GUIDES",
+    "refresh_spot_congestion_mv",
+    "refresh_congestion_mv_task",
+    "routing_get_distance_and_duration",
+    "routing_calculate_full_itinerary_route",
+    "routing_calculate_reroute",
+]
+
+# =========================================================
+# 既存のヘルス/メンテ系タスク
+# =========================================================
+
 DB_URL = os.getenv("DATABASE_URL")
 _engine = create_engine(DB_URL, future=True)
 
 
-# ---------------------------------------------------------------------
-# フォワーダ：オーケストレーション
-# ---------------------------------------------------------------------
-def orchestrate_message(payload: Dict[str, Any]) -> AsyncResult:
-    """
-    API から呼ばれる「フォワーダ」関数。
-    Worker 側の 'worker.app.tasks.orchestrate_message' タスクへ委譲する。
-    - API ノードで Worker 実装を import しないために send_task を使う
-    - 戻り値は AsyncResult（フロントはポーリング運用なのでIDだけ使えばOK）
-    """
-    return celery_app.send_task("worker.app.tasks.orchestrate_message", args=[payload])
-
-
-# ---------------------------------------------------------------------
-# マテリアライズド・ビュー更新系
-# ---------------------------------------------------------------------
 @celery_app.task(name="shared.app.tasks.refresh_spot_congestion_mv")
 def refresh_spot_congestion_mv():
     """
@@ -68,9 +77,10 @@ def refresh_congestion_mv_task() -> str:
             return f"failed: {e}"
 
 
-# ---------------------------------------------------------------------
-# Routing 用 追加タスク
-# ---------------------------------------------------------------------
+# =========================================================
+# Routing 用 追加タスク（既存I/Fを維持）
+# =========================================================
+
 @celery_app.task(name="routing.get_distance_and_duration", bind=True)
 def routing_get_distance_and_duration(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
