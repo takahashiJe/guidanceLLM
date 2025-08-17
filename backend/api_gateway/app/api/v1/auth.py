@@ -220,7 +220,10 @@ def register_user(payload: RegisterRequest, db: Session = Depends(get_db)):
     - email カラムが存在する環境では User.email にも保存（NOT NULL/UNIQUE に備える）。
     - display_name カラムが存在する場合のみ設定。
     """
-    email_str, display_name = _derive_email_and_username(payload)
+    email_str = _derive_email_and_username(payload)
+    email = payload.get("email")
+    username = payload.get("username") or email
+    display_name = payload.get("display_name") or (email or username).split("@")[0]
 
     # 既存チェックは username で（email を username に格納する実装）
     existing = (
@@ -238,6 +241,7 @@ def register_user(payload: RegisterRequest, db: Session = Depends(get_db)):
 
     user = models.User(
         username=email_str,
+        display_name=display_name,
         password_hash=password_hash,
     )
 
@@ -254,9 +258,11 @@ def register_user(payload: RegisterRequest, db: Session = Depends(get_db)):
     db.refresh(user)
 
     # トークン即時発行（security.create_* は sub=... を渡す実装に統一）
-    access_token = create_access_token(sub=str(user.id))
+    access_token  = create_access_token(sub=str(user.id))
     refresh_token = create_refresh_token(sub=str(user.id))
     return {
+        "user_id": user.id,
+         "id": user.id,   
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
@@ -274,9 +280,8 @@ def login_user(payload: LoginRequest, db: Session = Depends(get_db)):
 
     q = db.query(models.User)
     user = None
-
-    # username 優先で検索
-    user = q.filter(models.User.username == id_key).first()
+    login_id = payload.get("username") or payload.get("email")
+    user = db.query(models.User).filter(models.User.username == login_id).first()
 
     # 見つからず email カラムがあるなら email でも検索
     if not user and hasattr(models.User, "email"):
@@ -301,13 +306,12 @@ def refresh_access_token(payload: TokenRefreshRequest):
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
-    if decoded.get("type") != "refresh" or not decoded.get("sub"):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    if decoded.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    uid_str = str(decoded["sub"])  # ← 常に str で渡す
-    # 毎回新規発行（前回の文字列を再利用しない！）
-    new_access  = create_access_token(sub=uid_str)
-    new_refresh = create_refresh_token(sub=uid_str)
+    user_id = decoded.get("sub")
+    new_access  = create_access_token(sub=str(user_id))
+    new_refresh = create_refresh_token(sub=str(user_id))
 
     return {
         "access_token": new_access,
