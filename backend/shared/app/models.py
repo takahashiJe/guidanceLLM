@@ -249,3 +249,19 @@ class ConversationEmbedding(Base):
         # よく使う検索パターン用の複合インデックス（任意）
         Index("ix_convemb_session_ts", "session_id", "ts"),
     )
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    session_id = Column(String, nullable=True)  # 監査用（フロント生成のセッションID）
+    token_type = Column(String, default="refresh", nullable=False)
+    jti = Column(String, unique=True, nullable=False)
+    revoked = Column(Boolean, default=False, nullable=False)
+    replaced_by_jti = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+
+    user = relationship("User", backref="refresh_tokens")
