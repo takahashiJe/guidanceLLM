@@ -1,59 +1,88 @@
 # -*- coding: utf-8 -*-
 """
-Chat / Navigation エンドポイント
-- JSON と multipart の両対応で /api/v1/chat/message を公開
-- Celery へ投げて task_id を返す（/api/v1/chat/result/{task_id} でポーリング）
-- /api/v1/navigation/start も公開
+/api/v1/chat エンドポイント群
+- JSON / multipart 両対応の /message
+- Celery task の状態ポーリング /result/{task_id}
+- 既存仕様を壊さない：/api/v1 は main.py 側で付与。ここでは "/chat" から開始。
 """
 
 from __future__ import annotations
 
 import base64
-import json
-from typing import Optional
+import os
+from typing import Optional, Dict, Any, Tuple
 
-from fastapi import APIRouter, Depends, Request, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-from api_gateway.app.security import get_current_user_optional  # Optional[models.User]
 from shared.app.celery_app import celery_app
+from api_gateway.app.security import get_current_user_optional
 from shared.app import models
 
-router = APIRouter(prefix="/chat")
+# Celery タスク名（Worker 側の @celery_app.task(name=...) と一致させる）
+# 既存の shared.app.tasks への import ではなく、文字列で明示することで依存を減らす
+TASK_ORCHESTRATE_CONVERSATION = os.getenv(
+    "TASK_ORCHESTRATE_CONVERSATION", "orchestrate.conversation"
+)
+
+router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-# Celery タスク名（ワーカー側に実在する関数名に合わせる）
-#   - worker/app/tasks.py の @celery_app.task で name 明示が無い場合は
-#     デフォルトで "worker.app.tasks.<func_name>" になります。
-TASK_ORCHESTRATE = "worker.app.tasks.orchestrate_conversation_task"
-TASK_NAV_START = "worker.app.tasks.navigation_start_task"
-
-
-def _parse_body_any(request: Request) -> dict:
+def _extract_json_payload(body: Dict[str, Any]) -> Tuple[str, Optional[str], str, Optional[str]]:
     """
-    JSON でも multipart/form-data でも、同一の辞書に正規化する。
-    - multipart: session_id, lang, input_mode はフォーム値
-                 audio_file があれば base64 化して audio_b64 に格納
-                 （STT はワーカー側）
-    - JSON: そのままロード
+    JSON 受付時の必須/任意フィールド抽出。
+    戻り値: (session_id, message_text, lang, audio_b64)
     """
-    if request.headers.get("content-type", "").startswith("application/json"):
-        # JSON
-        return {}
+    session_id = body.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
 
-    # multipart の場合はここでフォームを読む（エンドポイント関数側で受け取るため未使用）
-    return {}
+    message_text = body.get("message_text")
+    lang = body.get("lang", "ja")
+    audio_b64 = body.get("audio_b64")  # 任意（音声のベース64文字列を直接送る場合）
+
+    return session_id, message_text, lang, audio_b64
 
 
-@router.post("/chat/message")
+async def _extract_multipart_payload(
+    session_id_form: Optional[str],
+    lang_form: Optional[str],
+    input_mode_form: Optional[str],
+    audio_file: Optional[UploadFile],
+) -> Tuple[str, Optional[str], str, Optional[str]]:
+    """
+    multipart/form-data 受付時の必須/任意フィールド抽出。
+    - テキストはフォームに text として送る想定はなく、multipart の場合は通常音声
+    - 音声は base64 化して Worker に渡す
+    戻り値: (session_id, message_text, lang, audio_b64)
+    """
+    if not session_id_form:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    lang = (lang_form or "ja").strip()
+
+    # 音声があれば base64 化
+    audio_b64: Optional[str] = None
+    if audio_file:
+        content = await audio_file.read()
+        # 最小限のヘッダーでも受け付ける（E2E のダミーWAV考慮）
+        audio_b64 = base64.b64encode(content).decode("utf-8")
+
+    # multipart では message_text を運ばない前提（音声中心）
+    message_text: Optional[str] = None
+    return session_id_form, message_text, lang, audio_b64
+
+
+@router.post("/message")
 async def post_message(
     request: Request,
-    # --- multipart/form-data の場合に受け取るフォーム項目 ---
+    # --- multipart/form-data フィールド（音声 or フォームテキスト）---
     session_id_form: Optional[str] = Form(default=None),
     lang_form: Optional[str] = Form(default=None),
     input_mode_form: Optional[str] = Form(default=None),
     audio_file: Optional[UploadFile] = File(default=None),
-    # --- 認証：任意（無くても受付）---
+    # --- 共通：認証（任意）---
     current_user: Optional[models.User] = Depends(get_current_user_optional),
 ):
     """
@@ -61,105 +90,98 @@ async def post_message(
     - JSON / multipart の両方をサポート
     - 受理後は 202 + {task_id} を返し、結果は /api/v1/chat/result/{task_id} をポーリング
     """
-    user_id = current_user.id if isinstance(current_user, models.User) else None
+    user_id: Optional[int] = current_user.id if isinstance(current_user, models.User) else None
 
-    # Content-Type を見て分岐
-    if request.headers.get("content-type", "").startswith("application/json"):
-        body = await request.json()
-        session_id = body.get("session_id")
-        lang = body.get("lang", "ja")
-        input_mode = body.get("input_mode", "text")
-        message_text = body.get("message_text")
-        audio_b64 = body.get("audio_b64")  # JSON で渡された場合も許容
-        if not session_id:
-            raise HTTPException(status_code=400, detail="session_id は必須です。")
+    # JSON or multipart を自動判定
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+
+        session_id, message_text, lang, audio_b64 = _extract_json_payload(body)
+        input_mode = (body.get("input_mode") or ("voice" if audio_b64 else "text")).strip()
+
     else:
-        # multipart/form-data
-        form = await request.form()
-        session_id = session_id_form or form.get("session_id")
-        lang = (lang_form or form.get("lang") or "ja")
-        input_mode = (input_mode_form or form.get("input_mode") or "voice")
-        message_text = form.get("message_text")
-        audio_b64 = None
-        if audio_file:
-            # 音声は base64 へ（実際の STT はワーカー側）
-            content = await audio_file.read()
-            audio_b64 = base64.b64encode(content).decode("utf-8")
-        if not session_id:
-            raise HTTPException(status_code=400, detail="session_id は必須です。")
+        # multipart/form-data として処理
+        session_id, message_text, lang, audio_b64 = await _extract_multipart_payload(
+            session_id_form, lang_form, input_mode_form, audio_file
+        )
+        input_mode = (input_mode_form or ("voice" if audio_b64 else "text")).strip()
 
-    # Celery へ投入
-    payload = {
+    # Celery に渡す payload を組み立て
+    payload: Dict[str, Any] = {
         "session_id": session_id,
         "user_id": user_id,
         "lang": lang,
         "input_mode": input_mode,
-        "message_text": message_text,
-        "audio_b64": audio_b64,
     }
-    try:
-        async_result = celery_app.send_task(TASK_ORCHESTRATE, args=[payload])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"タスク投入に失敗しました: {e}")
+    if message_text:
+        payload["message_text"] = message_text
+    if audio_b64:
+        payload["audio_b64"] = audio_b64
 
-    # 202 Accepted + task_id を返す（テスト要件）
+    # Celery タスクを投入（非同期）
+    try:
+        async_result = celery_app.send_task(TASK_ORCHESTRATE_CONVERSATION, args=[payload])
+    except Exception as e:
+        # ブローカー未起動など
+        raise HTTPException(status_code=503, detail=f"failed to enqueue task: {e}")
+
+    # 受理応答（tests は task_id を期待）
     return JSONResponse(
-        status_code=202,
-        content={
-            "accepted": True,
-            "session_id": session_id,
-            "task_id": async_result.id,
-        },
-    )
-
-
-@router.get("/chat/result/{task_id}")
-async def get_chat_result(task_id: str):
-    """
-    Celery の AsyncResult をポーリングするためのエンドポイント。
-    """
-    if not task_id or task_id.lower() == "none":
-        raise HTTPException(status_code=404, detail="task_id が不正です。")
-    try:
-        res = celery_app.AsyncResult(task_id)
-        state = res.state  # PENDING / STARTED / RETRY / FAILURE / SUCCESS
-        body = {"task_id": task_id, "status": state}
-        if res.ready():
-            try:
-                body["result"] = res.get(propagate=False)
-            except Exception as e:
-                body["status"] = "FAILURE"
-                body["error"] = str(e)
-        return JSONResponse(status_code=200, content=body)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"結果参照に失敗しました: {e}")
-
-
-@router.post("/navigation/start")
-async def navigation_start(
-    payload: dict,
-    current_user: Optional[models.User] = Depends(get_current_user_optional),
-):
-    """
-    ナビゲーション開始（ガイド事前生成などのトリガー）
-    - E2E テストは 200/202 のみ確認
-    - 実処理はワーカー側の navigation_start_task に委譲
-    """
-    session_id = payload.get("session_id")
-    lang = payload.get("lang", "ja")
-    user_id = current_user.id if isinstance(current_user, models.User) else None
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id は必須です。")
-
-    args = [{"session_id": session_id, "user_id": user_id, "lang": lang}]
-    try:
-        async_result = celery_app.send_task(TASK_NAV_START, args=args)
-    except Exception as e:
-        # 起動順の都合などでワーカーが未登録でも 202 を返すのは避け、
-        # ここでは明示的に 500 を返す（要件に合わせて調整可）
-        raise HTTPException(status_code=500, detail=f"ナビ開始のタスク投入に失敗: {e}")
-
-    return JSONResponse(
-        status_code=202,
+        status_code=status.HTTP_202_ACCEPTED,
         content={"accepted": True, "session_id": session_id, "task_id": async_result.id},
     )
+
+
+class TaskResultResponse(BaseModel):
+    task_id: str
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    # 追加: 失敗時の簡易情報
+    error: Optional[str] = None
+
+
+@router.get("/result/{task_id}", response_model=TaskResultResponse)
+async def get_result(task_id: str):
+    """
+    Celery の AsyncResult を参照して状態/結果を返す。
+    - SUCCESS: result を返す（Worker 側の orchestrate_conversation_task の戻り値）
+    - PENDING/RETRY: 202 with status
+    - FAILURE: 200 で status=FAILURE + 簡易エラー
+    """
+    from celery.result import AsyncResult
+
+    if task_id in (None, "", "None"):
+        # E2E の防御策
+        raise HTTPException(status_code=404, detail="task_id not found")
+
+    ar = AsyncResult(task_id, app=celery_app)
+    state = ar.state or "PENDING"
+
+    if state == "SUCCESS":
+        try:
+            res = ar.get(propagate=False)
+        except Exception as e:
+            return TaskResultResponse(task_id=task_id, status="FAILURE", error=str(e))
+        return TaskResultResponse(task_id=task_id, status="SUCCESS", result=res)
+
+    if state in ("PENDING", "RETRY", "STARTED", "RECEIVED"):
+        # 進行中 → 202
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=TaskResultResponse(task_id=task_id, status=state).model_dump(),
+        )
+
+    if state == "FAILURE":
+        # 失敗 → 200 で失敗情報
+        try:
+            info = str(ar.result) if ar.result else None
+        except Exception:
+            info = None
+        return TaskResultResponse(task_id=task_id, status="FAILURE", error=info)
+
+    # その他状態（REVOKEDなど）→ 一旦 200
+    return TaskResultResponse(task_id=task_id, status=state)
