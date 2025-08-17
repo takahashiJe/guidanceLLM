@@ -34,9 +34,17 @@ class ChatSubmitResponse(BaseModel):
 @router.post("/chat/message", response_model=ChatSubmitResponse, status_code=202)
 async def submit_message(
     request: Request,
+    session_id_form: Optional[str] = Form(None),
+    message_form: Optional[str] = Form(None),
+    language_form: Optional[str] = Form(None),
+    input_mode_form: Optional[str] = Form(None),
+    audio_file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    user = Depends(get_current_user),
 ):
+    body = {}
+    if request.headers.get("content-type","").startswith("application/json"):
+        body = await request.json()
     """
     JSON(text) と multipart(voice) の両方を単一路由で受ける
     - JSON: {session_id, message_text, lang, input_mode}
