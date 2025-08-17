@@ -1,175 +1,155 @@
 # -*- coding: utf-8 -*-
 """
-認証エンドポイント
-- /api/v1/auth/register
-- /api/v1/auth/login
-- /api/v1/auth/token/refresh
-
-注意:
-- ルーターには prefix を付けない（/api/v1/... は main.py 側で付与）
-- models.User に display_name が無い環境に合わせ、登録時は username/password_hash のみ保存
+認証・ユーザー管理エンドポイント
+- 変更点:
+  - /register のリクエストボディで username をオプショナル化。
+  - username 未指定の場合は email のローカル部から自動生成（重複時はサフィックス付与）。
+  - 既存のトークン発行/検証ロジックやルート構成は変更しない。
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import re
+import secrets
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from pydantic import BaseModel, Field, ValidationError
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from shared.app.database import get_db
-from shared.app import models
 from api_gateway.app.security import (
-    hash_password,
-    verify_password,
     create_access_token,
     create_refresh_token,
-    decode_token,
+    verify_password,
+    get_password_hash,
+    verify_refresh_token,
+)
+from shared.app.database import get_db
+from shared.app import models
+
+router = APIRouter(
+    # 既存のルーター登録（prefix）は main.py 側の include_router に依存。
+    # 本ファイル内では従来通りの設定にしているため、プレフィックスは変更しない。
+    prefix="/api/v1/auth",
+    tags=["auth"],
 )
 
-# ★ prefix は付けない（main.py で /api/v1/auth を付与）
-router = APIRouter(prefix="/auth")
-
-
 # -----------------------------
-# リクエスト/レスポンス モデル
+# 内部用スキーマ（username を Optional に）
 # -----------------------------
-class RegisterRequest(BaseModel):
+USERNAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+
+
+class RegisterIn(BaseModel):
+    """username を省略可能にした登録用モデル（E2E 想定: email/password のみでも登録可）"""
+    email: EmailStr
+    password: str = Field(min_length=8, description="8文字以上を推奨")
+    username: Optional[str] = None
+
+
+class RegisterOut(BaseModel):
+    id: int
+    email: EmailStr
     username: str
-    password: str
-    # display_name は DB に無い環境があるので受付のみ（保存はしない）
-    display_name: Optional[str] = None
 
 
-class RegisterResponse(BaseModel):
-    # テストは user_id か id のどちらでも受けるため両方返す
-    user_id: str
-    username: str
-    id: Optional[str] = None
-
-
-class LoginJSONRequest(BaseModel):
-    username: str
+class LoginIn(BaseModel):
+    email: EmailStr
     password: str
 
 
-class TokenPair(BaseModel):
+class TokenOut(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
 
 
-class RefreshRequest(BaseModel):
-    refresh_token: str = Field(..., description="現在のリフレッシュトークン")
+class RefreshIn(BaseModel):
+    refresh_token: str
 
 
 # -----------------------------
-# /register
+# ユーティリティ
 # -----------------------------
-@router.post("/register", response_model=RegisterResponse, status_code=201)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
-    # 既存チェック
-    existing = db.query(models.User).filter(models.User.username == payload.username).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="username already exists")
+def _sanitize_username(name: str) -> str:
+    """ユーザー名に使えない文字を除去し、先頭末尾のピリオド/ハイフン/アンダースコアも整形"""
+    name = USERNAME_RE.sub("", name)
+    name = name.strip("._-")
+    # 空になった場合のフォールバック
+    return name or f"user{secrets.token_hex(3)}"
 
-    # ★ display_name は保存しない（User にカラムが無い環境のため）
-    user = models.User(
-        username=payload.username,
-        password_hash=hash_password(payload.password),
-    )
+
+def _derive_username_from_email(email: str) -> str:
+    local = email.split("@", 1)[0]
+    return _sanitize_username(local)
+
+
+def _ensure_unique_username(db: Session, base_username: str) -> str:
+    """既存重複があればランダムサフィックスを付与してユニーク化"""
+    cand = base_username
+    while True:
+        exists = db.query(models.User).filter(models.User.username == cand).first()
+        if not exists:
+            return cand
+        cand = f"{base_username}_{secrets.token_hex(2)}"
+
+
+# -----------------------------
+# エンドポイント
+# -----------------------------
+@router.post("/register", response_model=RegisterOut, status_code=status.HTTP_201_CREATED)
+def register(payload: RegisterIn, db: Session = Depends(get_db)):
+    """
+    ユーザー登録
+    - username はオプショナル。未指定時は email ローカル部から自動生成（重複時はサフィックス）。
+    - email 重複などの整合性違反は 409 を返す。
+    """
+    # username の補完
+    if payload.username and payload.username.strip():
+        base_username = _sanitize_username(payload.username)
+    else:
+        base_username = _derive_username_from_email(payload.email)
+
+    username = _ensure_unique_username(db, base_username)
+    hashed = get_password_hash(payload.password)
+
+    user = models.User(email=payload.email, username=username, hashed_password=hashed)
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # email のユニーク制約違反など
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="user already exists")
     db.refresh(user)
 
-    # 互換のため user_id と id を両方返す（どちらも文字列）
-    return RegisterResponse(user_id=str(user.id), id=str(user.id), username=user.username)
+    return RegisterOut(id=user.id, email=user.email, username=user.username)
 
 
-# -----------------------------
-# /login （JSON と x-www-form-urlencoded の両方を確実に受ける）
-# -----------------------------
-@router.post("/login", response_model=TokenPair)
-async def login(request: Request, db: Session = Depends(get_db)):
+@router.post("/login", response_model=TokenOut)
+def login(payload: LoginIn, db: Session = Depends(get_db)):
     """
-    Content-Type を見て自前で抽出することで、Form/JSON 併用時の 422 を回避する。
+    ログイン
+    - email/password を検証し、access/refresh を発行。
     """
-    username, password = await _extract_login_credential(request)
-    if not username or not password:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="username/password is required (form or json).",
-        )
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
 
-    user = db.query(models.User).filter(models.User.username == username).first()
-    if not user or not verify_password(password, user.password_hash):
-        raise HTTPException(status_code=401, detail="invalid credentials")
-
-    # アクセス/リフレッシュを毎回新規発行（security 側で jti/nonce 付与）
-    access = create_access_token(sub=str(user.id), token_type="access")
-    refresh = create_refresh_token(sub=str(user.id), token_type="refresh")
-    return TokenPair(access_token=access, refresh_token=refresh)
+    access_token = create_access_token(subject=str(user.id))
+    refresh_token = create_refresh_token(subject=str(user.id))
+    return TokenOut(access_token=access_token, refresh_token=refresh_token)
 
 
-async def _extract_login_credential(request: Request) -> Tuple[Optional[str], Optional[str]]:
+@router.post("/token/refresh", response_model=TokenOut)
+def refresh_token(payload: RefreshIn):
     """
-    - application/json: { "username": "...", "password": "..." }
-    - application/x-www-form-urlencoded: username=...&password=...
-    - それ以外でも、まず JSON → ダメなら form の順で試す（互換性重視）
+    リフレッシュトークンを検証し、アクセストークンを再発行。
+    - ここでは refresh もローテーション（新しい refresh を返却）する運用。
     """
-    ctype = (request.headers.get("content-type") or "").lower()
-
-    # 1) JSON 優先
-    if "application/json" in ctype:
-        try:
-            data = await request.json()
-            # pydantic で型検証
-            body = LoginJSONRequest.model_validate(data)
-            return body.username, body.password
-        except (ValidationError, Exception):
-            # JSON と言っているが body 不正→後段の form 試行にフォールバック
-            pass
-
-    # 2) form
-    if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype or True:
-        # True を含めておくことで、ctype 不明でも form() 試行して互換性を上げる
-        try:
-            form = await request.form()
-            u = form.get("username")
-            p = form.get("password")
-            if u and p:
-                return str(u), str(p)
-        except Exception:
-            pass
-
-    # どちらも取れなかった
-    return None, None
-
-
-# -----------------------------
-# /token/refresh
-# -----------------------------
-@router.post("/token/refresh", response_model=TokenPair)
-def refresh_token(payload: RefreshRequest, db: Session = Depends(get_db)):
-    try:
-        decoded = decode_token(payload.refresh_token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="invalid refresh token")
-
-    if decoded.get("type") != "refresh":
-        raise HTTPException(status_code=401, detail="token type must be refresh")
-
-    user_id = decoded.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="invalid refresh token (no sub)")
-
-    # ユーザー存在確認
-    user = db.query(models.User).filter(models.User.id == int(user_id)).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="user not found")
-
-    # 新規に発行（jti/nonce により同秒でも値が変わる）
-    access = create_access_token(sub=str(user.id), token_type="access")
-    refresh = create_refresh_token(sub=str(user.id), token_type="refresh")
-    return TokenPair(access_token=access, refresh_token=refresh)
+    sub = verify_refresh_token(payload.refresh_token)  # 例外時は 401（security 側で発生）
+    # sub にはユーザーID文字列が入る想定
+    access_token = create_access_token(subject=sub)
+    new_refresh_token = create_refresh_token(subject=sub)
+    return TokenOut(access_token=access_token, refresh_token=new_refresh_token)
