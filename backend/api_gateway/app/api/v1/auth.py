@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from pydantic import BaseModel, EmailStr, Field, TypeAdapter, ValidationError, field_validator
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from api_gateway.app.security import (
     hash_password,
@@ -211,56 +212,47 @@ def _derive_email_and_username(payload: RegisterRequest) -> Tuple[str, Optional[
 # ------------------------------------------------------------
 # エンドポイント
 # ------------------------------------------------------------
-@router.post("/register", response_model=RegisterResponse, status_code=201)
+@router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 def register_user(payload: RegisterIn, db: Session = Depends(get_db)):
-    """
-    新規ユーザー登録。
-    - 入力は email / username のどちらでも可
-    - DB に email カラムが無いため、email は User.username に保存する（テスト実装準拠）
-    - display_name は存在すれば User.display_name に入れる（存在しないスキーマでも壊さない）
-    - レスポンスは user_id + トークン（bearer）
-    """
-    # 実際に username カラムへ格納する値を決定（email があればそれを使う）
-    username_value = (payload.email or payload.username).strip()
+    # e2e は email のみを渡してくるので、email 優先で拾い、なければ username
+    raw = payload.email if payload.email is not None else payload.username
+    username_value = str(raw).strip() if raw is not None else ""   # 空判定もできるように
 
-    # 重複チェック（username カラムで一意）
+    if not username_value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="username/email required")
+
+    # 既存チェック（username に email を格納する運用）
     existing = db.query(models.User).filter(models.User.username == username_value).first()
     if existing:
-        # e2e テストは 200/201/400/409 を許容 → 409 を返す
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
 
-    # パスワードハッシュ
     password_hash = hash_password(payload.password)
 
-    # ユーザー作成
     user = models.User(username=username_value, password_hash=password_hash)
-    if hasattr(models.User, "display_name") and payload.display_name:
+    if hasattr(models.User, "display_name") and getattr(payload, "display_name", None):
         setattr(user, "display_name", payload.display_name)
 
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
     db.refresh(user)
-
-    # トークン
-    access_token  = _issue_access_token_for(user.id)
-    refresh_token = _issue_refresh_token_for(user.id)
 
     return {
         "user_id": user.id,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
+        "access_token": _issue_access_token_for(user.id),
+        "refresh_token": _issue_refresh_token_for(user.id),
         "token_type": "bearer",
     }
 
 
 @router.post("/login", response_model=AuthTokens)
 def login_user(payload: LoginIn, db: Session = Depends(get_db)):
-    """
-    ログイン（JSON ボディ）
-    - email / username のどちらでも受付
-    - 既存の仕様に合わせて DB は User.username に email を格納しているため、そのまま一致検索
-    """
-    key = (payload.email or payload.username).strip()
+    # 入力値の正規化（str で安全化）
+    raw = payload.email if payload.email is not None else payload.username
+    key = str(raw).strip()
 
     user = db.query(models.User).filter(models.User.username == key).first()
     if not user or not verify_password(payload.password, user.password_hash):
@@ -273,27 +265,23 @@ def login_user(payload: LoginIn, db: Session = Depends(get_db)):
     }
 
 
-@router.post("/token/refresh", response_model=AccessTokenOnly)
+@router.post("/token/refresh", response_model=AuthTokens)
 def refresh_access_token(payload: TokenRefreshRequest):
-    """
-    リフレッシュトークンからアクセストークンを再発行。
-    - security.decode_token() で JWT を復号し、"type" == "refresh" と "sub" を検証。
-    """
     try:
         decoded = decode_token(payload.refresh_token)
     except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
     token_type = decoded.get("type")
     user_id = decoded.get("sub")
     if token_type != "refresh" or not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
-    new_access = create_access_token(user_id=int(user_id))
-    return AccessTokenOnly(access_token=new_access)
+    uid = int(user_id)
+    new_access  = _issue_access_token_for(uid)
+    new_refresh = _issue_refresh_token_for(uid)   # ← リフレッシュもローテーション
+    return {
+        "access_token": new_access,
+        "refresh_token": new_refresh,
+        "token_type": "bearer",
+    }
