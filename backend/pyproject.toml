@@ -8,6 +8,7 @@ package-mode = false  # ルートをパッケージとしては扱わない（�
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.12"
+PyJWT = ">=2.8,<3"           # `import jwt` が使える本体
 
 # --- DB/ベクトル ---
 pgvector = "^0.3.2"
