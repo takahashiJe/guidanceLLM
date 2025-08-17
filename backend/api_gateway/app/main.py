@@ -2,8 +2,8 @@
 """
 FastAPI アプリケーションのエントリポイント。
 - CORS 設定
-- v1 ルーター群の登録（auth / sessions / chat）
 - /health の登録（最初に登録しておくと疎通確認が容易）
+- v1 ルーター群の登録（auth / sessions / chat）※ここで /api/v1 を一括付与
 """
 
 import os
@@ -44,8 +44,8 @@ def create_app() -> FastAPI:
     # /health は最初に
     app.include_router(health_router)  # => GET /health
 
-    # 各 v1 ルーターは **相対パス（/auth, /sessions, /chat）** を前提に、
-    # ここで prefix="/api/v1" を付与して公開 URL を /api/v1/... に統一する。
+    # 重要：/api/v1 のバージョン接頭辞は **ここで** 付ける
+    # 各ルーター(auth/sessions/chat)側のAPIRouterは、prefix="/auth" 等の想定。
     app.include_router(auth_router, prefix="/api/v1")      # => /api/v1/auth/...
     app.include_router(sessions_router, prefix="/api/v1")  # => /api/v1/sessions/...
     app.include_router(chat_router, prefix="/api/v1")      # => /api/v1/chat/...
@@ -56,10 +56,14 @@ def create_app() -> FastAPI:
         return {
             "service": "api-gateway",
             "version": app.version,
-            "endpoints": ["/health", "/api/v1/auth/*", "/api/v1/sessions/*", "/api/v1/chat/*"],
+            "endpoints": [
+                "/health",
+                "/api/v1/auth/*",
+                "/api/v1/sessions/*",
+                "/api/v1/chat/*",
+            ],
         }
 
     return app
-
 
 app = create_app()

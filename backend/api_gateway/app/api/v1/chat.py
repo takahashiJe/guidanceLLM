@@ -14,7 +14,7 @@ from shared.app.database import get_db
 from shared.app import models
 from api_gateway.app.security import get_current_user
 
-router = APIRouter(tags=["chat"])
+router = APIRouter(prefix="/chat", tags=["chat"])
 
 # 上限（バイト）。未設定なら 10MB
 MAX_AUDIO_BYTES = int(os.getenv("CHAT_MAX_AUDIO_BYTES", str(10 * 1024 * 1024)))

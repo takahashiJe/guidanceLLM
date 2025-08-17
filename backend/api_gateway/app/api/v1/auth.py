@@ -29,7 +29,7 @@ from api_gateway.app.security import (
 )
 
 # ★ prefix は付けない（main.py で /api/v1/auth を付与）
-router = APIRouter(tags=["auth"])
+router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 # -----------------------------
