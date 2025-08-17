@@ -212,55 +212,84 @@ def _derive_email_and_username(payload: RegisterRequest) -> Tuple[str, Optional[
 # ------------------------------------------------------------
 # エンドポイント
 # ------------------------------------------------------------
-@router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/register", response_model=AuthTokens, status_code=status.HTTP_201_CREATED)
 def register_user(payload: RegisterRequest, db: Session = Depends(get_db)):
-    # e2e は email だけで来るので email 優先、なければ username
-    raw = payload.email if getattr(payload, "email", None) else getattr(payload, "username", None)
-    username_value = (str(raw).strip() if raw is not None else "")
-    if not username_value:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="username/email required")
+    """
+    新規ユーザー登録。
+    - DB に email カラムが無い環境もあるため、email は必ず User.username に保存。
+    - email カラムが存在する環境では User.email にも保存（NOT NULL/UNIQUE に備える）。
+    - display_name カラムが存在する場合のみ設定。
+    """
+    email_str, display_name = _derive_email_and_username(payload)
 
-    # 重複は 409
-    existing = db.query(models.User).filter(models.User.username == username_value).first()
+    # 既存チェックは username で（email を username に格納する実装）
+    existing = (
+        db.query(models.User)
+        .filter(models.User.username == email_str)
+        .first()
+    )
     if existing:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User already exists",
+        )
 
     password_hash = hash_password(payload.password)
-    user = models.User(username=username_value, password_hash=password_hash)
-    if hasattr(models.User, "display_name") and getattr(payload, "display_name", None):
-        setattr(user, "display_name", payload.display_name)
+
+    user = models.User(
+        username=email_str,
+        password_hash=password_hash,
+    )
+
+    # ✅ email カラムがあるなら email も同じ値で埋める（e2e 環境の NOT NULL/UNIQUE に対応）
+    if hasattr(models.User, "email"):
+        setattr(user, "email", email_str)
+
+    # 任意の display_name カラム対応
+    if hasattr(models.User, "display_name") and display_name:
+        setattr(user, "display_name", display_name)
 
     db.add(user)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        # 競合は 409 に正規化
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
+    db.commit()
     db.refresh(user)
 
-    uid_str = str(user.id)
+    # トークン即時発行（security.create_* は sub=... を渡す実装に統一）
+    access_token = create_access_token(sub=str(user.id))
+    refresh_token = create_refresh_token(sub=str(user.id))
     return {
-        "user_id": user.id,
-        "access_token": create_access_token(sub=uid_str),
-        "refresh_token": create_refresh_token(sub=uid_str),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
     }
 
 
 @router.post("/login", response_model=AuthTokens)
-def login_user(payload: LoginIn, db: Session = Depends(get_db)):
-    # 入力値の正規化（str で安全化）
-    raw = payload.email if payload.email is not None else payload.username
-    key = str(raw).strip()
+def login_user(payload: LoginRequest, db: Session = Depends(get_db)):
+    """
+    username/email のどちらでもログイン可能にする。
+    """
+    id_key = (payload.username or payload.email or "").strip()
+    if not id_key:
+        raise HTTPException(status_code=400, detail="username or email required")
 
-    user = db.query(models.User).filter(models.User.username == key).first()
+    q = db.query(models.User)
+    user = None
+
+    # username 優先で検索
+    user = q.filter(models.User.username == id_key).first()
+
+    # 見つからず email カラムがあるなら email でも検索
+    if not user and hasattr(models.User, "email"):
+        user = q.filter(models.User.email == id_key).first()
+
     if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="invalid credentials")
 
+    access_token = create_access_token(sub=str(user.id))
+    refresh_token = create_refresh_token(sub=str(user.id))
     return {
-        "access_token": _issue_access_token_for(user.id),
-        "refresh_token": _issue_refresh_token_for(user.id),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
     }
 
