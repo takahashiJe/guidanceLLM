@@ -40,14 +40,14 @@ class SessionCreateRequest(BaseModel):
 
 class SessionCreateResponse(BaseModel):
     session_id: str = Field(serialization_alias="session_id")
-    app_status: str = Field(serialization_alias="appStatus")
+    appStatus: str = Field(serialization_alias="appStatus")
     active_plan_id: Optional[int] = Field(default=None, serialization_alias="active_plan_id")
     reset: bool = False
     model_config = ConfigDict(populate_by_name=True)
 
 class SessionRestoreResponse(BaseModel):
     session_id: str = Field(serialization_alias="session_id")
-    app_status: str = Field(serialization_alias="appStatus")
+    appStatus: str = Field(serialization_alias="appStatus")
     active_plan_id: Optional[int] = Field(default=None, serialization_alias="active_plan_id")
     model_config = ConfigDict(populate_by_name=True)
 
@@ -104,10 +104,10 @@ def create_session(
 
         payload = SessionCreateResponse(
             session_id=found.session_id,
-            app_status=found.current_status or "idle",
+            appStatus=found.current_status or "Browse",
             active_plan_id=found.active_plan_id,
             reset=True,
-        )
+            )
         return Response(
             content=payload.model_dump_json(by_alias=True),
             media_type="application/json",
@@ -160,7 +160,7 @@ def restore_session(
 
     payload = SessionRestoreResponse(
         session_id=rec.session_id,
-        app_status=rec.current_status or "idle",
+        appStatus=rec.current_status or "Browse",
         active_plan_id=rec.active_plan_id,
     )
     return Response(
