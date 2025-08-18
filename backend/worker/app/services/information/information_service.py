@@ -1,298 +1,524 @@
-# backend/worker/app/services/information/information_service.py
-# -------------------------------------------------------------
-# 情報提供サービス部の本実装。
-# - 候補スポット抽出（意図別）
-# - ナッジ材料収集（距離・天気・混雑・最適日）
-# - 静的情報返却
-#
-# 依存：
-# - DB: shared.app.database.get_db / shared.app.models
-# - ルート計算: worker.app.services.routing.routing_service.RoutingService
-# - 混雑集計: worker.app.services.itinerary.itinerary_service.get_congestion_info
-# - 天気取得: 同ディレクトリの web_crawler / weather_api
-# -------------------------------------------------------------
+# worker/app/services/information/information_service.py
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional, Tuple
-from datetime import datetime, date, timedelta
+import math
+from datetime import date, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_, func
+# 既存の関数をモジュール直下にも露出（互換維持）
+# ※ 遅延インポートはクラス内で行う。ここは tests / 既存コード互換のためエクスポートのみ。
+from .weather_api import get_point_forecast  # 一般地点用
+from .web_crawler import get_tenkijp_chokai_daily  # 鳥海山ページ（日次）
 
-from shared.app.models import Spot  # Spot モデル（official_name, tags, spot_type, latitude, longitude, description, social_proof 等）
-from worker.app.services.routing.routing_service import RoutingService
-from worker.app.services.itinerary.itinerary_service import get_congestion_info
-from .web_crawler import get_tenkijp_chokai_daily  # 山岳用：tenki.jp 鳥海山ページのスクレイパ
-from .weather_api import get_point_forecast  # 一般地点用：緯度経度からの天気API
-
-# -------------------------------
-# 設定・定数
-# -------------------------------
-
-# 「山岳スポット」判定に使うタグ（tags にこれらの語が含まれれば山として扱う）
-MOUNTAIN_TAGS = {"山", "登山", "ハイキング", "トレッキング", "山岳", "峰", "縦走"}
-
-# 天気スコアリング（簡易）
-# 備考：tenki.jp / API 双方からの文字列を「部分一致」で判定できるよう幅広めに設定
-WEATHER_SCORE_TABLE = [
-    (("快晴",), 5),
-    (("晴", "晴れ"), 5),
-    (("薄曇", "曇", "くもり"), 3),
-    (("小雨", "にわか雨", "一時雨"), 1),
-    (("雨",), 0),
-    (("雪", "みぞれ", "吹雪"), 0),
+__all__ = [
+    "InformationService",
+    # 既存コード互換のためにモジュール関数も公開
+    "get_point_forecast",
+    "get_tenkijp_chokai_daily",
 ]
 
-# 混雑スコアリング（Itinerary Service の status に合わせる）
-CONGESTION_SCORE_TABLE = {
-    "空いています": 5,
-    "比較的穏やかでしょう": 3,
-    "混雑が予想されます": 0,
+# =========================
+# 定数・スコアテーブル
+# =========================
+
+MOUNTAIN_TAGS: set[str] = {
+    "mountain", "peak", "trail", "hiking", "climb",
+    "山", "岳", "登山", "トレッキング", "ハイキング",
 }
 
+# 簡易的スコア化（0.0〜1.0）
+WEATHER_SCORE_TABLE: Dict[str, float] = {
+    # キーは天気API/スクレイパの“状態表現”にある程度ロバストに対応
+    "clear": 1.0, "sunny": 1.0, "快晴": 1.0, "晴": 0.9, "晴れ": 0.9,
+    "partly_cloudy": 0.8, "cloudy": 0.6, "曇": 0.6, "くもり": 0.6,
+    "rain": 0.2, "rainy": 0.2, "小雨": 0.3, "雨": 0.2, "大雨": 0.1,
+    "snow": 0.3, "snowy": 0.3, "小雪": 0.4, "雪": 0.3, "大雪": 0.2,
+    "storm": 0.1, "雷雨": 0.1,
+}
 
-# -------------------------------
+CONGESTION_SCORE_TABLE: Dict[str, float] = {
+    "low": 1.0,     # 空いている
+    "medium": 0.6,  # ふつう
+    "high": 0.2,    # 混んでいる
+    "unknown": 0.5, # 不明は中間評価
+}
+
+# =========================
 # ユーティリティ
-# -------------------------------
+# =========================
 
-def _daterange_inclusive(start_d: date, end_d: date):
-    """開始〜終了を**両端含む**日付反復"""
-    cur = start_d
-    while cur <= end_d:
-        yield cur
-        cur = cur + timedelta(days=1)
-
-
-def _is_mountain_spot(tags: Optional[str]) -> bool:
-    """「山タグ」を含むかを判定（tags はカンマ区切り想定／NULL許容）"""
-    if not tags:
-        return False
-    t = tags.lower()
-    for key in MOUNTAIN_TAGS:
-        if key.lower() in t:
-            return True
-    return False
-
-
-def _score_weather(desc: str) -> int:
-    """天気記述のスコアを返す（部分一致ベースの簡易判定）"""
-    if not desc:
-        return 0
-    d = desc.strip()
-    for keys, score in WEATHER_SCORE_TABLE:
-        for k in keys:
-            if k in d:
-                return score
-    # どれにも該当しない場合は中間値相当
-    return 3
-
-
-def _score_congestion(status: str) -> int:
-    """混雑ステータスのスコア"""
-    return CONGESTION_SCORE_TABLE.get(status, 3)
-
-
-def _normalize_distance_km(meters: float) -> float:
-    return round((meters or 0.0) / 1000.0, 1)
-
-
-def _normalize_duration_min(seconds: float) -> int:
-    return int(round((seconds or 0.0) / 60.0))
-
-
-# -------------------------------
-# 候補スポット抽出
-# -------------------------------
-
-def find_spots_by_intent(
-    db: Session,
-    intent_type: Literal["specific", "category", "general_tourist"],
-    query: Optional[str],
-    language: Literal["ja", "en", "zh"] = "ja",
-    limit: int = 50,
-) -> List[Spot]:
-    """
-    ユーザー意図に応じた候補スポット抽出（FR-3-1, FR-3-5）
-    - specific: official_name 部分一致
-    - category: tags に query を含む
-    - general_tourist: spot_type = 'tourist_spot' 固定
-    """
-    q = db.query(Spot)
-
-    if intent_type == "specific":
-        if not query:
-            return []
-        # official_name の部分一致（大文字小文字は DB コレーションに依存。ilike が使えればそれが理想）
-        like = f"%{query}%"
-        q = q.filter(Spot.official_name.ilike(like))
-        return q.limit(limit).all()
-
-    elif intent_type == "category":
-        if not query:
-            return []
-        like = f"%{query}%"
-        # tags（カンマ区切り or フリーテキスト想定）への部分一致
-        q = q.filter(Spot.tags.ilike(like))
-        return q.limit(limit).all()
-
-    elif intent_type == "general_tourist":
-        # 宿泊施設が出ないよう観光スポット固定
-        q = q.filter(Spot.spot_type == "tourist_spot")
-        return q.limit(limit).all()
-
-    else:
-        # 未知の intent は空
+def _daterange_inclusive(start: date, end: date) -> Iterable[date]:
+    d = start
+    if end < start:
         return []
+    while d <= end:
+        yield d
+        d += timedelta(days=1)
 
 
-# -------------------------------
-# 静的情報の取得
-# -------------------------------
+def _is_mountain_spot(spot: Any) -> bool:
+    # Spot.tags が list[str] or comma-separated string を想定。双方に対応。
+    tags: List[str] = []
+    raw = getattr(spot, "tags", None)
+    if isinstance(raw, list):
+        tags = [str(t).strip().lower() for t in raw]
+    elif isinstance(raw, str):
+        tags = [t.strip().lower() for t in raw.split(",")]
+    return any(t in MOUNTAIN_TAGS for t in tags)
 
-def get_spot_details(db: Session, spot_id: int) -> Optional[Spot]:
+
+def _normalize_distance_km(km: float, max_km: float) -> float:
+    if max_km <= 0:
+        return 0.0
+    # 小さい距離を高評価（0〜1）
+    v = 1.0 - min(max(km, 0.0) / max_km, 1.0)
+    return max(0.0, min(1.0, v))
+
+
+def _normalize_duration_min(minutes: float, max_min: float) -> float:
+    if max_min <= 0:
+        return 0.0
+    v = 1.0 - min(max(minutes, 0.0) / max_min, 1.0)
+    return max(0.0, min(1.0, v))
+
+
+def _score_weather(weather: Dict[str, Any]) -> float:
     """
-    指定 spot の静的情報を返す（official_name / description / social_proof 等）
+    weather から 0.0〜1.0 のスコアへ。
+    - まず 'condition' 等の文章ラベルをテーブル変換
+    - あれば降水確率、風速、体感温度乖離なども減点（実装済）
     """
-    return db.query(Spot).filter(Spot.id == spot_id).first()
+    # ラベル → 基本スコア
+    label = (weather.get("condition") or weather.get("label") or "").strip().lower()
+    base = WEATHER_SCORE_TABLE.get(label, 0.5)
+
+    # 追加ペナルティ
+    pop = weather.get("precip_probability")  # 0〜1 or 0〜100
+    if isinstance(pop, (int, float)):
+        p = float(pop)
+        if p > 1.0:
+            p = p / 100.0
+        base *= max(0.0, 1.0 - 0.6 * p)  # 降水確率が高いほど減点（上限0.6）
+
+    wind = weather.get("wind_speed")  # m/s
+    if isinstance(wind, (int, float)) and wind > 8.0:
+        base *= 0.8  # 強風でやや減点
+
+    # クリップ
+    return max(0.0, min(1.0, base))
 
 
-# -------------------------------
-# ナッジ材料の収集と最適日の算出
-# -------------------------------
+def _score_congestion(level: str | None) -> float:
+    if not level:
+        level = "unknown"
+    return CONGESTION_SCORE_TABLE.get(level, 0.5)
 
-def find_best_day_and_gather_nudge_data(
-    db: Session,
-    spots: List[Spot],
-    user_location: Tuple[float, float],
-    date_range: Dict[str, str],
-    travel_profile: Literal["car", "foot"] = "car",
-) -> Dict[int, Dict]:
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    to_rad = math.pi / 180.0
+    dlat = (lat2 - lat1) * to_rad
+    dlon = (lon2 - lon1) * to_rad
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1 * to_rad) * math.cos(lat2 * to_rad) * math.sin(dlon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+# =========================
+# InformationService
+# =========================
+
+class InformationService:
     """
-    プロアクティブ・ナッジ（FR-3-3）の材料を収集し、最適日を算出して返す。
-    返却フォーマット（例）:
-    {
-      123: {
-        "best_date": "2025-08-10",
-        "distance_km": 21.4,
-        "duration_min": 38,
-        "weather_on_best_date": "晴れ",
-        "congestion_on_best_date": "空いています",
-        "congestion_count_on_best_date": 4,
-        "per_day": { "2025-08-09": {...}, "2025-08-10": {...}, ... }
-      },
-      ...
-    }
+    情報取得・評価の統合サービス。
+    - DB のスポット検索
+    - 天気（山岳/一般地点）
+    - ルーティング（距離/所要時間）
+    - 混雑情報
+    - ナッジ（最適日算出）
     """
-    if not spots:
-        return {}
 
-    # 日付範囲の解釈
-    start_str = date_range.get("start")
-    end_str = date_range.get("end")
-    if not (start_str and end_str):
-        raise ValueError("date_range は {'start': 'YYYY-MM-DD', 'end': 'YYYY-MM-DD'} 形式で指定してください。")
+    # -----------------------
+    # スポット検索系
+    # -----------------------
+    def find_spots_by_intent(
+        self,
+        *,
+        intent: str,
+        query_text: Optional[str] = None,
+        category: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        intent: 'specific' | 'category' | 'general_tourist'
+        query_text: specific の時は名称検索 / general は説明やタグも対象に全文検索
+        category: category の時のカテゴリ名
+        """
+        # 遅延インポート（ワーカー起動安定化）
+        from shared.app.database import SessionLocal
+        from shared.app.models import Spot  # type: ignore[attr-defined]
 
-    start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
-    end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+        with SessionLocal() as db:
+            q = db.query(Spot)
 
-    # ルート計算クライアント（同期）
-    routing = RoutingService()
-
-    results: Dict[int, Dict] = {}
-
-    for spot in spots:
-        # A) 距離・所要時間（不変情報）
-        try:
-            distance_m, duration_s = routing.get_distance_and_duration(
-                origin=user_location,
-                destination=(spot.latitude, spot.longitude),
-                profile=travel_profile,
-            )
-            distance_km = _normalize_distance_km(distance_m)
-            duration_min = _normalize_duration_min(duration_s)
-        except Exception:
-            # ルート計算が失敗した場合でも他情報で続行
-            distance_km, duration_min = 0.0, 0
-
-        # B) 期間内の日ごとの情報を収集
-        is_mountain = _is_mountain_spot(spot.tags)
-        per_day: Dict[str, Dict] = {}
-
-        for d in _daterange_inclusive(start_date, end_date):
-            d_str = d.strftime("%Y-%m-%d")
-
-            # --- 天気 ---
-            weather_desc = ""
-            weather_note = None  # 山麓予報の注釈用
-
-            if is_mountain:
-                # まず tenki.jp 鳥海山ページからスクレイプ
-                try:
-                    weather_desc = get_tenkijp_chokai_daily(d)
-                except Exception:
-                    # 失敗時フォールバック：地点予報＋注釈
-                    try:
-                        weather_desc = get_point_forecast(spot.latitude, spot.longitude, d)
-                        weather_note = "※ 山頂の詳細予報取得に失敗したため、山麓付近の一般予報を代替表示しています。"
-                    except Exception:
-                        weather_desc = ""
-                        weather_note = "※ 天気情報の取得に失敗しました。"
+            intent_l = (intent or "").strip().lower()
+            if intent_l == "specific" and query_text:
+                like = f"%{query_text}%"
+                q = q.filter(Spot.official_name.ilike(like))
+            elif intent_l == "category" and category:
+                like = f"%{category}%"
+                # category カラム or tags に含まれる
+                q = q.filter(
+                    (Spot.category.ilike(like))
+                    | (Spot.tags.ilike(like))  # tags が文字列のケースに対応
+                )
             else:
-                # 麓スポットは地点予報で十分
-                try:
-                    weather_desc = get_point_forecast(spot.latitude, spot.longitude, d)
-                except Exception:
-                    weather_desc = ""
-                    weather_note = "※ 天気情報の取得に失敗しました。"
+                # general：名称・説明・タグを緩く検索
+                if query_text:
+                    like = f"%{query_text}%"
+                    q = q.filter(
+                        (Spot.official_name.ilike(like))
+                        | (Spot.description.ilike(like))
+                        | (Spot.tags.ilike(like))
+                    )
 
-            weather_score = _score_weather(weather_desc)
+            q = q.limit(limit)
 
-            # --- 混雑 ---
-            try:
-                cong = get_congestion_info(db=db, spot_id=spot.id, visit_date=d)
-                congestion_status = cong.get("status", "比較的穏やかでしょう")
-                congestion_count = int(cong.get("count", 0))
-            except Exception:
-                # 失敗時は中間値で継続
-                congestion_status = "比較的穏やかでしょう"
-                congestion_count = 0
+            out: List[Dict[str, Any]] = []
+            for s in q.all():
+                out.append(
+                    {
+                        "id": getattr(s, "id"),
+                        "official_name": getattr(s, "official_name", None),
+                        "description": getattr(s, "description", None),
+                        "lat": getattr(s, "lat", None),
+                        "lon": getattr(s, "lon", None),
+                        "tags": getattr(s, "tags", None),
+                        "category": getattr(s, "category", None),
+                    }
+                )
+            return out
 
-            congestion_score = _score_congestion(congestion_status)
+    def get_spot_details(self, spot_id: int | str) -> Optional[Dict[str, Any]]:
+        from shared.app.database import SessionLocal
+        from shared.app.models import Spot  # type: ignore[attr-defined]
 
-            per_day[d_str] = {
-                "weather": weather_desc,
-                "weather_score": weather_score,
-                "weather_note": weather_note,
-                "congestion": congestion_status,
-                "congestion_count": congestion_count,
-                "congestion_score": congestion_score,
-                "total_score": weather_score + congestion_score,
+        with SessionLocal() as db:
+            s = db.query(Spot).get(spot_id)  # type: ignore[arg-type]
+            if not s:
+                return None
+            return {
+                "id": getattr(s, "id"),
+                "official_name": getattr(s, "official_name", None),
+                "description": getattr(s, "description", None),
+                "lat": getattr(s, "lat", None),
+                "lon": getattr(s, "lon", None),
+                "tags": getattr(s, "tags", None),
+                "category": getattr(s, "category", None),
+                "address": getattr(s, "address", None),
+                "url": getattr(s, "url", None),
             }
 
-        # C) 最適日の決定
-        best_key = None
-        best_total = -1
-        for k, v in per_day.items():
-            if v["total_score"] > best_total:
-                best_total = v["total_score"]
-                best_key = k
+    # -----------------------
+    # ナッジ（最適日算出）
+    # -----------------------
+    def find_best_day_and_gather_nudge_data(
+        self,
+        *,
+        spot_ids: List[int],
+        start_date: date,
+        end_date: date,
+        origin_lat: Optional[float] = None,
+        origin_lon: Optional[float] = None,
+        lang: str = "ja",
+        units: str = "metric",
+    ) -> Dict[str, Any]:
+        """
+        指定スポット群に対して、距離/所要時間・天気・混雑を日毎に集計し、合計スコア最大の日=ベスト日を返す。
+        戻り値には日別の詳細（距離・時間・天気・混雑・各スコア）も含める。
+        """
+        # 遅延インポート
+        from shared.app.database import SessionLocal
+        from shared.app.models import Spot  # type: ignore[attr-defined]
 
-        # 返却整形
-        if best_key is None:
-            # すべて失敗した場合のフォールバック
-            best_key = start_date.strftime("%Y-%m-%d")
+        # スポットを取得
+        with SessionLocal() as db:
+            spots: List[Any] = (
+                db.query(Spot)
+                .filter(Spot.id.in_(spot_ids))  # type: ignore[attr-defined]
+                .all()
+            )
 
-        best_day_obj = per_day[best_key]
+        if not spots:
+            return {
+                "best_date": None,
+                "days": [],
+                "reason": "no_spots",
+            }
 
-        results[spot.id] = {
-            "best_date": best_key,
-            "distance_km": distance_km,
-            "duration_min": duration_min,
-            "weather_on_best_date": best_day_obj["weather"],
-            "congestion_on_best_date": best_day_obj["congestion"],
-            "congestion_count_on_best_date": best_day_obj["congestion_count"],
-            "per_day": per_day,  # UI 側で比較表示したい場合に利用可
-        }
+        # 出発点：未指定なら 1件目の座標
+        if origin_lat is None or origin_lon is None:
+            first = spots[0]
+            origin_lat = getattr(first, "lat", None)
+            origin_lon = getattr(first, "lon", None)
 
-    return results
+        # 山岳かどうか（どれか一つでも山タグなら山岳扱い）
+        any_mountain = any(_is_mountain_spot(s) for s in spots)
+
+        # 日ごとの指標入れ物
+        day_rows: List[Dict[str, Any]] = []
+
+        # まずルーティング評価のために距離/所要時間の基準（正規化用 max）を求める
+        # 全日ではなく “代表1日” で近似し、スポットの総移動距離・時間の上限を計算
+        rep_date = start_date
+        rep_distance_km, rep_duration_min = self._estimate_trip_distance_duration(
+            spots=spots, origin_lat=origin_lat, origin_lon=origin_lon, date_hint=rep_date
+        )
+        max_distance_km = max(rep_distance_km, 1.0)
+        max_duration_min = max(rep_duration_min, 1.0)
+
+        for d in _daterange_inclusive(start_date, end_date):
+            # 1) ルーティング
+            distance_km, duration_min = self._estimate_trip_distance_duration(
+                spots=spots, origin_lat=origin_lat, origin_lon=origin_lon, date_hint=d
+            )
+            dist_score = _normalize_distance_km(distance_km, max_distance_km)
+            dur_score = _normalize_duration_min(duration_min, max_duration_min)
+
+            # 2) 天気
+            if any_mountain:
+                # 鳥海山のページ情報（サイトが日毎情報を返す想定）
+                w = get_tenkijp_chokai_daily(user_agent=None, timeout=10.0)
+                # 返却が日毎なら該当日のものへフォーカス、なければ代表値
+                weather = _pick_weather_for_date(w, d)
+            else:
+                # 一般地点：代表として最初のスポット座標を使用
+                lat0 = getattr(spots[0], "lat", None)
+                lon0 = getattr(spots[0], "lon", None)
+                weather = get_point_forecast(
+                    lat=lat0, lon=lon0, lang=lang, units=units, extra_params={}
+                )
+                weather = _pick_weather_for_date(weather, d)
+
+            weather_score = _score_weather(weather or {})
+
+            # 3) 混雑
+            congestion_level = self._get_congestion_level(d, spots)
+            congestion_score = _score_congestion(congestion_level)
+
+            # 総合スコア（各要素に重みを設定：天気0.5、混雑0.2、距離0.15、時間0.15）
+            total = (
+                0.50 * weather_score
+                + 0.20 * congestion_score
+                + 0.15 * dist_score
+                + 0.15 * dur_score
+            )
+
+            day_rows.append(
+                {
+                    "date": d.isoformat(),
+                    "distance_km": distance_km,
+                    "duration_min": duration_min,
+                    "distance_score": dist_score,
+                    "duration_score": dur_score,
+                    "weather": weather,
+                    "weather_score": weather_score,
+                    "congestion_level": congestion_level,
+                    "congestion_score": congestion_score,
+                    "total_score": total,
+                }
+            )
+
+        # ベスト日を決定
+        if not day_rows:
+            return {"best_date": None, "days": []}
+        best = max(day_rows, key=lambda r: r["total_score"])
+        return {"best_date": best["date"], "days": day_rows, "best": best}
+
+    # -----------------------
+    # 内部：距離/所要時間の推定
+    # -----------------------
+    def _estimate_trip_distance_duration(
+        self,
+        *,
+        spots: List[Any],
+        origin_lat: float,
+        origin_lon: float,
+        date_hint: date,
+    ) -> Tuple[float, float]:
+        """
+        ルーティングサービスがあれば優先的に使い、無ければハバースィン距離＋簡易歩行速度で代替。
+        返り値: (総距離km, 総時間分)
+        """
+        # 遅延インポート（存在しないケースでも import 時に落とさない）
+        routing = None
+        try:
+            from worker.app.services.routing.routing_service import RoutingService  # type: ignore
+            routing = RoutingService()
+        except Exception:
+            try:
+                from worker.app.services.routing import RoutingService  # type: ignore
+                routing = RoutingService()
+            except Exception:
+                routing = None
+
+        # 経由順序：単純に origin → spot1 → spot2 → … の順、成功すれば各辺の距離/時間合計
+        waypoints = [(origin_lat, origin_lon)] + [
+            (getattr(s, "lat", None), getattr(s, "lon", None)) for s in spots
+        ]
+
+        total_km = 0.0
+        total_min = 0.0
+
+        if routing is not None:
+            # ルーティング API 仕様に幅を持たせる（存在するメソッドへフォールバック）
+            def _first_callable(obj, names: List[str]):
+                for nm in names:
+                    fn = getattr(obj, nm, None)
+                    if callable(fn):
+                        return fn
+                return None
+
+            # 1セグメントずつ問い合わせ
+            for (lat1, lon1), (lat2, lon2) in zip(waypoints[:-1], waypoints[1:]):
+                if None in (lat1, lon1, lat2, lon2):
+                    continue
+                # 候補メソッド
+                fn = _first_callable(
+                    routing,
+                    [
+                        "estimate_route",         # (lat1,lon1,lat2,lon2)-> {distance_km, duration_min}
+                        "route",                  # 返却に distance_m, duration_s が含まれる等
+                        "get_route",
+                        "compute_route",
+                    ],
+                )
+                seg_km, seg_min = None, None
+                if fn:
+                    try:
+                        resp = fn(lat1, lon1, lat2, lon2)
+                        # 返却形に幅を持たせて読み取る
+                        if isinstance(resp, dict):
+                            if "distance_km" in resp and "duration_min" in resp:
+                                seg_km = float(resp["distance_km"])
+                                seg_min = float(resp["duration_min"])
+                            elif "distance_m" in resp and "duration_s" in resp:
+                                seg_km = float(resp["distance_m"]) / 1000.0
+                                seg_min = float(resp["duration_s"]) / 60.0
+                    except Exception:
+                        seg_km, seg_min = None, None
+
+                if seg_km is None or seg_min is None:
+                    # ルーティングが無い/読めないときはハバースィン＋簡易速度（徒歩4.5km/h）
+                    seg_km = _haversine_km(lat1, lon1, lat2, lon2)
+                    seg_min = (seg_km / 4.5) * 60.0
+
+                total_km += seg_km
+                total_min += seg_min
+
+            return total_km, total_min
+
+        # ルーティングサービスが無い場合のフォールバック（ハバースィン＋徒歩）
+        for (lat1, lon1), (lat2, lon2) in zip(waypoints[:-1], waypoints[1:]):
+            if None in (lat1, lon1, lat2, lon2):
+                continue
+            seg_km = _haversine_km(lat1, lon1, lat2, lon2)
+            seg_min = (seg_km / 4.5) * 60.0
+            total_km += seg_km
+            total_min += seg_min
+
+        return total_km, total_min
+
+    # -----------------------
+    # 内部：混雑レベル取得
+    # -----------------------
+    def _get_congestion_level(self, day: date, spots: List[Any]) -> str:
+        """
+        Itinerary Service から混雑推定を取得できれば利用。
+        無い場合は 'unknown'。
+        """
+        # 遅延インポート候補を複数試す
+        svc = None
+        candidates = [
+            "worker.app.services.itinerary.service",
+            "worker.app.services.itinerary.itinerary_service",
+            "worker.app.services.itinerary",
+        ]
+        for mod_name in candidates:
+            try:
+                mod = __import__(mod_name, fromlist=["*"])
+                svc = getattr(mod, "ItineraryService", None)
+                if svc:
+                    break
+                # 関数群で提供される場合（例：get_congestion_level）
+                fn = getattr(mod, "get_congestion_level", None)
+                if callable(fn):
+                    # スポットID配列で問い合わせできるシンプルAPIを想定
+                    spot_ids = [getattr(s, "id", None) for s in spots if getattr(s, "id", None)]
+                    level = fn(day, spot_ids)  # type: ignore
+                    return str(level or "unknown")
+            except Exception:
+                continue
+
+        if svc:
+            try:
+                service = svc()
+                # API 仕様に幅を持たせる
+                if hasattr(service, "get_congestion_level_for_spots"):
+                    spot_ids = [getattr(s, "id", None) for s in spots if getattr(s, "id", None)]
+                    level = service.get_congestion_level_for_spots(day, spot_ids)  # type: ignore
+                    return str(level or "unknown")
+                if hasattr(service, "get_congestion_level"):
+                    level = service.get_congestion_level(day)  # type: ignore
+                    return str(level or "unknown")
+            except Exception:
+                pass
+
+        return "unknown"
+
+
+# ============ ユーティリティ（天気日付抽出） ============
+
+def _pick_weather_for_date(weather_payload: Dict[str, Any] | None, d: date) -> Dict[str, Any]:
+    """
+    API/スクレイパの返却から日付 d に対応する要素を抽出する。
+    フォーマット差を吸収するため、次の優先で探索：
+      - payload["daily"] に日次配列があり、各要素に "date" がある
+      - payload["days"] に配列がある
+      - payload["forecast"] に配列がある
+      - いずれも無ければ payload 自体を返す
+    """
+    if not weather_payload:
+        return {}
+
+    iso = d.isoformat()
+
+    def _match(items: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        for it in items:
+            dt = it.get("date") or it.get("dt") or it.get("time") or it.get("valid_date")
+            if isinstance(dt, str) and dt[:10] == iso:
+                return it
+        return None
+
+    for key in ("daily", "days", "forecast"):
+        arr = weather_payload.get(key)
+        if isinstance(arr, list) and arr:
+            hit = _match(arr)
+            if hit:
+                return hit
+
+    # 無ければ代表（最初）かそのまま
+    for key in ("daily", "days", "forecast"):
+        arr = weather_payload.get(key)
+        if isinstance(arr, list) and arr:
+            return arr[0]
+
+    return weather_payload
+
+
+# 便利に使えるデフォルトインスタンス
+information_service = InformationService()

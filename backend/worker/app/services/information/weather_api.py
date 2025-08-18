@@ -1,68 +1,172 @@
-# backend/worker/app/services/information/weather_api.py
-# 天気 API 取得（山麓用 or フォールバック用）
-# ここでは無償の Open-Meteo API を利用（APIキー不要）
+# worker/app/services/information/weather_api.py
 from __future__ import annotations
-from typing import Dict, Any, Optional
+
+import datetime as _dt
+from typing import Dict, Any, Optional, Tuple
+import os
+
 import requests
 
-# Open-Meteo の weathercode を日本語/簡体字/英語へ粗くマップ
-WEATHER_CODE_MAP_JA = {
-    0: "快晴", 1: "晴れ", 2: "晴れ時々曇り", 3: "曇り",
-    45: "霧", 48: "霧氷", 51: "霧雨(弱)", 53: "霧雨(中)", 55: "霧雨(強)",
-    61: "雨(弱)", 63: "雨(中)", 65: "雨(強)", 66: "着氷性の霧雨", 67: "着氷性の雨",
-    71: "雪(弱)", 73: "雪(中)", 75: "雪(強)",
-    80: "にわか雨(弱)", 81: "にわか雨(中)", 82: "にわか雨(強)",
-    95: "雷雨", 96: "雹を伴う雷雨(弱)", 97: "雹を伴う雷雨(強)"
+
+# --- Open-Meteo weathercode -> Japanese description ---
+_WEATHERCODE_JA: Dict[int, str] = {
+    0: "快晴",
+    1: "晴れ",
+    2: "晴れ時々くもり",
+    3: "くもり",
+    45: "霧",
+    48: "霧（霧氷）",
+    51: "霧雨（弱い）",
+    53: "霧雨（並）",
+    55: "霧雨（強い）",
+    56: "着氷性の霧雨（弱い）",
+    57: "着氷性の霧雨（強い）",
+    61: "雨（弱い）",
+    63: "雨（並）",
+    65: "雨（強い）",
+    66: "着氷性の雨（弱い）",
+    67: "着氷性の雨（強い）",
+    71: "雪（弱い）",
+    73: "雪（並）",
+    75: "雪（強い）",
+    77: "雪あられ",
+    80: "にわか雨（弱い）",
+    81: "にわか雨（並）",
+    82: "にわか雨（激しい）",
+    85: "にわか雪（弱い）",
+    86: "にわか雪（強い）",
+    95: "雷雨（弱い〜並）",
+    96: "雷雨（ひょうを伴う可能性：弱い）",
+    99: "雷雨（ひょうを伴う可能性：強い）",
 }
-WEATHER_CODE_MAP_EN = {
-    0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-    45: "Fog", 48: "Depositing rime fog", 51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
-    61: "Light rain", 63: "Moderate rain", 65: "Heavy rain", 66: "Freezing drizzle", 67: "Freezing rain",
-    71: "Light snow", 73: "Moderate snow", 75: "Heavy snow",
-    80: "Light showers", 81: "Moderate showers", 82: "Heavy showers",
-    95: "Thunderstorm", 96: "Thunderstorm with slight hail", 97: "Thunderstorm with heavy hail"
-}
-WEATHER_CODE_MAP_ZH = {
-    0: "晴", 1: "多云", 2: "间多云", 3: "阴",
-    45: "雾", 48: "霜雾", 51: "小毛雨", 53: "中毛雨", 55: "大毛雨",
-    61: "小雨", 63: "中雨", 65: "大雨", 66: "冻毛雨", 67: "冻雨",
-    71: "小雪", 73: "中雪", 75: "大雪",
-    80: "阵雨(小)", 81: "阵雨(中)", 82: "阵雨(大)",
-    95: "雷阵雨", 96: "雷阵雨伴小冰雹", 97: "雷阵雨伴大冰雹"
-}
 
-def _code_to_text(code: int, lang: str) -> str:
-    if lang == "ja":
-        return WEATHER_CODE_MAP_JA.get(code, "不明")
-    if lang == "zh":
-        return WEATHER_CODE_MAP_ZH.get(code, "未知")
-    return WEATHER_CODE_MAP_EN.get(code, "Unknown")
 
-class WeatherAPI:
-    """Open-Meteo を使って緯度経度のデイリー天気（天気コード）を取得する"""
+def weathercode_to_text_ja(code: Optional[int]) -> str:
+    """Open-Meteo の weathercode を日本語の天気概況に変換。"""
+    if code is None:
+        return "天気不明"
+    try:
+        return _WEATHERCODE_JA.get(int(code), f"天気コード{code}")
+    except Exception:
+        return "天気不明"
 
-    BASE_URL = "https://api.open-meteo.com/v1/forecast"
 
-    def get_daily_weather(self, lat: float, lon: float, target_date: str, lang: str = "ja") -> Dict[str, str]:
+class OpenMeteoClient:
+    """
+    超軽量の Open-Meteo クライアント。
+    - ネットワークアクセスは実行時のみ（import 時には外部接続しない）
+    - 既定タイムゾーンは Asia/Tokyo（環境変数 OPEN_METEO_TZ で変更可）
+    """
+
+    def __init__(self, base_url: str | None = None, timeout: float = 8.0):
+        self.base_url = base_url or os.getenv(
+            "OPEN_METEO_BASE",
+            "https://api.open-meteo.com/v1/forecast",
+        )
+        self.timeout = timeout
+        self.tz = os.getenv("OPEN_METEO_TZ", "Asia/Tokyo")
+
+    def _request(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        resp = requests.get(self.base_url, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_daily(
+        self,
+        lat: float,
+        lon: float,
+        start: _dt.date,
+        end: _dt.date,
+    ) -> Dict[str, Any]:
         """
-        :param target_date: "YYYY-MM-DD"
-        :return: {"date": target_date, "condition": "晴れ", "source": "open-meteo"}
+        指定期間のデイリー統計（weathercode, tmax, tmin, precipitation_sum）を取得。
         """
         params = {
             "latitude": lat,
             "longitude": lon,
-            "daily": "weathercode",
-            "timezone": "Asia/Tokyo",
-            "start_date": target_date,
-            "end_date": target_date,
+            "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum",
+            "timezone": self.tz,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
         }
-        r = requests.get(self.BASE_URL, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        return self._request(params)
 
+
+def _pick_daily_for_date(
+    payload: Dict[str, Any],
+    target: _dt.date,
+) -> Optional[Tuple[Optional[int], Optional[float], Optional[float], Optional[float]]]:
+    """
+    Open-Meteo の daily.* から target 日の
+    (weathercode, tmax, tmin, precip) を取り出す。
+    """
+    daily = payload.get("daily") or {}
+    dates = daily.get("time") or []
+    try:
+        idx = dates.index(target.isoformat())
+    except ValueError:
+        return None
+
+    def _pick(key: str):
+        arr = daily.get(key) or []
+        return arr[idx] if idx < len(arr) else None
+
+    wcode = _pick("weathercode")
+    tmax = _pick("temperature_2m_max")
+    tmin = _pick("temperature_2m_min")
+    precip = _pick("precipitation_sum")
+    return (
+        int(wcode) if wcode is not None else None,
+        float(tmax) if tmax is not None else None,
+        float(tmin) if tmin is not None else None,
+        float(precip) if precip is not None else None,
+    )
+
+
+def get_point_forecast(lat: float, lon: float, date: _dt.date | str) -> str:
+    """
+    緯度・経度・日付から日本語の1日予報テキストを返す公開関数。
+
+    information_service.py から呼ばれる前提のため：
+      - 例外は外に投げず、失敗時は日本語メッセージの文字列を返す
+      - 短い説明文（天気＋気温＋降水量）に整形する
+    """
+    # date は str（"YYYY-MM-DD" など）でも受け付ける
+    if isinstance(date, str):
         try:
-            code = data["daily"]["weathercode"][0]
-        except Exception:
-            return {"date": target_date, "condition": "不明", "source": "open-meteo"}
+            date = _dt.date.fromisoformat(date)
+        except ValueError:
+            # "YYYY/MM/DD" にも配慮
+            date = _dt.datetime.strptime(date, "%Y/%m/%d").date()
 
-        return {"date": target_date, "condition": _code_to_text(int(code), lang), "source": "open-meteo"}
+    client = OpenMeteoClient()
+    try:
+        payload = client.get_daily(lat, lon, date, date)
+        picked = _pick_daily_for_date(payload, date)
+        if not picked:
+            return "予報データが見つかりませんでした。"
+
+        wcode, tmax, tmin, precip = picked
+        desc = weathercode_to_text_ja(wcode)
+
+        def fmt(v: Optional[float], unit: str) -> str:
+            return f"{round(v, 1):.1f}{unit}" if v is not None else f"—{unit}"
+
+        tmax_s = fmt(tmax, "℃")
+        tmin_s = fmt(tmin, "℃")
+        precip_s = fmt(precip, "mm")
+
+        # 例: "晴れ。最高25.3℃ / 最低16.8℃。降水量は1.4mmの見込み。"
+        return f"{desc}。最高{tmax_s} / 最低{tmin_s}。降水量は{precip_s}の見込み。"
+
+    except Exception as e:
+        # 呼び出し側で人間向けレスポンスをさらに整える前提のため、
+        # ここでは例外送出を避け、簡潔な失敗メッセージを返す
+        return f"天気情報の取得に失敗しました（{e.__class__.__name__}）。"
+
+
+__all__ = [
+    "OpenMeteoClient",
+    "weathercode_to_text_ja",
+    "get_point_forecast",
+]
