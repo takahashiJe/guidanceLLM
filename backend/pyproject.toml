@@ -47,6 +47,7 @@ pyyaml = "^6.0.1"
 pydub = "^0.25.1"
 numpy = "^1.26.4"
 torch = "^2.3.0"  # 必要に応じてCPU/GPU版を環境で切替
+faster-whisper = "^1.0.0"  # 追加：軽量・高速なWhisper実装（CTranslate2ベース）
 
 # --- Information Services ---
 requests = "^2.31.0"

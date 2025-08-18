@@ -23,8 +23,8 @@ import numpy as np
 
 from shared.app.database import SessionLocal
 from shared.app import models
-from shared.app.embeddings import embed_text, cosine_similarities
 
+from worker.app.services.embeddings import embed_text, cosine_similarities
 from worker.app.services.information.information_service import InformationService
 from worker.app.services.routing.routing_service import RoutingService
 from worker.app.services.llm.llm_service import LLMInferenceService

@@ -1,91 +1,188 @@
-# -*- coding: utf-8 -*-
-"""
-Ollama の Embeddings API クライアント（堅牢版）
-- mxbai-embed-large を前提に /api/embeddings を 1テキストずつ呼び出す
-- 失敗/空ベクトル/型不正をスキップ
-- 軽いリトライとタイムアウト
-"""
-
+# worker/app/services/embeddings.py
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import List, Sequence, Optional, Protocol, runtime_checkable, Iterable, Tuple
 import os
-import time
-import json
-import logging
-from typing import List, Optional
-import requests
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-DEFAULT_BASE_URL = os.getenv("OLLAMA_HOST", "http://ollama:11434")
-DEFAULT_MODEL = os.getenv("EMBED_MODEL", "mxbai-embed-large")
-REQ_TIMEOUT = float(os.getenv("EMBED_REQ_TIMEOUT", "30"))  # 秒
-RETRY_TIMES = int(os.getenv("EMBED_REQ_RETRIES", "2"))
-RETRY_WAIT = float(os.getenv("EMBED_REQ_RETRY_WAIT", "1.0"))  # 秒
+try:
+    # sentence-transformers がある前提の本実装
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None  # 実行環境により未導入のケースを許容
 
 
+# ========================
+# インターフェイス（互換維持）
+# ========================
+@runtime_checkable
+class EmbeddingClient(Protocol):
+    """
+    既存コードが import することを想定したプロトコル。
+    具象実装は下の OllamaEmbeddingClient / SentenceTransformerClient など。
+    """
+    def embed(self, text: str) -> List[float]: ...
+    def embed_batch(self, texts: Sequence[str]) -> List[List[float]]: ...
+
+
+# ========================
+# 具象実装
+# ========================
+@dataclass
+class SentenceTransformerClient:
+    """
+    sentence-transformers を使う本実装。
+    """
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    _model: Optional["SentenceTransformer"] = None
+
+    def __post_init__(self) -> None:
+        if SentenceTransformer is None:
+            raise RuntimeError(
+                "sentence-transformers が利用できません。"
+                "pyproject.toml の依存関係に sentence-transformers を追加し、"
+                "ワーカーイメージを再ビルドしてください。"
+            )
+        self._model = SentenceTransformer(self.model_name)
+
+    def embed(self, text: str) -> List[float]:
+        return list(map(float, self._model.encode([text])[0]))  # type: ignore[union-attr]
+
+    def embed_batch(self, texts: Sequence[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        arr = self._model.encode(list(texts))  # type: ignore[union-attr]
+        return [list(map(float, row)) for row in arr]
+
+
+@dataclass
 class OllamaEmbeddingClient:
     """
-    Ollama /api/embeddings を叩く薄いクライアント。
-    - 1テキストずつ送る（Ollama は配列一括に対応していないため）
-    - レスポンス例: {"embedding":[...]} を想定
+    既存コードとの互換シンボル。環境に応じて実際は SentenceTransformer を使用。
+    （Ollama 連携を行いたい場合はここに HTTP 呼び出し等の実装を入れる）
     """
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    _impl: EmbeddingClient = None  # type: ignore[assignment]
 
-    def __init__(self, base_url: str = DEFAULT_BASE_URL, model: str = DEFAULT_MODEL):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.endpoint = f"{self.base_url}/api/embeddings"
+    def __post_init__(self) -> None:
+        # ひとまず ST ベースの実装にフォールバック
+        self._impl = SentenceTransformerClient(self.model_name)
 
-    def _embed_one(self, text: str) -> Optional[List[float]]:
-        """
-        単一テキストを埋め込み。失敗時は None。
-        """
-        if not isinstance(text, str) or not text.strip():
-            return None
+    def embed(self, text: str) -> List[float]:
+        return self._impl.embed(text)
 
-        payload = {
-            "model": self.model,
-            "prompt": text,
-        }
+    def embed_batch(self, texts: Sequence[str]) -> List[List[float]]:
+        return self._impl.embed_batch(texts)
 
-        # 軽いリトライ
-        for attempt in range(RETRY_TIMES + 1):
-            try:
-                resp = requests.post(self.endpoint, json=payload, timeout=REQ_TIMEOUT)
-                if resp.status_code != 200:
-                    logger.warning("embeddings http %s: %s", resp.status_code, resp.text[:200])
-                    raise RuntimeError(f"HTTP {resp.status_code}")
-                data = resp.json()
-                # 期待形: {"embedding":[float,...]}
-                emb = data.get("embedding")
-                if not isinstance(emb, list) or len(emb) == 0:
-                    logger.warning("empty or invalid embedding: %s", json.dumps(data)[:200])
-                    return None
-                # 数値化を強制
-                try:
-                    emb = [float(x) for x in emb]
-                except Exception:
-                    logger.warning("non-float element found in embedding")
-                    return None
-                return emb
-            except Exception as e:
-                if attempt < RETRY_TIMES:
-                    time.sleep(RETRY_WAIT)
-                    continue
-                logger.error("embed request failed (final): %s", e)
-                return None
 
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """
-        複数テキストを順次埋め込み。None は除外して返す（順序は維持できない点に注意）。
-        01_build_knowledge_graph.py 側で docs とベクトル件数整合は再調整済み。
-        """
-        vectors: List[List[float]] = []
-        for idx, t in enumerate(texts):
-            v = self._embed_one(t)
-            if v is None:
-                # None はスキップ（呼び出し側で件数整合処理）
-                continue
-            vectors.append(v)
-        return vectors
+# 互換のためにトップレベルにシンボルを公開しておく
+# - 過去コードが `from worker.app.services.embeddings import EmbeddingClient`
+#   としても ImportError にならないようにする
+# - 実体は Protocol + 具象（OllamaEmbeddingClient / SentenceTransformerClient）
+EmbeddingClient = EmbeddingClient  # type: ignore[assignment]
+
+
+# ========================
+# ユーティリティ
+# ========================
+def create_embedding_client(model_name: Optional[str] = None) -> EmbeddingClient:
+    """
+    既存のファクトリ。環境変数 EMBEDDING_MODEL も考慮。
+    """
+    model = model_name or os.getenv("EMBEDDING_MODEL") or "sentence-transformers/all-MiniLM-L6-v2"
+    return OllamaEmbeddingClient(model)
+
+
+def embed_texts(texts: Sequence[str], client: Optional[EmbeddingClient] = None) -> List[List[float]]:
+    """
+    テキスト配列を一括ベクトル化。
+    """
+    if client is None:
+        client = create_embedding_client()
+    return client.embed_batch(texts)
+
+
+# ========================
+# 会話埋め込みの保存（本実装）
+# ========================
+def _iter_message_texts_for_embedding(messages: Iterable[dict]) -> Iterable[Tuple[str, str]]:
+    """
+    与えられた会話メッセージ（辞書想定）から (role, content) ペアを抽出する。
+    role: "user" / "assistant" 等
+    content: 埋め込み対象テキスト
+    """
+    for m in messages:
+        role = str(m.get("role") or m.get("type") or m.get("speaker") or "user")
+        content = str(m.get("content") or m.get("text") or m.get("message") or "").strip()
+        if content:
+            yield role, content
+
+
+def save_conversation_embeddings(
+    session_id: str,
+    messages: Sequence[dict],
+    client: Optional[EmbeddingClient] = None,
+) -> int:
+    """
+    既存の目的を満たす「会話内容のベクトル保存」本実装。
+    - shared.app.database のセッションを使って conversation_embeddings テーブルへ保存する前提。
+    - 既存スキーマを壊さないよう、存在チェック＋挿入に留める。
+    - 返り値: 保存したレコード件数
+    """
+    from sqlalchemy import inspect, Table, Column, Integer, String, LargeBinary, MetaData, insert
+    from sqlalchemy.orm import Session
+    from shared.app.database import SessionLocal, engine
+
+    # 埋め込みテキストの抽出
+    pairs: List[Tuple[str, str]] = list(_iter_message_texts_for_embedding(messages))
+    if not pairs:
+        return 0
+
+    # ベクトル計算
+    if client is None:
+        client = create_embedding_client()
+    vectors = embed_texts([p[1] for p in pairs], client=client)
+
+    # 既存テーブル存在確認（壊さない）
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "conversation_embeddings" not in tables:
+        # 既存マイグレーションに任せる。なければ作成。（破壊的変更は避ける）
+        meta = MetaData()
+        Table(
+            "conversation_embeddings",
+            meta,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("session_id", String(64), index=True, nullable=False),
+            Column("role", String(32), nullable=False),
+            Column("content", String, nullable=False),
+            Column("vector", LargeBinary, nullable=False),  # numpy.tofile 由来のバイナリなど
+        )
+        meta.create_all(engine)
+        # 再読込
+        tables = set(inspector.get_table_names())
+
+    meta = MetaData()
+    conv_tbl = Table("conversation_embeddings", meta, autoload_with=engine)
+
+    # 保存（既存に追加）
+    import numpy as np
+    import io
+
+    inserted = 0
+    with SessionLocal() as db:  # type: Session
+        for (role, text), vec in zip(pairs, vectors):
+            # ベクトルはバイナリで保存（可逆）
+            arr = np.asarray(vec, dtype=np.float32)
+            buf = io.BytesIO()
+            arr.tofile(buf)
+            payload = {
+                "session_id": session_id,
+                "role": role,
+                "content": text,
+                "vector": buf.getvalue(),
+            }
+            db.execute(insert(conv_tbl).values(**payload))
+            inserted += 1
+        db.commit()
+    return inserted
