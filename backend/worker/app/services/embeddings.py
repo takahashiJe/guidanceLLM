@@ -42,7 +42,38 @@ from sqlalchemy.orm import Session
 from shared.app.database import SessionLocal
 from shared.app import models
 
+try:
+    # LangChain の OllamaEmbeddings を利用（pip: langchain-community）
+    from langchain_community.embeddings import OllamaEmbeddings
+except Exception as e:
+    OllamaEmbeddings = None  # 実行時に検出して明示的にエラーを出す
+
 logger = logging.getLogger(__name__)
+
+class _OllamaEmbeddingFunction:
+    """
+    Ollama の埋め込みモデル(mxbai-embed-large)をラップする軽量アダプタ。
+    ConversationEmbedder からは __call__ / embed_query / embed_documents いずれで呼ばれてもOK。
+    """
+    def __init__(self, model_name: str, base_url: Optional[str] = None, **kwargs):
+        if OllamaEmbeddings is None:
+            raise RuntimeError(
+                "langchain-community が見つかりません。`pip install langchain-community` を実行してください。"
+            )
+        # base_url は OLLAMA_BASE_URL（例: http://ollama:11434）を使用
+        self._emb = OllamaEmbeddings(model=model_name, base_url=base_url, **kwargs)
+
+    def __call__(self, text: str) -> List[float]:
+        # 単一クエリの埋め込み
+        return self._emb.embed_query(text)
+
+    def embed_query(self, text: str) -> List[float]:
+        # LangChain 準拠インターフェース
+        return self._emb.embed_query(text)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # 複数ドキュメントの埋め込み
+        return self._emb.embed_documents(texts)
 
 
 # ============================================================
@@ -537,11 +568,29 @@ class Embeddings:
     ) -> None:
         # ConversationEmbedder は同一モジュール内の実装を想定
         # （なければ from worker.app.services.embeddings import ConversationEmbedder で import する）
-        self._inner = ConversationEmbedder(
-            model_name=model_name,
-            device=device,
-            default_lang=default_lang,
-        )
+        model_name = os.getenv("EMBEDDING_MODEL", "mxbai-embed-large")
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+        # ---- 埋め込み関数（アダプタ）を構築 ----
+        # 必要に応じて kwargs で追加設定（例: timeout など）を渡せる拡張点
+        self._embedding_fn = _OllamaEmbeddingFunction(model_name=model_name, base_url=base_url)
+
+        # ---- 埋め込みベクトルの次元数を既知値で保持（mxbai-embed-large = 1024 次元）----
+        # 既に self.embedding_dim を使っている実装がある場合はそれを上書きしないように注意。
+        # 未定義なら設定する、の方が安全。
+        if not hasattr(self, "embedding_dim") or self.embedding_dim is None:
+            self.embedding_dim = 1024
+
+        # ---- ConversationEmbedder を初期化 ----
+        # ※ ここで 'model_name' を渡さないことが今回の修正の肝
+        #    ConversationEmbedder は `embedding_function` を呼び出してベクトルを取得する実装である想定
+        self._inner = ConversationEmbedder(embedding_function=self._embedding_fn)
+        # もし既存コードで「Embeddings」レベルのショートカットを提供しているなら温存
+        # 例: self.embed_text = lambda text: self._embedding_fn.embed_query(text)
+        if not hasattr(self, "embed_text") or not callable(getattr(self, "embed_text")):
+            self.embed_text = lambda text: self._embedding_fn.embed_query(text)
+
+        if not hasattr(self, "embed_documents") or not callable(getattr(self, "embed_documents")):
+            self.embed_documents = lambda texts: self._embedding_fn.embed_documents(texts)
         # 大量ドキュメント時のメモリ圧迫回避のための逐次処理サイズ
         self._chunk_size = max(1, int(chunk_size))
 
