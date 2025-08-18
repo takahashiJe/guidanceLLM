@@ -216,7 +216,7 @@ services:
       VECTORSTORE_BASE_DIR: "/app/backend/worker/app/data/vectorstore"
       CHROMA_TELEMETRY_DISABLED: "1"
     command: >
-      bash -lc "python /app/backend/scripts/01_build_knowledge_graph.py"
+      bash -lc "pip install langchain-community && python /app/backend/scripts/01_build_knowledge_graph.py"
     depends_on:
       db:
         condition: service_healthy

@@ -86,7 +86,7 @@ class OllamaEmbeddingClient:
         self,
         model: Optional[str] = None,
         host: Optional[str] = None,
-        timeout: Optional[int] = None,
+        timeout: Optional[int] = None
     ) -> None:
         self.model = model or os.getenv("EMBEDDING_MODEL", "mxbai-embed-large")
         self.host = (host or os.getenv("OLLAMA_HOST") or "http://ollama:11434").rstrip("/")
@@ -391,6 +391,7 @@ class ConversationEmbedder:
 
     def __init__(
         self,
+        lang: str,
         client: Optional["EmbeddingClient"] = None,
         embedding_version: Optional[str] = None,
         db_factory=SessionLocal,
@@ -559,40 +560,36 @@ class Embeddings:
     - モデル名・次元数の参照も提供する。
     """
 
-    def __init__(
-        self,
-        model_name: Optional[str] = None,
-        device: str = "cpu",
-        default_lang: Optional[str] = None,
-        chunk_size: int = 128,
-    ) -> None:
-        # ConversationEmbedder は同一モジュール内の実装を想定
-        # （なければ from worker.app.services.embeddings import ConversationEmbedder で import する）
-        model_name = os.getenv("EMBEDDING_MODEL", "mxbai-embed-large")
-        base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-        # ---- 埋め込み関数（アダプタ）を構築 ----
-        # 必要に応じて kwargs で追加設定（例: timeout など）を渡せる拡張点
-        self._embedding_fn = _OllamaEmbeddingFunction(model_name=model_name, base_url=base_url)
+    def __init__(self, *args, **kwargs):
+        """
+        - Ollama の mxbai-embed-large を初期化し、ConversationEmbedder には
+          EmbeddingClient 互換の client を渡す。
+        - embedding_version にはモデル名を設定（既定: mxbai-embed-large）。
+        """
+        try:
+            # 親クラスがある場合の互換維持（なければ無視）
+            super().__init__(*args, **kwargs)
+        except Exception:
+            pass
 
-        # ---- 埋め込みベクトルの次元数を既知値で保持（mxbai-embed-large = 1024 次元）----
-        # 既に self.embedding_dim を使っている実装がある場合はそれを上書きしないように注意。
-        # 未定義なら設定する、の方が安全。
-        if not hasattr(self, "embedding_dim") or self.embedding_dim is None:
-            self.embedding_dim = 1024
+        model_name = os.getenv("EMBEDDING_MODEL", os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large"))
+        base_url   = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+        self._chunk_size = int(os.getenv("EMBEDDING_CHUNK_SIZE", 128))
 
-        # ---- ConversationEmbedder を初期化 ----
-        # ※ ここで 'model_name' を渡さないことが今回の修正の肝
-        #    ConversationEmbedder は `embedding_function` を呼び出してベクトルを取得する実装である想定
-        self._inner = ConversationEmbedder(embedding_function=self._embedding_fn)
-        # もし既存コードで「Embeddings」レベルのショートカットを提供しているなら温存
-        # 例: self.embed_text = lambda text: self._embedding_fn.embed_query(text)
-        if not hasattr(self, "embed_text") or not callable(getattr(self, "embed_text")):
-            self.embed_text = lambda text: self._embedding_fn.embed_query(text)
+        # EmbeddingClient 互換のクライアントを作成
+        client = OllamaEmbeddingClient(model=model_name)
 
-        if not hasattr(self, "embed_documents") or not callable(getattr(self, "embed_documents")):
-            self.embed_documents = lambda texts: self._embedding_fn.embed_documents(texts)
-        # 大量ドキュメント時のメモリ圧迫回避のための逐次処理サイズ
-        self._chunk_size = max(1, int(chunk_size))
+        # ConversationEmbedder へは client と embedding_version を渡すのが正
+        self._inner = ConversationEmbedder(
+            client=client,
+            embedding_version=model_name,  # 例: "mxbai-embed-large"
+        )
+
+        # 便利メソッド（既にあれば上書きしない）
+        if not hasattr(self, "embed_text"):
+            self.embed_text = lambda text: self._inner.embed_text(text)
+        if not hasattr(self, "embed_documents"):
+            self.embed_documents = lambda texts: self._inner.embed_texts(texts)
 
     @property
     def model_name(self) -> str:
