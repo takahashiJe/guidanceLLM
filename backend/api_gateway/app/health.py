@@ -7,9 +7,9 @@
 
 from fastapi import APIRouter
 
-router = APIRouter(tags=["health"])
+router = APIRouter(prefix="/health", tags=["/health"])
 
-@router.get("/health")
+@router.get("/")
 async def health() -> dict:
     # ここでは「FastAPI が起動し、ルーターが正しく登録されている」ことのみを確認する。
     # 依存コンポーネント（DB/Celery/OSRM等）の詳細チェックは別の /healthz 等で行うのが安全。

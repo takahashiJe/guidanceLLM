@@ -23,7 +23,7 @@ from celery.result import AsyncResult
 # タスク名は shared.app.tasks の定数に揃える
 from shared.app.tasks import TASK_ORCHESTRATE_CONVERSATION
 
-router = APIRouter()
+router = APIRouter(prefix="/chat")
 
 
 def _extract_optional_user_id(current_user) -> Optional[int]:

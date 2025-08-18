@@ -18,7 +18,7 @@ from api_gateway.app.security import get_current_user_optional
 from shared.app.celery_app import celery_app
 from shared.app.tasks import TASK_START_NAVIGATION, TASK_UPDATE_LOCATION
 
-router = APIRouter()
+router = APIRouter(prefix="/navigation")
 
 
 def _extract_optional_user_id(current_user) -> Optional[int]:
