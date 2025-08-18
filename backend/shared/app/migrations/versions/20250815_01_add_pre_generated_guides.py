@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql as psql
 
 # リビジョン識別子
-revision = "20250815_01_add_pre_generated_guides"
+revision = "rev_2025081501"
 down_revision = None
 branch_labels = None
 depends_on = None

@@ -412,3 +412,92 @@ def reindex_session(session_id: str, force: bool = False) -> int:
 def embeddings_health() -> Dict[str, Any]:
     """疎通確認（互換API）。"""
     return _svc().health_check()
+
+# -------------- Embeddings ファサード（RAGスクリプト互換用） --------------
+# 目的:
+# - backend/scripts/01_build_knowledge_graph.py 等の既存スクリプトが想定する
+#   `Embeddings` クラスを提供し、内部では ConversationEmbedder を用いて
+#   mxbai-embed-large による埋め込みを実行する。
+# - 会話用実装（ConversationEmbedder）をそのまま再利用しつつ、RAG の
+#   バッチ埋め込み（embed_texts）インターフェースを提供する。
+
+class Embeddings:
+    """
+    RAG 用の薄い互換ラッパ。
+    - 既存スクリプトが想定する `embed_texts(List[str]) -> List[List[float]]`
+      を提供する。
+    - 内部では ConversationEmbedder を使用して単文を逐次埋め込み（CPU）。
+    - モデル名・次元数の参照も提供する。
+    """
+
+    def __init__(
+        self,
+        model_name: Optional[str] = None,
+        device: str = "cpu",
+        default_lang: Optional[str] = None,
+        chunk_size: int = 128,
+    ) -> None:
+        # ConversationEmbedder は同一モジュール内の実装を想定
+        # （なければ from worker.app.services.embeddings import ConversationEmbedder で import する）
+        self._inner = ConversationEmbedder(
+            model_name=model_name,
+            device=device,
+            default_lang=default_lang,
+        )
+        # 大量ドキュメント時のメモリ圧迫回避のための逐次処理サイズ
+        self._chunk_size = max(1, int(chunk_size))
+
+    @property
+    def model_name(self) -> str:
+        """利用中の埋め込みモデル名を返す。"""
+        # ConversationEmbedder 側に model_name 属性がある前提。なければ既定名を返す。
+        return getattr(self._inner, "model_name", "mxbai-embed-large")
+
+    @property
+    def dim(self) -> int:
+        """埋め込みベクトルの次元数を返す（mxbai-embed-large は 1024）。"""
+        return int(getattr(self._inner, "dim", 1024))
+
+    def embed_text(self, text: str, lang: Optional[str] = None) -> List[float]:
+        """
+        単一テキストの埋め込み（ヘルパー）。RAG 側で単発呼び出しが必要な場合に備える。
+        """
+        if text is None:
+            raise ValueError("text は None にできません。")
+        t = text.strip()
+        if not t:
+            # 空文字は全ゼロベクトルを返して呼び出し側でスキップしやすくする
+            return [0.0] * self.dim
+        return self._inner.embed_text(t, lang=lang)
+
+    def embed_texts(self, texts: List[str], lang: Optional[str] = None) -> List[List[float]]:
+        """
+        複数テキストをバッチ埋め込み。
+        - 内部ではチャンクに分けて逐次 embed してメモリ使用量を抑制。
+        - 入力が None/空文字の場合はゼロベクトルを返す（スキップしやすくするための方針）。
+        """
+        if texts is None:
+            raise ValueError("texts は None にできません。")
+
+        results: List[List[float]] = []
+        dim = self.dim
+
+        def _embed_one(s: Optional[str]) -> List[float]:
+            if s is None:
+                return [0.0] * dim
+            t = s.strip()
+            if not t:
+                return [0.0] * dim
+            return self._inner.embed_text(t, lang=lang)
+
+        # チャンク逐次処理
+        n = len(texts)
+        if n == 0:
+            return results
+
+        for i in range(0, n, self._chunk_size):
+            chunk = texts[i : i + self._chunk_size]
+            for s in chunk:
+                results.append(_embed_one(s))
+
+        return results

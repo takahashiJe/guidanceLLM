@@ -173,6 +173,7 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-guidancellm}-db-init-1
     env_file:
       - .env
+    working_dir: /app
     environment:
       DATABASE_URL: "postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-guidance}"
       PYTHONPATH: "/app/backend"
@@ -183,6 +184,7 @@ services:
       INIT_LOAD_ACCESS_POINTS: "${INIT_LOAD_ACCESS_POINTS:-true}"
       INIT_BUILD_VECTORSTORE: "false"  # Vectorstoreは別サービスで実行
     volumes:
+      - .:/app
       - ./backend:/app/backend
     depends_on:
       db:
@@ -190,7 +192,7 @@ services:
     command: >
       bash -lc "
         pip install --no-cache-dir alembic &&
-        python worker/app/init_db_script.py
+        python backend/worker/app/init_db_script.py
       "
     networks: [default]
     profiles: ["*", "api", "worker"]

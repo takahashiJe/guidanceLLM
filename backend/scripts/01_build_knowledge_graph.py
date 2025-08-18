@@ -42,7 +42,7 @@ from chromadb.config import Settings
 KNOWLEDGE_ROOT = Path(
     os.getenv(
         "KNOWLEDGE_ROOT",
-        "backend/worker/app/data/knowledge",
+        "worker/app/data/knowledge",
     )
 ).resolve()
 

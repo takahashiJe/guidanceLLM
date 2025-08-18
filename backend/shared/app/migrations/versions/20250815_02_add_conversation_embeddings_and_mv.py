@@ -16,8 +16,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql as psql
 
 # リビジョン識別子
-revision = "20250815_02_add_conversation_embeddings_and_mv"
-down_revision = "20250815_01_add_pre_generated_guides"
+revision = "rev_2025081502"
+down_revision = "rev_2025081501"
 branch_labels = None
 depends_on = None
 
