@@ -1,38 +1,22 @@
-# docker-compose.prod.yml （更新版：フェーズ2）
+# docker-compose.prod.yml
+# 本番向けの上書き。コマンド/再起動方針/不要ポートの抑制など。
 services:
   api_gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
+    command: >
+      bash -lc "uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000 --log-level info"
     ports:
       - "8000:8000"
-    command: uvicorn api_gateway.app.main:app --host 0.0.0.0 --port 8000
     restart: unless-stopped
 
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
-    command: celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1
+    command: >
+      bash -lc "celery -A shared.app.celery_app.celery_app worker --loglevel=info --pool=threads --concurrency=1"
     restart: unless-stopped
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-  ollama:
-    restart: always
+  scheduler:
+    command: >
+      bash -lc "celery -A shared.app.celery_app.celery_app beat --loglevel=info"
+    restart: unless-stopped
 
-  osrm-car:
-    restart: always
-
-  osrm-foot:
-    restart: always
-
-  # 本番でも必要なら tools プロファイルで実行可能
-  db-init:
-    restart: "no"
-
-  vectorstore-init:
-    restart: "no"
+  frontend:
+    restart: unless-stopped

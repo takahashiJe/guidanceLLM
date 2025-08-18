@@ -1,5 +1,5 @@
 # docker-compose.yml
-
+# ベース定義（開発/本番共通）。起動順と依存関係、GPUの割当方針をここで統一。
 services:
   # =========================
   # 依存ミドルウェア
@@ -16,8 +16,7 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-    networks:
-      - default
+    networks: [default]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -26,23 +25,20 @@ services:
     profiles: ["*", "api", "worker"]
 
   redis:
-    profiles: ["api", "worker"]
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    ports: ["6379:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 10
-    networks:
-      - default
+    networks: [default]
+    profiles: ["*", "api", "worker"]
 
   # =========================
   # GPU を使うサービス（LLMのみ）
   # =========================
   ollama:
-    profiles: ["worker"]
     image: ollama/ollama:latest
     env_file: .env
     environment:
@@ -54,41 +50,39 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     gpus: all
-    networks:
-      - default
+    networks: [default]
     healthcheck:
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 10
-
-  osrm-car:
+      retries: 12
     profiles: ["worker"]
+
+  # =========================
+  # OSRM（日本全域データ）
+  # =========================
+  osrm-car:
     image: osrm/osrm-backend:latest
-    ports:
-      - "5000:5000"
+    ports: ["5000:5000"]
     volumes:
       - ./backend/worker/data/map/car:/data
     command: osrm-routed --algorithm mld /data/japan-latest.osrm
-    networks:
-      - default
+    networks: [default]
+    profiles: ["worker"]
 
   osrm-foot:
-    profiles: ["worker"]
     image: osrm/osrm-backend:latest
-    ports:
-      - "5001:5000"
+    ports: ["5001:5000"]
     volumes:
       - ./backend/worker/data/map/foot:/data
     command: osrm-routed --algorithm mld /data/japan-latest-foot.osrm
-    networks:
-      - default
+    networks: [default]
+    profiles: ["worker"]
 
   # =========================
   # アプリ本体
   # =========================
   api_gateway:
-    profiles: ["api"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -106,11 +100,10 @@ services:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
-    networks:
-      - default
+    networks: [default]
+    profiles: ["api"]
 
   worker:
-    profiles: ["worker"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -121,33 +114,53 @@ services:
       - APP_ENV=${APP_ENV}
       - LOG_LEVEL=${LOG_LEVEL}
       - OLLAMA_HOST=${OLLAMA_HOST}
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # ※ GPU は割り当てない（NVIDIA_* も指定しない）
     depends_on:
-      ollama:
+      db:
         condition: service_healthy
       redis:
         condition: service_healthy
-      db:
+      ollama:
         condition: service_healthy
+      vectorstore-init:
+        condition: service_completed_successfully
       osrm-car:
         condition: service_started
       osrm-foot:
         condition: service_started
-    # コマンドは本番 compose で指定（開発時は必要に応じて）
-    networks:
-      - default
+      db-init:
+        condition: service_completed_successfully
+    networks: [default]
+    profiles: ["worker"]
+
+  # Celery Beat（定期実行：MVリフレッシュ等）
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app/backend
+      - APP_ENV=${APP_ENV}
+      - LOG_LEVEL=${LOG_LEVEL}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [default]
+    profiles: ["worker"]
 
   frontend:
-    profiles: ["dev", "api"]
     build:
       context: ./frontend
-    ports:
-      - "8501:8501"
+    ports: ["8501:8501"]
     depends_on:
-      - api_gateway
-    networks:
-      - default
+      api_gateway:
+        condition: service_started
+    networks: [default]
+    profiles: ["dev", "api"]
 
   # =========================
   # 初期化ツール（起動順固定）
@@ -158,23 +171,30 @@ services:
       dockerfile: Dockerfile
       target: development
     container_name: ${COMPOSE_PROJECT_NAME:-guidancellm}-db-init-1
+    env_file:
+      - .env
     environment:
-      # DB接続はコンテナ名 db を使う
       DATABASE_URL: "postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-guidance}"
-      # （必要なら）その他 env をここへ
+      PYTHONPATH: "/app/backend"
+      ALEMBIC_SCRIPT_LOCATION: "${ALEMBIC_SCRIPT_LOCATION:-backend/shared/app/migrations}"
+      ALEMBIC_DB_URL: "${DATABASE_URL}"
+      INIT_RUN_ALEMBIC: "${INIT_RUN_ALEMBIC:-true}"
+      INIT_LOAD_SPOTS: "${INIT_LOAD_SPOTS:-true}"
+      INIT_LOAD_ACCESS_POINTS: "${INIT_LOAD_ACCESS_POINTS:-true}"
+      INIT_BUILD_VECTORSTORE: "false"  # Vectorstoreは別サービスで実行
     volumes:
       - ./backend:/app/backend
     depends_on:
       db:
         condition: service_healthy
-    profiles: ["*", "api", "worker"]
     command: >
       bash -lc "
-        pip install --no-cache-dir pgvector alembic &&
+        pip install --no-cache-dir alembic &&
         python worker/app/init_db_script.py
       "
-    networks:
-      - default
+    networks: [default]
+    profiles: ["*", "api", "worker"]
+    restart: "no"
 
   vectorstore-init:
     build:
@@ -183,25 +203,29 @@ services:
       target: development
     image: ${COMPOSE_PROJECT_NAME:-guidancellm}-vectorstore-init
     container_name: ${COMPOSE_PROJECT_NAME:-guidancellm}-vectorstore-init-1
-    command: >
-      bash -lc "python /app/backend/scripts/01_build_knowledge_graph.py"
+    env_file: .env
     environment:
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app/backend"
-      OLLAMA_HOST: "http://ollama:11434"
-      EMBED_MODEL: "mxbai-embed-large"
-      KNOWLEDGE_LANGS: "ja,en,zh"
-      KNOWLEDGE_BASE_DIR: "/app/backend/worker/data/knowledge"
-      VECTORSTORE_BASE_DIR: "/app/backend/worker/data/vectorstore"
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://ollama:11434}"
+      EMBED_MODEL: "${EMBED_MODEL:-mxbai-embed-large}"
+      KNOWLEDGE_LANGS: "${KNOWLEDGE_LANGS:-ja,en,zh}"
+      KNOWLEDGE_BASE_DIR: "/app/backend/worker/app/data/knowledge"
+      VECTORSTORE_BASE_DIR: "/app/backend/worker/app/data/vectorstore"
       CHROMA_TELEMETRY_DISABLED: "1"
+    command: >
+      bash -lc "python /app/backend/scripts/01_build_knowledge_graph.py"
     depends_on:
-      - ollama
-      - db
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     volumes:
       - ./backend:/app/backend
-    profiles: ["*", "api", "worker"]
-    networks:
-      - default
+    networks: [default]
+    profiles: ["*", "worker"]
     restart: "no"
 
 volumes:
