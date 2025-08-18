@@ -32,11 +32,11 @@ from typing import List, Dict, Tuple
 # =========================
 # 「ベース」ディレクトリ直下に ja/en/zh をぶら下げる想定
 KNOWLEDGE_BASE = Path(
-    os.getenv("KNOWLEDGE_BASE", "backend/worker/data/knowledge")
+    os.getenv("KNOWLEDGE_BASE", "worker/data/knowledge")
 ).resolve()
 
 VECTORSTORE_BASE = Path(
-    os.getenv("VECTORSTORE_BASE", "backend/vectorstore")
+    os.getenv("VECTORSTORE_BASE", "vectorstore")
 ).resolve()
 
 def knowledge_root_for(lang: str) -> Path:

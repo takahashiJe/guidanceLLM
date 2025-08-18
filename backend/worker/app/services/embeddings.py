@@ -33,6 +33,7 @@ import time
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
 
 import requests
 from sqlalchemy import select, desc
@@ -348,6 +349,103 @@ class EmbeddingService:
                 "model": self.client.model,
                 "host": self.client.host,
             }
+
+class ConversationEmbedder:
+    """
+    会話用の埋め込み保存 / 検索（KNN）ユーティリティ。
+    - mxbai-embed-large（既定）でベクトル化
+    - conversation_embeddings テーブルへ保存
+    - 同一 conversation_id 内から KNN 検索
+    """
+
+    def __init__(
+        self,
+        client: Optional["EmbeddingClient"] = None,
+        embedding_version: Optional[str] = None,
+        db_factory=SessionLocal,
+    ) -> None:
+        self.client = client or OllamaEmbeddingClient()
+        self.db_factory = db_factory
+        self.embedding_version = (
+            embedding_version
+            or os.getenv("EMBEDDING_VERSION", os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large"))
+        )
+
+    # --- 埋め込み生成 ---
+
+    def embed_text(self, text: str) -> List[float]:
+        """単文の埋め込み（List[float]）"""
+        vecs = self.client.embed([text])
+        return vecs[0]
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """複数文の埋め込み"""
+        return self.client.embed(texts)
+
+    # --- 保存 ---
+
+    def save_message(
+        self,
+        *,
+        conversation_id: str,
+        speaker: str,       # "user" | "assistant" | "system"
+        lang: str,          # "ja" | "en" | "zh"
+        text: str,
+        ts: Optional[datetime] = None,
+        turn_id: Optional[int] = None,
+    ) -> int:
+        """
+        1件の会話メッセージをベクトル化して conversation_embeddings に保存し、主キー id を返す。
+        """
+        vec = self.embed_text(text)
+        now = ts or datetime.utcnow()
+
+        with self.db_factory() as db:  # type: Session
+            rec = models.ConversationEmbedding(
+                conversation_id=conversation_id,
+                speaker=speaker,
+                lang=lang,
+                ts=now,
+                text=text,
+                embedding=vec,  # pgvector(Vector) カラムに Python list を渡す
+                embedding_version=self.embedding_version,
+            )
+            # DBに turn_id カラムがある構成なら保存（後方互換）
+            if hasattr(models.ConversationEmbedding, "turn_id") and turn_id is not None:
+                setattr(rec, "turn_id", turn_id)
+
+            db.add(rec)
+            db.commit()
+            db.refresh(rec)
+            return rec.id
+
+    # --- 近傍検索 ---
+
+    def knn_messages(
+        self,
+        *,
+        conversation_id: str,
+        query_text: str,
+        k: int = 5,
+        lang: Optional[str] = None,
+    ) -> List[models.ConversationEmbedding]:
+        """
+        同一 conversation_id 内から、query_text に近い過去メッセージ k 件を返す。
+        pgvector の l2_distance を使用してソート。
+        """
+        qvec = self.embed_text(query_text)
+
+        with self.db_factory() as db:  # type: Session
+            stmt = (
+                select(models.ConversationEmbedding)
+                .where(models.ConversationEmbedding.conversation_id == conversation_id)
+            )
+            if lang:
+                stmt = stmt.where(models.ConversationEmbedding.lang == lang)
+
+            stmt = stmt.order_by(models.ConversationEmbedding.embedding.l2_distance(qvec)).limit(k)
+            rows = db.execute(stmt).scalars().all()
+            return rows
 
 
 # ============================================================
