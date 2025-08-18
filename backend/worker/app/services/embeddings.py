@@ -1,28 +1,15 @@
+# backend/worker/app/services/embeddings.py
 # -*- coding: utf-8 -*-
 """
-埋め込み（Embeddings）サービス
-------------------------------------------------------------
-役割:
-  - Ollama の mxbai-embed-large を用いてテキストを埋め込みベクトル化
-  - conversation_embeddings テーブルへ保存・再インデックス
-  - セッション内の k 近傍検索（pgvector なしでも Python 側でコサイン類似度計算）
+Embeddings（会話の長期記憶/RAG埋め込み）サービスの本実装。
 
-特長:
-  - HTTP と Python SDK（ollama）両対応。HTTP を優先し、SDK をフォールバックに利用。
-  - pgvector がない環境でも安全に動作（将来の pgvector 導入に備えて拡張ポイントを用意）
-  - 既存コードからの呼び出しに配慮し、クラス API と関数 API の両方を提供
-
-環境変数:
-  - OLLAMA_HOST               : Ollama のホストURL（例: http://ollama:11434）
-  - EMBEDDING_MODEL           : 既定 "mxbai-embed-large"
-  - EMBEDDING_VERSION         : 既定 "mxbai-embed-large@v1"（再インデックス判定に使用）
-  - EMBEDDING_HTTP_TIMEOUT    : 既定 60（秒）
-  - EMBEDDING_CANDIDATE_LIMIT : 既定 200（kNN候補として DB から読む最大件数）
-  - EMBEDDING_MAX_TEXT_LEN    : 既定 4096（超過時は安全に切り詰め）
-
-前提:
-  - shared.app.models に ConversationEmbedding モデルが定義済み
-    （columns: id, session_id, speaker, lang, ts, text, embedding_version, embedding[float] など）
+設計ポイント
+- 低レイヤの Ollama クライアント、DB 層(pgvector)、ベクタストア用埋め込み関数、
+  そして公開 Facade（EmbeddingsService）を単一ファイルに内包しつつ責務分離。
+- 既存呼び出し（state.py / information_nodes.py / 01_build_knowledge_graph.py）との互換性維持。
+- Cosine 距離で KNN 検索（pgvector）。L2 正規化を実施。
+- LRU キャッシュで同一テキストの埋め込み再計算を抑制。
+- 例外・再試行・タイムアウトを備えた堅牢化。
 """
 
 from __future__ import annotations
@@ -30,618 +17,447 @@ from __future__ import annotations
 import os
 import math
 import time
+import json
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-import numpy as np
+import hashlib
+import functools
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
-from sqlalchemy import select, desc
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+# pgvector の SQLAlchemy 型
+try:
+    from pgvector.sqlalchemy import Vector
+except Exception:
+    # ランタイムで未導入の環境でも import エラーで死なないようにする（実運用では pgvector を入れること）
+    Vector = None  # type: ignore
+
+# 共有の DB セッションファクトリ
 from shared.app.database import SessionLocal
 from shared.app import models
 
-try:
-    # LangChain の OllamaEmbeddings を利用（pip: langchain-community）
-    from langchain_community.embeddings import OllamaEmbeddings
-except Exception as e:
-    OllamaEmbeddings = None  # 実行時に検出して明示的にエラーを出す
-
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-class _OllamaEmbeddingFunction:
+# ============================================
+# 環境変数（デフォルト値を安全側に設定）
+# ============================================
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", os.getenv("EMBED_MODEL", "mxbai-embed-large"))
+EMBEDDING_VERSION = os.getenv("EMBEDDING_VERSION", f"{EMBEDDING_MODEL}@v1")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+
+# ============================================
+# ユーティリティ
+# ============================================
+
+def _l2_normalize(vec: Sequence[float]) -> List[float]:
+    """L2 正規化（ゼロベクトルのときはそのまま返す）"""
+    s = math.sqrt(sum((x * x) for x in vec))
+    if s == 0:
+        return list(vec)
+    return [float(x) / s for x in vec]
+
+
+def _sha_key(text: str) -> str:
+    """テキストのキャッシュキー（先頭32桁で十分）"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+# ============================================
+# 低レイヤ: Ollama Embeddings クライアント
+# ============================================
+
+class _OllamaEmbeddingsClient:
     """
-    Ollama の埋め込みモデル(mxbai-embed-large)をラップする軽量アダプタ。
-    ConversationEmbedder からは __call__ / embed_query / embed_documents いずれで呼ばれてもOK。
+    Ollama の /api/embeddings を叩くシンプルなクライアント。
+    - リトライ（指数バックオフ＋ジッター）
+    - タイムアウト
+    - 応答検証（次元）
+    - L2 正規化
     """
-    def __init__(self, model_name: str, base_url: Optional[str] = None, **kwargs):
-        if OllamaEmbeddings is None:
-            raise RuntimeError(
-                "langchain-community が見つかりません。`pip install langchain-community` を実行してください。"
-            )
-        # base_url は OLLAMA_BASE_URL（例: http://ollama:11434）を使用
-        self._emb = OllamaEmbeddings(model=model_name, base_url=base_url, **kwargs)
-
-    def __call__(self, text: str) -> List[float]:
-        # 単一クエリの埋め込み
-        return self._emb.embed_query(text)
-
-    def embed_query(self, text: str) -> List[float]:
-        # LangChain 準拠インターフェース
-        return self._emb.embed_query(text)
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # 複数ドキュメントの埋め込み
-        return self._emb.embed_documents(texts)
-
-
-# ============================================================
-# 内部: Ollama クライアント（HTTP優先）
-# ============================================================
-class OllamaEmbeddingClient:
-    """Ollama の embeddings API を叩く軽量クライアント。HTTP を優先し、SDK をフォールバック。"""
-
     def __init__(
         self,
-        model: Optional[str] = None,
-        host: Optional[str] = None,
-        timeout: Optional[int] = None
+        host: str = OLLAMA_HOST,
+        model: str = EMBEDDING_MODEL,
+        timeout: float = 30.0,
+        max_retries: int = 3,
+        embedding_dim: int = EMBEDDING_DIM,
     ) -> None:
-        self.model = model or os.getenv("EMBEDDING_MODEL", "mxbai-embed-large")
-        self.host = (host or os.getenv("OLLAMA_HOST") or "http://ollama:11434").rstrip("/")
-        self.timeout = int(os.getenv("EMBEDDING_HTTP_TIMEOUT", str(timeout or 60)))
+        self.host = host.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.embedding_dim = embedding_dim
+        self._session = requests.Session()
+        self._url = f"{self.host}/api/embeddings"
 
-        # HTTP エンドポイント（Ollama 0.1 系: /api/embeddings, 0.2 以降: /api/embed）
-        self._endpoints = ["/api/embeddings", "/api/embed"]
-
-    def embed(self, text: str) -> List[float]:
-        """単一テキストの埋め込みを取得。HTTP -> SDK の順でトライ。"""
-        text = self._sanitize_text(text)
-        # 1) HTTP
-        for ep in self._endpoints:
+    def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # リトライ（指数バックオフ＋小ジッター）
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries):
             try:
-                url = f"{self.host}{ep}"
-                payload = self._make_http_payload(text)
-                res = requests.post(url, json=payload, timeout=self.timeout)
-                res.raise_for_status()
-                vec = self._parse_http_embeddings(res.json())
-                if vec:
-                    return list(map(float, vec))
+                resp = self._session.post(self._url, json=payload, timeout=self.timeout)
+                resp.raise_for_status()
+                return resp.json()
             except Exception as e:
-                logger.debug(f"Ollama HTTP embeddings failed at {ep}: {e}")
+                last_exc = e
+                sleep_sec = min(2 ** attempt, 8) + (0.05 * attempt)
+                logger.warning("Ollama embeddings request failed (attempt %s/%s): %s",
+                               attempt + 1, self.max_retries, e)
+                time.sleep(sleep_sec)
+        # すべて失敗
+        raise RuntimeError(f"Ollama embeddings request failed after retries: {last_exc}")
 
-        # 2) SDK フォールバック
-        try:
-            import ollama  # type: ignore
-            # SDK の仕様差吸収（旧: prompt 新: input）
+    def _post_and_extract(self, text: str) -> List[float]:
+        # Ollama Embeddings API: {model, prompt}
+        payload = {"model": self.model, "prompt": text}
+        data = self._post(payload)
+        # 期待されるキー: {"embedding": [...]} 形式
+        if not isinstance(data, dict) or "embedding" not in data:
+            raise ValueError(f"Invalid embeddings response: {data}")
+        emb = data["embedding"]
+        if not isinstance(emb, list) or len(emb) != self.embedding_dim:
+            raise ValueError(
+                f"Invalid embedding dimension: expected {self.embedding_dim}, got {len(emb)}"
+            )
+        return [float(x) for x in emb]
+
+    @functools.lru_cache(maxsize=1024)
+    def _embed_one_cached(self, key: str, text: str) -> Tuple[str, List[float]]:
+        """LRU キャッシュ付き 1テキスト埋め込み（key はテキストハッシュ）"""
+        emb = self._post_and_extract(text)
+        emb = _l2_normalize(emb)
+        return key, emb
+
+    def embed_one(self, text: str) -> List[float]:
+        """単一テキストを埋め込み（L2 正規化済み）"""
+        key = _sha_key(text)
+        _, emb = self._embed_one_cached(key, text)
+        return emb
+
+    def embed_many(self, texts: Iterable[str]) -> List[List[float]]:
+        """
+        複数テキストを埋め込み（API の単発呼び出しをループ。Ollama は配列入力未保証）
+        - L2 正規化済みを返す
+        """
+        result: List[List[float]] = []
+        for t in texts:
+            result.append(self.embed_one(t))
+        return result
+
+
+# ============================================
+# DB 層: 会話長期記憶（pgvector）
+# ============================================
+
+class _ConversationMemoryStore:
+    """
+    会話の長期記憶（conversation_message_embeddings テーブル）を司る DB 層。
+    - upsert: (conversation_id, turn_id, speaker) で一意
+    - knn: cosine 距離で近傍検索（L2 正規化済み前提）
+    """
+    def __init__(self, session_factory: Callable[[], Session] = SessionLocal) -> None:
+        self._session_factory = session_factory
+
+    def bulk_upsert(
+        self,
+        rows: List[Dict[str, Any]],
+    ) -> None:
+        """
+        複数行を 1 トランザクションで UPSERT。
+        rows の各要素：
+          {
+            "conversation_id": str,
+            "turn_id": int,
+            "speaker": str,  # "user" / "assistant" / ...
+            "lang": str,
+            "text": str,
+            "embedding": List[float],
+            "embedding_version": str,
+            "ts": Optional[datetime]  # 省略可
+          }
+        """
+        if not rows:
+            return
+        with self._session_factory() as db:
             try:
-                data = ollama.embeddings(model=self.model, prompt=text)  # 旧
-            except TypeError:
-                data = ollama.embeddings(model=self.model, input=text)   # 新
-            vec = data.get("embedding") or (data.get("data") and data["data"][0].get("embedding"))
-            if not vec:
-                raise RuntimeError("SDK embeddings result is empty.")
-            return list(map(float, vec))
-        except Exception as e:
-            raise RuntimeError(f"Ollama embeddings failed (HTTP & SDK): {e}")
+                # SQLAlchemy Core の insert ... on conflict do update を使う
+                from sqlalchemy.dialects.postgresql import insert
 
-    # 将来的な一括APIに備えて用意（現状は逐次）
-    def embed_many(self, texts: List[str]) -> List[List[float]]:
-        return [self.embed(t) for t in texts]
-
-    # ------------------------ 内部ユーティリティ ------------------------
-    def _make_http_payload(self, text: str) -> Dict[str, Any]:
-        # /api/embeddings（prompt）と /api/embed（input）の両対応
-        return {"model": self.model, "prompt": text, "input": text}
-
-    def _parse_http_embeddings(self, data: Dict[str, Any]) -> Optional[List[float]]:
-        # /api/embeddings: {"embedding":[...]}
-        if "embedding" in data and isinstance(data["embedding"], list):
-            return data["embedding"]
-        # /api/embed: {"data":[{"embedding":[...]}]}
-        if "data" in data and isinstance(data["data"], list) and data["data"]:
-            first = data["data"][0]
-            emb = first.get("embedding")
-            if isinstance(emb, list):
-                return emb
-        return None
-
-    def _sanitize_text(self, text: str) -> str:
-        max_len = int(os.getenv("EMBEDDING_MAX_TEXT_LEN", "4096"))
-        s = (text or "").strip()
-        if len(s) > max_len:
-            s = s[:max_len]
-        return s
-
-
-# ============================================================
-# 数学ユーティリティ（pgvector ない場合のコサイン類似度）
-# ============================================================
-def _cosine_similarity(a: List[float], b: List[float]) -> float:
-    if not a or not b:
-        return 0.0
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return dot / (math.sqrt(na) * math.sqrt(nb))
-
-
-# ============================================================
-# 埋め込みサービス（保存・検索・再インデックス）
-# ============================================================
-class EmbeddingService:
-    """
-    会話の長期記憶（conversation_embeddings）の保存・検索。
-    - upsert_message: 1件保存（バージョン付き）
-    - search_similar: セッション内 kNN 検索（pgvector 無でも動作）
-    - batch_reindex_session: 旧バージョン/欠損の再インデックス
-    - health_check: 埋め込み系の疎通
-    """
-
-    def __init__(
-        self,
-        client: Optional[OllamaEmbeddingClient] = None,
-        embedding_version: Optional[str] = None,
-        candidate_limit: Optional[int] = None,
-    ) -> None:
-        self.client = client or OllamaEmbeddingClient()
-        self.embedding_version = embedding_version or os.getenv("EMBEDDING_VERSION", "mxbai-embed-large@v1")
-        self.candidate_limit = int(os.getenv("EMBEDDING_CANDIDATE_LIMIT", str(candidate_limit or 200)))
-
-    # ----------------------------- 保存系 -----------------------------
-    def upsert_message(
-        self,
-        *,
-        session_id: str,
-        speaker: str,          # "user" / "assistant" / "system"
-        lang: str,             # "ja" / "en" / "zh"
-        text: str,
-        conversation_id: Optional[str] = None,
-        ts: Optional[datetime] = None,
-        db: Optional[Session] = None,
-    ) -> int:
-        """
-        単一メッセージを埋め込み保存。戻り値は保存したレコードの ID。
-        """
-        vector = self.client.embed(text)
-        close_db = False
-        if db is None:
-            db = SessionLocal()
-            close_db = True
-        try:
-            row = models.ConversationEmbedding(
-                session_id=session_id,
-                conversation_id=conversation_id,
-                speaker=speaker,
-                lang=lang,
-                ts=ts or datetime.utcnow(),
-                text=text,
-                embedding_version=self.embedding_version,
-                embedding=vector,
-            )
-            db.add(row)
-            db.commit()
-            db.refresh(row)
-            return int(row.id)
-        finally:
-            if close_db:
-                db.close()
-
-    # ----------------------------- 検索系 -----------------------------
-    def search_similar(
-        self,
-        *,
-        session_id: str,
-        query_text: str,
-        top_k: int = 5,
-        min_cosine: float = 0.0,
-        db: Optional[Session] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        セッション内の会話から k 近傍検索。
-        - 既定は直近 self.candidate_limit 件をロードして Python 側でコサイン類似度を計算
-        - 戻り値はスコア降順の辞書リスト
-        """
-        qvec = self.client.embed(query_text)
-
-        close_db = False
-        if db is None:
-            db = SessionLocal()
-            close_db = True
-        try:
-            stmt = (
-                select(models.ConversationEmbedding)
-                .where(
-                    models.ConversationEmbedding.session_id == session_id,
-                    models.ConversationEmbedding.embedding_version == self.embedding_version,
+                table = models.ConversationMessageEmbedding.__table__  # type: ignore
+                stmt = insert(table).values(rows)
+                # 一意制約 (conversation_id, turn_id, speaker) を前提
+                on_conflict = stmt.on_conflict_do_update(
+                    index_elements=["conversation_id", "turn_id", "speaker"],
+                    set_={
+                        "lang": stmt.excluded.lang,
+                        "text": stmt.excluded.text,
+                        "embedding": stmt.excluded.embedding,
+                        "embedding_version": stmt.excluded.embedding_version,
+                        "ts": stmt.excluded.ts,
+                    },
                 )
-                .order_by(desc(models.ConversationEmbedding.ts))
-                .limit(self.candidate_limit)
-            )
-            rows = db.execute(stmt).scalars().all()
-
-            # 類似度算出（pgvector 無環境でも確実に動く）
-            scored: List[Tuple[float, models.ConversationEmbedding]] = []
-            for r in rows:
-                if not r.embedding:
-                    continue
-                score = _cosine_similarity(qvec, r.embedding)
-                if score >= min_cosine:
-                    scored.append((score, r))
-
-            scored.sort(key=lambda x: x[0], reverse=True)
-            top = scored[: max(1, top_k)]
-
-            results: List[Dict[str, Any]] = []
-            for score, r in top:
-                results.append(
-                    {
-                        "id": int(r.id),
-                        "session_id": r.session_id,
-                        "conversation_id": getattr(r, "conversation_id", None),
-                        "speaker": r.speaker,
-                        "lang": r.lang,
-                        "ts": r.ts.isoformat() if r.ts else None,
-                        "text": r.text,
-                        "embedding_version": r.embedding_version,
-                        "cosine": float(score),
-                    }
-                )
-            return results
-        finally:
-            if close_db:
-                db.close()
-
-    # ------------------------- 再インデックス系 -------------------------
-    def batch_reindex_session(
-        self,
-        *,
-        session_id: str,
-        force: bool = False,
-        db: Optional[Session] = None,
-    ) -> int:
-        """
-        セッション内で、埋め込み未生成/旧バージョンの行を再インデックス。
-        - force=True で全件再インデックス
-        戻り値: 更新件数
-        """
-        close_db = False
-        if db is None:
-            db = SessionLocal()
-            close_db = True
-
-        updated = 0
-        try:
-            # 対象行を取得
-            if force:
-                stmt = (
-                    select(models.ConversationEmbedding)
-                    .where(models.ConversationEmbedding.session_id == session_id)
-                    .order_by(desc(models.ConversationEmbedding.ts))
-                )
-            else:
-                stmt = (
-                    select(models.ConversationEmbedding)
-                    .where(
-                        models.ConversationEmbedding.session_id == session_id,
-                        (
-                            (models.ConversationEmbedding.embedding == None)  # noqa: E711
-                            | (models.ConversationEmbedding.embedding_version != self.embedding_version)
-                        ),
-                    )
-                    .order_by(desc(models.ConversationEmbedding.ts))
-                )
-
-            rows = db.execute(stmt).scalars().all()
-            if not rows:
-                return 0
-
-            for r in rows:
-                try:
-                    r.embedding = self.client.embed(r.text or "")
-                    r.embedding_version = self.embedding_version
-                    updated += 1
-                except Exception as e:
-                    logger.warning(f"reindex failed (id={r.id}): {e}")
-            db.commit()
-            return updated
-        finally:
-            if close_db:
-                db.close()
-
-    # --------------------------- ヘルスチェック ---------------------------
-    def health_check(self) -> Dict[str, Any]:
-        """
-        埋め込みエンドポイントの疎通を確認（短いテキストで1回だけ呼ぶ）。
-        """
-        t0 = time.time()
-        try:
-            v = self.client.embed("hello")
-            ok = isinstance(v, list) and len(v) > 0
-            return {
-                "ok": ok,
-                "latency_ms": int((time.time() - t0) * 1000),
-                "model": self.client.model,
-                "host": self.client.host,
-                "dim": (len(v) if ok else 0),
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": str(e),
-                "latency_ms": int((time.time() - t0) * 1000),
-                "model": self.client.model,
-                "host": self.client.host,
-            }
-
-class ConversationEmbedder:
-    """
-    会話用の埋め込み保存 / 検索（KNN）ユーティリティ。
-    - mxbai-embed-large（既定）でベクトル化
-    - conversation_embeddings テーブルへ保存
-    - 同一 conversation_id 内から KNN 検索
-    """
-
-    def __init__(
-        self,
-        lang: str,
-        client: Optional["EmbeddingClient"] = None,
-        embedding_version: Optional[str] = None,
-        db_factory=SessionLocal,
-    ) -> None:
-        self.client = client or OllamaEmbeddingClient()
-        self.db_factory = db_factory
-        self.embedding_version = (
-            embedding_version
-            or os.getenv("EMBEDDING_VERSION", os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large"))
-        )
-
-    # --- 埋め込み生成 ---
-
-    def embed_text(self, text: str) -> List[float]:
-        """単文の埋め込み（List[float]）"""
-        vecs = self.client.embed([text])
-        return vecs[0]
-
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """複数文の埋め込み"""
-        return self.client.embed(texts)
-
-    # --- 保存 ---
-
-    def save_message(
-        self,
-        *,
-        conversation_id: str,
-        speaker: str,       # "user" | "assistant" | "system"
-        lang: str,          # "ja" | "en" | "zh"
-        text: str,
-        ts: Optional[datetime] = None,
-        turn_id: Optional[int] = None,
-    ) -> int:
-        """
-        1件の会話メッセージをベクトル化して conversation_embeddings に保存し、主キー id を返す。
-        """
-        vec = self.embed_text(text)
-        now = ts or datetime.utcnow()
-
-        with self.db_factory() as db:  # type: Session
-            rec = models.ConversationEmbedding(
-                conversation_id=conversation_id,
-                speaker=speaker,
-                lang=lang,
-                ts=now,
-                text=text,
-                embedding=vec,  # pgvector(Vector) カラムに Python list を渡す
-                embedding_version=self.embedding_version,
-            )
-            # DBに turn_id カラムがある構成なら保存（後方互換）
-            if hasattr(models.ConversationEmbedding, "turn_id") and turn_id is not None:
-                setattr(rec, "turn_id", turn_id)
-
-            db.add(rec)
-            db.commit()
-            db.refresh(rec)
-            return rec.id
-
-    # --- 近傍検索 ---
+                db.execute(on_conflict)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("bulk_upsert failed")
+                raise
 
     def knn_messages(
         self,
-        *,
         conversation_id: str,
+        query_embedding: List[float],
+        k: int = 5,
+        min_cosine: float = 0.2,
+        role_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        KNN 検索（cosine 距離）。L2 正規化済みベクトル前提。
+        - pgvector の演算子 `<=>` は「距離」。cosine 類似度 sim = 1 - distance として扱う。
+        - min_cosine で下限フィルタ（SQL では距離 <= 1 - min_cosine）
+        返却: [{speaker, text, lang, turn_id, ts, score}]
+        """
+        if Vector is None:
+            raise RuntimeError("pgvector 'Vector' type is not available. Please install pgvector.")
+
+        max_distance = 1.0 - float(min_cosine)
+        # 念のため距離の上下限を安全側に丸める
+        if max_distance < 0.0:
+            max_distance = 0.0
+        if max_distance > 2.0:
+            max_distance = 2.0
+
+        # SQL: 距離で ORDER BY。必要なら role_filter を付与。
+        base_sql = """
+            SELECT
+                speaker,
+                lang,
+                text,
+                turn_id,
+                ts,
+                (embedding <=> :query_vec) AS distance
+            FROM conversation_message_embeddings
+            WHERE conversation_id = :cid
+              AND (embedding <=> :query_vec) <= :max_dist
+        """
+        if role_filter:
+            base_sql += " AND speaker = :role "
+
+        base_sql += " ORDER BY (embedding <=> :query_vec) ASC LIMIT :k "
+
+        with self._session_factory() as db:
+            # bindparam に Vector 型を指定（次元数から型を生成）
+            if Vector is not None:
+                vec_type = Vector(EMBEDDING_DIM)
+            else:
+                vec_type = None  # type: ignore
+
+            params: Dict[str, Any] = {
+                "cid": conversation_id,
+                "query_vec": query_embedding,
+                "max_dist": max_distance,
+                "k": int(k),
+            }
+            if role_filter:
+                params["role"] = role_filter
+
+            stmt = text(base_sql).bindparams()
+            # SQLAlchemy が pgvector を認識しやすいよう、bindparams で type_ を追加
+            if vec_type is not None:
+                # NOTE: bindparams の型指定（方言差によっては不要だが安全のため付ける）
+                stmt = stmt.bindparams(
+                    # type: ignore
+                    text(":query_vec").bindparams(type_=vec_type)  # noqa
+                )
+
+            rows = db.execute(stmt, params).mappings().all()
+
+        results: List[Dict[str, Any]] = []
+        for r in rows:
+            dist = float(r["distance"])
+            # cosine 類似度に変換（sim = 1 - dist）
+            sim = 1.0 - dist
+            results.append(
+                {
+                    "speaker": r["speaker"],
+                    "lang": r["lang"],
+                    "text": r["text"],
+                    "turn_id": int(r["turn_id"]),
+                    "ts": r["ts"],
+                    "score": sim,
+                }
+            )
+        return results
+
+
+# ============================================
+# ベクタストア用 埋め込み関数アダプタ
+# ============================================
+
+class _VectorStoreEmbeddingFn:
+    """
+    ベクタストア側（Chroma など）の embedding_function に渡すためのコール可能オブジェクト。
+    - テキスト配列を受け取り、L2 正規化済み埋め込み配列を返す。
+    """
+    def __init__(self, client: _OllamaEmbeddingsClient) -> None:
+        self._client = client
+
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        return self._client.embed_many(texts)
+
+
+# ============================================
+# Facade: EmbeddingsService（公開 API）
+# ============================================
+
+class EmbeddingsService:
+    """
+    既存コードからの唯一の窓口。内部実装は各レイヤに委譲。
+    - embed_text(text) -> List[float]
+    - save_conversation_embeddings(session_id, turn_id, lang, user_text, assistant_text, embedding_version=None) -> None
+    - knn_messages(session_id, query_text, k=5, min_cosine=0.2, role_filter=None) -> List[Dict]
+    - format_memory_snippets(excerpts) -> str
+    - embedding_function_for_vectorstore() -> Callable[[List[str]], List[List[float]]]
+    """
+
+    def __init__(
+        self,
+        *,
+        session_factory: Callable[[], Session] = SessionLocal,
+        ollama_host: str = OLLAMA_HOST,
+        model: str = EMBEDDING_MODEL,
+        embedding_version: str = EMBEDDING_VERSION,
+        embedding_dim: int = EMBEDDING_DIM,
+    ) -> None:
+        self._client = _OllamaEmbeddingsClient(
+            host=ollama_host,
+            model=model,
+            embedding_dim=embedding_dim,
+        )
+        self._store = _ConversationMemoryStore(session_factory=session_factory)
+        self._embedding_version = embedding_version
+        self._embedding_dim = embedding_dim
+
+    # -------------------------
+    # 単発埋め込み（互換 API）
+    # -------------------------
+    def embed_text(self, text: str) -> List[float]:
+        """
+        1テキストを埋め込み（L2 正規化済み）。
+        """
+        if not isinstance(text, str):
+            text = str(text)
+        return self._client.embed_one(text)
+
+    # ----------------------------------------
+    # 会話（ユーザ/アシスタント）の埋め込みを一括保存
+    # ----------------------------------------
+    def save_conversation_embeddings(
+        self,
+        session_id: str,
+        turn_id: int,
+        lang: str,
+        user_text: Optional[str],
+        assistant_text: Optional[str],
+        embedding_version: Optional[str] = None,
+    ) -> None:
+        """
+        会話確定時に、ユーザ発話/アシスタント応答の埋め込みを一括保存する。
+        - どちらかが None の場合でも問題ない（指定された方のみ保存）。
+        - upsert（一意: conversation_id, turn_id, speaker）
+        """
+        rows: List[Dict[str, Any]] = []
+        ver = embedding_version or self._embedding_version
+
+        if user_text and user_text.strip():
+            user_emb = self._client.embed_one(user_text.strip())
+            rows.append(
+                {
+                    "conversation_id": session_id,
+                    "turn_id": int(turn_id),
+                    "speaker": "user",
+                    "lang": lang,
+                    "text": user_text.strip(),
+                    "embedding": user_emb,
+                    "embedding_version": ver,
+                }
+            )
+
+        if assistant_text and assistant_text.strip():
+            asst_emb = self._client.embed_one(assistant_text.strip())
+            rows.append(
+                {
+                    "conversation_id": session_id,
+                    "turn_id": int(turn_id),
+                    "speaker": "assistant",
+                    "lang": lang,
+                    "text": assistant_text.strip(),
+                    "embedding": asst_emb,
+                    "embedding_version": ver,
+                }
+            )
+
+        if rows:
+            self._store.bulk_upsert(rows)
+
+    # ----------------------------------------
+    # KNN 検索（長期記憶の近傍抽出）
+    # ----------------------------------------
+    def knn_messages(
+        self,
+        session_id: str,
         query_text: str,
         k: int = 5,
-        lang: Optional[str] = None,
-    ) -> List[models.ConversationEmbedding]:
+        min_cosine: float = 0.2,
+        role_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        同一 conversation_id 内から、query_text に近い過去メッセージ k 件を返す。
-        pgvector の l2_distance を使用してソート。
+        最新ユーザ発話など query_text に近い会話履歴（長期記憶）を KNN 検索。
+        返却: [{speaker, text, lang, turn_id, ts, score}] （score は cosine 類似度）
         """
-        qvec = self.embed_text(query_text)
-
-        with self.db_factory() as db:  # type: Session
-            stmt = (
-                select(models.ConversationEmbedding)
-                .where(models.ConversationEmbedding.conversation_id == conversation_id)
-            )
-            if lang:
-                stmt = stmt.where(models.ConversationEmbedding.lang == lang)
-
-            stmt = stmt.order_by(models.ConversationEmbedding.embedding.l2_distance(qvec)).limit(k)
-            rows = db.execute(stmt).scalars().all()
-            return rows
-
-
-# ============================================================
-# 互換性のためのモジュールレベル関数（既存呼び出しに配慮）
-# ============================================================
-_default_service: Optional[EmbeddingService] = None
-
-
-def _svc() -> EmbeddingService:
-    global _default_service
-    if _default_service is None:
-        _default_service = EmbeddingService()
-    return _default_service
-
-
-def embed_text(text: str) -> List[float]:
-    """テキストを埋め込み（互換API）。"""
-    return _svc().client.embed(text)
-
-
-def upsert_conversation_message(
-    *,
-    session_id: str,
-    speaker: str,
-    lang: str,
-    text: str,
-    conversation_id: Optional[str] = None,
-    ts: Optional[datetime] = None,
-) -> int:
-    """会話メッセージを保存（互換API）。"""
-    return _svc().upsert_message(
-        session_id=session_id,
-        speaker=speaker,
-        lang=lang,
-        text=text,
-        conversation_id=conversation_id,
-        ts=ts,
-    )
-
-
-def knn_search(
-    *,
-    session_id: str,
-    query_text: str,
-    top_k: int = 5,
-    min_cosine: float = 0.0,
-) -> List[Dict[str, Any]]:
-    """k 近傍検索（互換API）。"""
-    return _svc().search_similar(
-        session_id=session_id,
-        query_text=query_text,
-        top_k=top_k,
-        min_cosine=min_cosine,
-    )
-
-
-def reindex_session(session_id: str, force: bool = False) -> int:
-    """再インデックス（互換API）。"""
-    return _svc().batch_reindex_session(session_id=session_id, force=force)
-
-
-def embeddings_health() -> Dict[str, Any]:
-    """疎通確認（互換API）。"""
-    return _svc().health_check()
-
-# -------------- Embeddings ファサード（RAGスクリプト互換用） --------------
-# 目的:
-# - backend/scripts/01_build_knowledge_graph.py 等の既存スクリプトが想定する
-#   `Embeddings` クラスを提供し、内部では ConversationEmbedder を用いて
-#   mxbai-embed-large による埋め込みを実行する。
-# - 会話用実装（ConversationEmbedder）をそのまま再利用しつつ、RAG の
-#   バッチ埋め込み（embed_texts）インターフェースを提供する。
-
-class Embeddings:
-    """
-    RAG 用の薄い互換ラッパ。
-    - 既存スクリプトが想定する `embed_texts(List[str]) -> List[List[float]]`
-      を提供する。
-    - 内部では ConversationEmbedder を使用して単文を逐次埋め込み（CPU）。
-    - モデル名・次元数の参照も提供する。
-    """
-
-    def __init__(self, *args, **kwargs):
-        """
-        - Ollama の mxbai-embed-large を初期化し、ConversationEmbedder には
-          EmbeddingClient 互換の client を渡す。
-        - embedding_version にはモデル名を設定（既定: mxbai-embed-large）。
-        """
-        try:
-            # 親クラスがある場合の互換維持（なければ無視）
-            super().__init__(*args, **kwargs)
-        except Exception:
-            pass
-
-        model_name = os.getenv("EMBEDDING_MODEL", os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large"))
-        base_url   = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-        self._chunk_size = int(os.getenv("EMBEDDING_CHUNK_SIZE", 128))
-
-        # EmbeddingClient 互換のクライアントを作成
-        client = OllamaEmbeddingClient(model=model_name)
-
-        # ConversationEmbedder へは client と embedding_version を渡すのが正
-        self._inner = ConversationEmbedder(
-            client=client,
-            embedding_version=model_name,  # 例: "mxbai-embed-large"
+        if not isinstance(query_text, str):
+            query_text = str(query_text)
+        query_emb = self._client.embed_one(query_text)
+        return self._store.knn_messages(
+            conversation_id=session_id,
+            query_embedding=query_emb,
+            k=k,
+            min_cosine=min_cosine,
+            role_filter=role_filter,
         )
 
-        # 便利メソッド（既にあれば上書きしない）
-        if not hasattr(self, "embed_text"):
-            self.embed_text = lambda text: self._inner.embed_text(text)
-        if not hasattr(self, "embed_documents"):
-            self.embed_documents = lambda texts: self._inner.embed_texts(texts)
-
-    @property
-    def model_name(self) -> str:
-        """利用中の埋め込みモデル名を返す。"""
-        # ConversationEmbedder 側に model_name 属性がある前提。なければ既定名を返す。
-        return getattr(self._inner, "model_name", "mxbai-embed-large")
-
-    @property
-    def dim(self) -> int:
-        """埋め込みベクトルの次元数を返す（mxbai-embed-large は 1024）。"""
-        return int(getattr(self._inner, "dim", 1024))
-
-    def embed_text(self, text: str, lang: Optional[str] = None) -> List[float]:
+    # ----------------------------------------
+    # LLM へ渡すメモリ断片のフォーマット
+    # ----------------------------------------
+    @staticmethod
+    def format_memory_snippets(excerpts: List[Dict[str, Any]], max_chars: int = 2400) -> str:
         """
-        単一テキストの埋め込み（ヘルパー）。RAG 側で単発呼び出しが必要な場合に備える。
+        LLM テンプレートの "Memory" セクション用に、近傍会話抜粋を整形。
+        - バイト数ではなく文字数基準で簡易的に切り詰め（サーバ側 Unicode 前提）
         """
-        if text is None:
-            raise ValueError("text は None にできません。")
-        t = text.strip()
-        if not t:
-            # 空文字は全ゼロベクトルを返して呼び出し側でスキップしやすくする
-            return [0.0] * self.dim
-        return self._inner.embed_text(t, lang=lang)
+        lines: List[str] = []
+        for ex in excerpts:
+            speaker = ex.get("speaker", "user")
+            turn_id = ex.get("turn_id", "-")
+            ts = ex.get("ts")
+            text = ex.get("text", "")
+            # テキストは 1 行に整形（改行はスペースへ）
+            text_line = " ".join(str(text).split())
+            lines.append(f"[{speaker}] turn:{turn_id} {ts}: {text_line}")
+        joined = "\n".join(lines)
+        if len(joined) > max_chars:
+            joined = joined[: max_chars - 3] + "..."
+        return joined
 
-    def embed_texts(self, texts: List[str], lang: Optional[str] = None) -> List[List[float]]:
+    # ----------------------------------------
+    # ベクタストア用の埋め込み関数（RAG スクリプト互換）
+    # ----------------------------------------
+    def embedding_function_for_vectorstore(self) -> Callable[[List[str]], List[List[float]]]:
         """
-        複数テキストをバッチ埋め込み。
-        - 内部ではチャンクに分けて逐次 embed してメモリ使用量を抑制。
-        - 入力が None/空文字の場合はゼロベクトルを返す（スキップしやすくするための方針）。
+        Chroma などの embedding_function に渡すためのコール可能を返す。
         """
-        if texts is None:
-            raise ValueError("texts は None にできません。")
-
-        results: List[List[float]] = []
-        dim = self.dim
-
-        def _embed_one(s: Optional[str]) -> List[float]:
-            if s is None:
-                return [0.0] * dim
-            t = s.strip()
-            if not t:
-                return [0.0] * dim
-            return self._inner.embed_text(t, lang=lang)
-
-        # チャンク逐次処理
-        n = len(texts)
-        if n == 0:
-            return results
-
-        for i in range(0, n, self._chunk_size):
-            chunk = texts[i : i + self._chunk_size]
-            for s in chunk:
-                results.append(_embed_one(s))
-
-        return results
+        return _VectorStoreEmbeddingFn(self._client)
