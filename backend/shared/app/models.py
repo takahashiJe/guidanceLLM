@@ -1,267 +1,345 @@
-# backend/shared/app/models.py
-# ※ SQLAlchemy モデル定義。アプリ全体で参照されるスキーマをここで一元管理します。
-# - 既存の database.py（SessionLocal, Base）と連携する想定
-# - 既存のコードから参照されるカラム名/リレーションに合わせて定義
-# - Alembic を導入する前提であっても、初期段階ではこの定義で動作するように実装
+# -*- coding: utf-8 -*-
+"""
+アプリ全体で共有する SQLAlchemy モデル定義。
+- 本ファイルは API Gateway / Worker の双方からインポートされる
+- Alembic の target_metadata は Base.metadata を参照（migrations/env.py 側で設定）
+- 既存のモデルを壊さず、フェーズ0〜10の追加要件（pre_generated_guides / conversation_embeddings）を含む
+
+ポイント
+- pgvector が利用可能なら Vector 型、なければ JSON(List[float]) で埋め込みを保持
+- pre_generated_guides は (session_id, spot_id, lang) を一意制約
+- 会話履歴 / セッション / 計画 / スポット / アクセスポイントなどのリレーションを付与
+"""
 
 from __future__ import annotations
+
+import os
+import enum
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional
 
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Date, ForeignKey,
-    Text, Float, Enum, Boolean, Index, UniqueConstraint
+    Column,
+    Integer,
+    BigInteger,
+    String,
+    Text,
+    Date,
+    DateTime,
+    Float,
+    Boolean,
+    ForeignKey,
+    UniqueConstraint,
+    Index,
+    Enum as SAEnum,
+    JSON,
 )
-from sqlalchemy.orm import relationship, Mapped, mapped_column, declarative_base
-from sqlalchemy.dialects.postgresql import JSONB
-import enum
+from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.sql import func
 
+# ------------------------------------------------------------
+# Base
+# ------------------------------------------------------------
 Base = declarative_base()
 
+
+# ------------------------------------------------------------
+# pgvector 利用可否の判定と型定義
+# ------------------------------------------------------------
+USE_PGVECTOR = False
+Vector = None  # type: ignore[misc]
+
 try:
-    from pgvector.sqlalchemy import Vector
-    HAS_PGVECTOR = True
+    # pgvector がインストール済みか確認
+    from pgvector.sqlalchemy import Vector  # type: ignore
+    USE_PGVECTOR = True
 except Exception:
-    Vector = None  # type: ignore
-    HAS_PGVECTOR = False
+    USE_PGVECTOR = False
+
+# 埋め込みベクトル次元数（mxbai-embed-large は 1024 次元）
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+EMBEDDING_VERSION_DEFAULT = os.getenv("EMBEDDING_VERSION", "mxbai-embed-large@v1")
+
 
 # ------------------------------------------------------------
-# 列挙型の定義
+# Enum 定義
 # ------------------------------------------------------------
+class Speaker(str, enum.Enum):
+    user = "user"
+    assistant = "assistant"
+    system = "system"
 
-class AppStatus(str, enum.Enum):
-    browse = "Browse"
-    planning = "planning"
-    navigating = "navigating"
 
 class SpotType(str, enum.Enum):
+    # 必要に応じて拡張（観光スポット・登山口・駐車場・宿泊施設など）
     tourist_spot = "tourist_spot"
-    accommodation = "accommodation"
-
-class AccessPointType(str, enum.Enum):
-    parking = "parking"
     trailhead = "trailhead"
-    others = "others"
+    parking = "parking"
+    facility = "facility"
+    other = "other"
 
 
 # ------------------------------------------------------------
-# ユーザー・認証まわり
+# User / Auth 関連
 # ------------------------------------------------------------
-
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    preferred_lang = Column(String(8), nullable=True)  # 例: "ja" / "en" / "zh"
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    # logical relations
-    sessions: Mapped[List["Session"]] = relationship("Session", back_populates="user", cascade="all, delete-orphan")
-    plans: Mapped[List["Plan"]] = relationship("Plan", back_populates="user", cascade="all, delete-orphan")
+    plans = relationship("Plan", back_populates="user", cascade="all, delete-orphan")
+
+    def __repr__(self) -> str:
+        return f"<User id={self.id} email={self.email}>"
 
 
 # ------------------------------------------------------------
-# 会話セッション管理
+# セッション / 会話履歴
 # ------------------------------------------------------------
-
 class Session(Base):
+    """
+    アプリ内の対話セッション。id は UUID/ULID 文字列想定（API 層で払い出し）。
+    """
     __tablename__ = "sessions"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    # フロント生成の一意なID（localStorage に保持）を string で受ける
-    session_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    id = Column(String(64), primary_key=True)  # UUID/ULID 文字列
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    # 現在のアプリ状態（例: "idle", "information", "planning", "navigating" など）
+    app_status = Column(String(64), nullable=True)
+    # アクティブな計画（存在しない場合は None）
+    active_plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
 
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    user: Mapped["User"] = relationship("User", back_populates="sessions")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    current_status: Mapped[AppStatus] = mapped_column(Enum(AppStatus), default=AppStatus.browse, nullable=False)
-    active_plan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("plans.id"), nullable=True)
+    user = relationship("User")
+    active_plan = relationship("Plan", foreign_keys=[active_plan_id])
+    histories = relationship("ConversationHistory", back_populates="session", cascade="all, delete-orphan")
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-
-    # relations
-    active_plan: Mapped[Optional["Plan"]] = relationship("Plan", foreign_keys=[active_plan_id])
-    histories: Mapped[List["ConversationHistory"]] = relationship("ConversationHistory", back_populates="session", cascade="all, delete-orphan")
-
-    __table_args__ = (
-        Index("ix_sessions_user_session", "user_id", "session_id"),
-    )
+    def __repr__(self) -> str:
+        return f"<Session id={self.id} user_id={self.user_id} app_status={self.app_status}>"
 
 
 class ConversationHistory(Base):
-    __tablename__ = "conversation_histories"
+    """
+    会話の逐次履歴。短期記憶の材料として直近5往復を抽出する。
+    """
+    __tablename__ = "conversation_history"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), nullable=False, index=True)
-    role: Mapped[str] = mapped_column(String(32), nullable=False)  # "user" | "assistant" | "system"
-    # ユーザー入力ではない自動ガイド等は本文の代わりに「SYSTEM_TRIGGER」を記録
-    content: Mapped[Text] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String(32), nullable=False)  # "user" / "assistant" / "system"
+    content = Column(Text, nullable=False)
+    lang = Column(String(8), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    session: Mapped["Session"] = relationship("Session", back_populates="histories")
+    session = relationship("Session", back_populates="histories")
+
+    __table_args__ = (
+        Index("ix_convhist_session_created", "session_id", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ConversationHistory id={self.id} session_id={self.session_id} role={self.role}>"
 
 
 # ------------------------------------------------------------
-# スポット・アクセスポイント
+# 会話長期記憶（Embedding 保存）
 # ------------------------------------------------------------
+class ConversationEmbedding(Base):
+    """
+    長期記憶としての会話埋め込み。
+    - pgvector を使える場合は Vector 型、使えない場合は JSON(List[float]) として保存
+    - kNN 検索はサービス層（worker/app/services/embeddings.py）で抽象化
+    """
+    __tablename__ = "conversation_embeddings"
 
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # セッション単位での検索を基本とする（session_id で絞って近傍検索）
+    session_id = Column(String(64), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # 会話の話者とテキスト
+    speaker = Column(SAEnum(Speaker), nullable=False, index=True)
+    lang = Column(String(8), nullable=True)
+    text = Column(Text, nullable=False)
+
+    # タイムスタンプ（時系列での再構成やフィルタ用）
+    ts = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    # 埋め込みモデルのバージョン（後方互換維持のため）
+    embedding_version = Column(String(64), nullable=False, default=EMBEDDING_VERSION_DEFAULT)
+
+    if USE_PGVECTOR and Vector is not None:
+        # pgvector(Vector) 型
+        embedding = Column(Vector(EMBEDDING_DIM), nullable=False)
+        __table_args__ = (
+            Index("ix_convemb_session_ts", "session_id", "ts"),
+            # pgvector 専用のインデックス（IVFFlat）。初回は Alembic 側で CREATE INDEX ... USING ivfflat を推奨
+            # ここでは btree 以外の作成は Alembic/SQL 側で行うことを前提とし、モデル側では通常 Index のみ。
+        )
+    else:
+        # フォールバック（JSON の float 配列）
+        embedding = Column(JSON, nullable=False)  # 例: [0.01, -0.23, ...]
+        __table_args__ = (
+            Index("ix_convemb_session_ts", "session_id", "ts"),
+        )
+
+    session = relationship("Session")
+
+    def __repr__(self) -> str:
+        return f"<ConversationEmbedding id={self.id} session_id={self.session_id} speaker={self.speaker.value}>"
+
+
+# ------------------------------------------------------------
+# スポット / アクセスポイント関連
+# ------------------------------------------------------------
 class Spot(Base):
+    """
+    観光スポット等の静的情報（Information Service の主要データ源）。
+    - tags は JSON 配列（例: ["waterfall", "山", "ハイキング"]）
+    """
     __tablename__ = "spots"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    official_name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    social_proof: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    official_name = Column(String(255), nullable=False, index=True)
+    spot_type = Column(SAEnum(SpotType), nullable=False, index=True, default=SpotType.tourist_spot)
+
+    # タグ配列：カテゴリ検索（category intent）に利用
+    tags = Column(JSON, nullable=True)  # List[str]
 
     # 位置情報
-    latitude: Mapped[float] = mapped_column(Float, nullable=False)
-    longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
 
-    # タグはカンマ区切りのシンプルな文字列として保持（PostgreSQL の Array でもよい）
-    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # ガイド文作成に必要な静的情報
+    description = Column(Text, nullable=True)
+    social_proof = Column(Text, nullable=True)
 
-    spot_type: Mapped[SpotType] = mapped_column(Enum(SpotType), default=SpotType.tourist_spot, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    # リレーション
+    stops = relationship("Stop", back_populates="spot")
 
-    # relations
-    stops: Mapped[List["Stop"]] = relationship("Stop", back_populates="spot")
+    __table_args__ = (
+        Index("ix_spots_type_name", "spot_type", "official_name"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Spot id={self.id} name={self.official_name} type={self.spot_type.value}>"
 
 
 class AccessPoint(Base):
+    """
+    アクセスポイント（駐車場や登山口などの起点）。
+    - AccessPoint テーブルはオーケストレーターのルート分割判断（車→徒歩）に活用
+    """
     __tablename__ = "access_points"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    ap_type: Mapped[AccessPointType] = mapped_column(Enum(AccessPointType), default=AccessPointType.parking, nullable=False)
-    latitude: Mapped[float] = mapped_column(Float, nullable=False)
-    longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, index=True)
+    ap_type = Column(String(64), nullable=True)  # 例: "parking", "trailhead"
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
 
-    # どの Spot へ向かうための AP か（NULL 許容：汎用駐車場など）
-    spot_id: Mapped[Optional[int]] = mapped_column(ForeignKey("spots.id"), nullable=True)
-    spot: Mapped[Optional["Spot"]] = relationship("Spot")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    # 最近傍判定のためのインデックス
-    __table_args__ = (
-        Index("ix_access_points_lat_lon", "latitude", "longitude"),
-    )
+    def __repr__(self) -> str:
+        return f"<AccessPoint id={self.id} name={self.name}>"
 
 
 # ------------------------------------------------------------
-# 計画（滞在時間の概念は持たず、順序リストのみ）
+# 計画（Plan）/ 立寄り順序（Stop）
 # ------------------------------------------------------------
-
 class Plan(Base):
+    """
+    周遊計画。滞在時間の概念は持たず、Stops の順序のみ管理（FR-4）。
+    """
     __tablename__ = "plans"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    user: Mapped["User"] = relationship("User", back_populates="plans")
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    start_date = Column(Date, nullable=True, index=True)
 
-    # 計画の開始日（混雑集計のキー）
-    start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    user = relationship("User", back_populates="plans")
+    stops = relationship("Stop", back_populates="plan", order_by="Stop.order_index", cascade="all, delete-orphan")
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    __table_args__ = (
+        Index("ix_plans_user_date", "user_id", "start_date"),
+    )
 
-    stops: Mapped[List["Stop"]] = relationship("Stop", back_populates="plan", cascade="all, delete-orphan", order_by="Stop.order_index")
+    def __repr__(self) -> str:
+        return f"<Plan id={self.id} user_id={self.user_id} start_date={self.start_date}>"
 
 
 class Stop(Base):
+    """
+    計画の訪問先（順序リスト）。
+    """
     __tablename__ = "stops"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id"), nullable=False, index=True)
-    spot_id: Mapped[int] = mapped_column(ForeignKey("spots.id"), nullable=False, index=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, index=True)
+    spot_id = Column(Integer, ForeignKey("spots.id", ondelete="CASCADE"), nullable=False, index=True)
 
-    order_index: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # 訪問順序（0,1,2,...）
+    order_index = Column(Integer, nullable=False, index=True)
 
-    plan: Mapped["Plan"] = relationship("Plan", back_populates="stops")
-    spot: Mapped["Spot"] = relationship("Spot", back_populates="stops")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    plan = relationship("Plan", back_populates="stops")
+    spot = relationship("Spot", back_populates="stops")
 
     __table_args__ = (
         UniqueConstraint("plan_id", "order_index", name="uq_stops_plan_order"),
         Index("ix_stops_plan_order", "plan_id", "order_index"),
     )
 
+    def __repr__(self) -> str:
+        return f"<Stop id={self.id} plan_id={self.plan_id} spot_id={self.spot_id} idx={self.order_index}>"
+
 
 # ------------------------------------------------------------
-# 事前生成ガイド（ナビ開始時に作成・参照）
+# 事前生成ガイド（FR-5-4-1）
 # ------------------------------------------------------------
-
 class PreGeneratedGuide(Base):
+    """
+    ナビ開始時などにスポットごとのガイド文を事前生成して保持。
+    - 一意性: (session_id, spot_id, lang)
+    """
     __tablename__ = "pre_generated_guides"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), nullable=False, index=True)
-    spot_id: Mapped[int] = mapped_column(ForeignKey("spots.id"), nullable=False, index=True)
-    lang: Mapped[str] = mapped_column(String(8), nullable=False)  # "ja" | "en" | "zh"
-    text: Mapped[str] = mapped_column(Text, nullable=False)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    spot_id = Column(Integer, ForeignKey("spots.id", ondelete="CASCADE"), nullable=False, index=True)
+    lang = Column(String(8), nullable=False, index=True)
+    text = Column(Text, nullable=False)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    # relations（必要に応じて参照）
-    session: Mapped["Session"] = relationship("Session")
-    spot: Mapped["Spot"] = relationship("Spot")
-
-# =========================================================
-# ConversationEmbedding（長期記憶）
-# =========================================================
-class ConversationEmbedding(Base):
-    """
-    長期記憶：会話の埋め込み保存テーブル
-    - セッション識別は sessions.session_id（フロント生成の一意ID）に合わせる
-    - pgvector が使えるなら Vector 型、無ければ JSONB にフォールバック
-    """
-    __tablename__ = "conversation_embeddings"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-
-    # FK は sessions.session_id を参照（型は String(64)）
-    session_id: Mapped[str] = mapped_column(
-        String(64),
-        ForeignKey("sessions.session_id", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-
-    speaker: Mapped[str] = mapped_column(String(16), nullable=False)  # "user" / "assistant"
-    lang: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
-    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-    text: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding_version: Mapped[str] = mapped_column(String(64), nullable=False)
-
-    if HAS_PGVECTOR:
-        # mxbai-embed-large の次元数は 1024
-        embedding = mapped_column(Vector(1024), nullable=False)
-    else:
-        # フォールバック（DBに pgvector 無い場合）：JSONB に embedding 配列を保存
-        from sqlalchemy.dialects.postgresql import JSONB  # lazy import
-        embedding = mapped_column(JSONB, nullable=False)
+    session = relationship("Session")
+    spot = relationship("Spot")
 
     __table_args__ = (
-        # よく使う検索パターン用の複合インデックス（任意）
-        Index("ix_convemb_session_ts", "session_id", "ts"),
+        UniqueConstraint("session_id", "spot_id", "lang", name="uq_pre_guides_session_spot_lang"),
+        Index("ix_pre_guides_spot_lang", "spot_id", "lang"),
     )
 
-class RefreshToken(Base):
-    __tablename__ = "refresh_tokens"
+    def __repr__(self) -> str:
+        return f"<PreGeneratedGuide id={self.id} session_id={self.session_id} spot_id={self.spot_id} lang={self.lang}>"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    session_id = Column(String, nullable=True)  # 監査用（フロント生成のセッションID）
-    token_type = Column(String, default="refresh", nullable=False)
-    jti = Column(String, unique=True, nullable=False)
-    revoked = Column(Boolean, default=False, nullable=False)
-    replaced_by_jti = Column(String, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    last_used_at = Column(DateTime, nullable=True)
-    expires_at = Column(DateTime, nullable=False)
 
-    user = relationship("User", backref="refresh_tokens")
+# ------------------------------------------------------------
+# 参考: 混雑マテビューは Alembic / 初期化 SQL 側で管理
+# - congestion_by_date_spot / spot_congestion_mv 等
+# - ここでは Model クラスを定義しない（読み取りは生SQL or text() で実施）
+# ------------------------------------------------------------

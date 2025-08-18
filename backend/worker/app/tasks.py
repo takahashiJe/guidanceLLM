@@ -1,18 +1,17 @@
-# backend/worker/app/tasks.py
+# -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # 役割:
 #  - API Gateway から Celery 経由で渡されるタスクを受け取り、
 #    各専門サービス（オーケストレーション、音声、情報、経路など）
 #    に委譲する「受け口」を集約する。
-#  - タスク名は必ず shared.app.tasks のシグネチャ（名前）と一致させる。
+#  - タスク名は必ず shared.app.tasks の定数を使用し、両者の不整合を防ぐ。
 #  - ここではビジネスロジックは極力書かず、呼び出しと例外処理に徹する。
 #
 # ポイント:
 #  - テキスト/音声の混在に対応（音声はSTTでテキスト化）
 #  - LangGraph の実行（orchestrator）を単一のタスクに集約
 #  - ナビ開始/位置更新のトリガーを用意（Navigation Service連携）
-#  - 事前ガイド生成のタスクを用意（pre_generated_guides への保存は
-#    各サービス側の責務。ここでは委譲のみ）
+#  - 事前ガイド生成の実行。DB 保存はサービス側の責務（本ファイルは委譲）
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -22,31 +21,34 @@ import traceback
 from typing import Any, Dict, Optional
 
 from shared.app.celery_app import celery_app
-# タスク名は必ず shared.app.tasks の定数を使用（ズレ防止）
+from shared.app import models, schemas
+from shared.app.database import SessionLocal
+
+# タスク名の定数は shared 側のものを唯一の参照元とする
 from shared.app.tasks import (
     TASK_ORCHESTRATE_CONVERSATION,
     TASK_START_NAVIGATION,
     TASK_UPDATE_LOCATION,
     TASK_PREGENERATE_GUIDES,
+    TASK_STT_TRANSCRIBE,
+    TASK_TTS_SYNTHESIZE,
 )
 
-# DB 接続やスキーマ（必要に応じて使用）
-from shared.app.database import SessionLocal  # noqa: F401
-from shared.app import models, schemas  # noqa: F401
-
-# 各サービス（Worker 側）をインポート
+# 各サービス（Worker 側）
 from worker.app.services.voice.voice_service import VoiceService
 from worker.app.services.orchestration import state as orch_state
 from worker.app.services.orchestration.graph import build_graph  # LangGraph 構築
 from worker.app.services.navigation.navigation_service import NavigationService
 
 # 必要に応じて利用（ナッジ・距離/時間などは内部で他サービスへ連携）
-from worker.app.services.information.information_service import InformationService  # noqa: F401
-from worker.app.services.itinerary.itinerary_service import ItineraryService  # noqa: F401
-from worker.app.services.routing.routing_service import RoutingService  # noqa: F401
+from worker.app.services.information.information_service import InformationService
+from worker.app.services.itinerary.itinerary_service import ItineraryService
+from worker.app.services.routing.routing_service import RoutingService
 
-from shared.app.schemas import STTRequest, STTResult, TTSRequest, TTSResult
 
+# ------------------------------------------------------------
+# 内部ユーティリティ
+# ------------------------------------------------------------
 
 def _ensure_text_from_audio_if_needed(
     *,
@@ -69,7 +71,7 @@ def _ensure_text_from_audio_if_needed(
 
         vs = VoiceService()
         # Whisper で STT。source_lang が None の場合は自動検出を期待。
-        text = vs.stt_handler.transcribe_audio_bytes(audio_bytes, language=source_lang)
+        text, _meta = vs.transcribe(audio_bytes, lang_hint=source_lang)
         if not text or not text.strip():
             raise ValueError("音声のテキスト化に失敗しました。")
         return text.strip()
@@ -77,9 +79,10 @@ def _ensure_text_from_audio_if_needed(
     raise ValueError("message_text も audio_b64 も指定されていません。")
 
 
-# ============================
-# Orchestration（会話中核タスク）
-# ============================
+# ------------------------------------------------------------
+# Orchestration（LangGraph 実行）
+# ------------------------------------------------------------
+
 @celery_app.task(name=TASK_ORCHESTRATE_CONVERSATION, bind=True)
 def orchestrate_conversation_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -142,9 +145,10 @@ def orchestrate_conversation_task(self, payload: Dict[str, Any]) -> Dict[str, An
         }
 
 
-# ============================
-# Navigation（開始/位置更新/事前生成）
-# ============================
+# ------------------------------------------------------------
+# Navigation: 開始 / 位置更新 / 事前ガイド生成
+# ------------------------------------------------------------
+
 @celery_app.task(name=TASK_START_NAVIGATION, bind=True)
 def navigation_start_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -261,11 +265,11 @@ def pregenerate_guides_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-# ============================
-# Voice（STT/TTS 軽量ユーティリティ）
-# ============================
-_voice_service: Optional[VoiceService] = None
+# ------------------------------------------------------------
+# Voice: STT / TTS
+# ------------------------------------------------------------
 
+_voice_service: Optional[VoiceService] = None
 
 def _get_voice_service() -> VoiceService:
     global _voice_service
@@ -274,11 +278,15 @@ def _get_voice_service() -> VoiceService:
     return _voice_service
 
 
-@celery_app.task(name="voice.stt_transcribe", bind=True)
+@celery_app.task(name=TASK_STT_TRANSCRIBE, bind=True)
 def stt_transcribe(self, payload: dict) -> dict:
     """
     base64 音声 → テキスト
+    入力: { "audio_b64": str, "lang": "ja"|"en"|"zh"|None }
+    戻り値: { "text": str, "detected_language": str|None, "duration": float|None, "language_probability": float|None }
     """
+    from shared.app.schemas import STTRequest, STTResult  # 依存を循環させないため関数内 import
+
     req = STTRequest(**payload)
     service = _get_voice_service()
     audio_bytes = base64.b64decode(req.audio_b64)
@@ -291,11 +299,15 @@ def stt_transcribe(self, payload: dict) -> dict:
     ).model_dump()
 
 
-@celery_app.task(name="voice.tts_synthesize", bind=True)
+@celery_app.task(name=TASK_TTS_SYNTHESIZE, bind=True)
 def tts_synthesize(self, payload: dict) -> dict:
     """
     テキスト → base64 WAV
+    入力: { "text": str, "lang": "ja"|"en"|"zh" }
+    戻り値: { "audio_b64": str, "sample_rate": int, "lang": str }
     """
+    from shared.app.schemas import TTSRequest, TTSResult  # 依存を循環させないため関数内 import
+
     req = TTSRequest(**payload)
     service = _get_voice_service()
     audio_bytes, meta = service.synthesize(req.text, lang=req.lang)

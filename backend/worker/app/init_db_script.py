@@ -1,125 +1,162 @@
 # -*- coding: utf-8 -*-
 """
-DB 初期化スクリプト（冪等）
-- 既存テーブル作成
-- pgvector 拡張作成（存在しなくても続行）
-- conversation_embeddings の埋め込み列を Vector(1024) へ強制整合
-- IVFFLAT インデックス作成（存在しなければ）
+DB 初期化スクリプト（db-init コンテナ用）
+------------------------------------------------------------
+役割:
+  1) Postgres の起動を待つ（リトライ）
+  2) Alembic によりスキーマを最新化（upgrade head）
+  3) 初回起動直後に、存在するマテビューをリフレッシュ
+     - congestion_by_date_spot（ユニークインデックスがあれば CONCURRENTLY）
+     - spot_congestion_mv（存在する場合の後方互換）
+
+環境変数:
+  - DATABASE_URL / ALEMBIC_DB_URL: DB 接続 URL（どちらかがあれば可）
+  - ALEMBIC_SCRIPT_LOCATION: Alembic の migrations ディレクトリ
+      例: backend/shared/app/migrations
+      未指定の場合は __file__ から相対で解決
+  - ALEMBIC_INI_PATH: alembic.ini のパス（既定 "alembic.ini"）
+  - DB_INIT_MAX_WAIT_SEC: DB 起動待機の最大秒数（既定 120）
+  - DB_INIT_RETRY_INTERVAL_SEC: 接続リトライ間隔（既定 2）
 """
 
 from __future__ import annotations
 
 import os
 import sys
-import traceback
-from contextlib import contextmanager
+import time
+import logging
+from pathlib import Path
+from typing import Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# 共有モデルを利用
-from shared.app.models import Base
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    print("[init_db_script] ERROR: DATABASE_URL is not set.", file=sys.stderr)
-    sys.exit(1)
-
-engine: Engine = create_engine(DATABASE_URL, future=True)
+from alembic import command
+from alembic.config import Config
 
 
-@contextmanager
-def begin_conn(e: Engine):
-    with e.begin() as conn:
-        yield conn
+# ------------------------------------------------------------
+# ロガー設定
+# ------------------------------------------------------------
+logger = logging.getLogger("db-init")
+handler = logging.StreamHandler(stream=sys.stdout)
+formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 
-def create_extension_vector(e: Engine) -> None:
-    # pgvector が使える環境なら拡張を作成（なければ警告のみで続行）
-    with begin_conn(e) as conn:
-        try:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-        except Exception as err:
-            print(f"[init_db_script] NOTE: pgvector extension not available: {err}")
+# ------------------------------------------------------------
+# ユーティリティ
+# ------------------------------------------------------------
+def _resolve_db_url() -> str:
+    """DATABASE_URL / ALEMBIC_DB_URL のいずれかから DB URL を決定。"""
+    db_url = os.getenv("ALEMBIC_DB_URL") or os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL または ALEMBIC_DB_URL が未設定です。")
+    return db_url
 
 
-def create_tables(e: Engine) -> None:
-    # 既存テーブル作成（models.py に定義された全テーブル）
-    Base.metadata.create_all(bind=e)
-
-
-def _convemb_udt_name(e: Engine) -> str | None:
-    # conversation_embeddings.embedding の実際の型名を取得（vector/jsonb 等）
-    q = text("""
-        SELECT udt_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'conversation_embeddings'
-          AND column_name = 'embedding'
-        LIMIT 1;
-    """)
-    with begin_conn(e) as conn:
-        row = conn.execute(q).fetchone()
-        return row[0] if row else None
-
-
-def _convemb_is_empty(e: Engine) -> bool:
-    with begin_conn(e) as conn:
-        row = conn.execute(text("SELECT COUNT(*) FROM conversation_embeddings;")).fetchone()
-        return (row[0] == 0) if row else True
-
-
-def ensure_convemb_vector_and_index(e: Engine) -> None:
+def _resolve_script_location() -> str:
     """
-    - 埋め込み列が jsonb のままなら、空テーブルであればドロップ→再作成して vector(1024) に。
-      （データがある場合は温存のためスキップし、検索性能は落ちるが動作は継続）
-    - 列が vector の場合は IVFFLAT インデックスを作成（存在しない場合のみ）。
+    Alembic の migrations ディレクトリを特定。
+    環境変数がなければ、__file__ から:
+      backend/worker/app/init_db_script.py
+      -> backend/shared/app/migrations
     """
-    udt = _convemb_udt_name(e)
-    if udt is None:
-        # テーブル自体が無いなら何もしない（create_all が後で作る前提）
-        return
+    env_loc = os.getenv("ALEMBIC_SCRIPT_LOCATION")
+    if env_loc:
+        return env_loc
 
-    if udt == "jsonb":
-        if _convemb_is_empty(e):
-            # 破壊的だが空なら安全：ドロップ→create_all で再作成（models は pgvector を前提にしておく）
-            print("[init_db_script] conversation_embeddings is JSONB & empty -> drop and recreate as vector")
-            with begin_conn(e) as conn:
-                conn.execute(text("DROP TABLE conversation_embeddings;"))
-            # 再作成
-            Base.metadata.create_all(bind=e)
-        else:
-            print("[init_db_script] WARNING: embeddings column is JSONB and table has rows -> keep JSONB (no IVFFLAT).")
-            return  # データ温存のため何もしない
+    here = Path(__file__).resolve()
+    backend_dir = here.parents[2]  # .../backend
+    migrations = backend_dir / "shared" / "app" / "migrations"
+    return str(migrations)
 
-    # ここまで来たら埋め込み列は vector のはず。IVFFLAT を作成（なければ）
-    with begin_conn(e) as conn:
+
+def _wait_for_db(db_url: str, max_wait: int = 120, interval: int = 2) -> Engine:
+    """Postgres 起動待機（接続が開くまでリトライ）。"""
+    engine = create_engine(db_url, future=True)
+    start = time.time()
+    while True:
         try:
-            conn.execute(text("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'ix_convemb_embedding_ivfflat') THEN
-                    CREATE INDEX ix_convemb_embedding_ivfflat
-                    ON conversation_embeddings
-                    USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
-                END IF;
-            END
-            $$;
-            """))
-        except Exception as err:
-            print(f"[init_db_script] NOTE: skip IVFFLAT index (pgvector/column mismatch?): {err}")
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            logger.info("DB 接続に成功しました。")
+            return engine
+        except Exception as e:
+            elapsed = int(time.time() - start)
+            if elapsed >= max_wait:
+                logger.error("DB 接続待機のタイムアウト: %s", str(e))
+                raise
+            logger.info("DB 起動待機中... (%ds/%ds): %s", elapsed, max_wait, str(e))
+            time.sleep(interval)
 
 
-def main() -> None:
+def _run_alembic_upgrade(script_location: str, db_url: str) -> None:
+    """Alembic で upgrade head を実行。"""
+    ini_path = os.getenv("ALEMBIC_INI_PATH", "alembic.ini")
+    logger.info("Alembic 実行開始: script_location=%s, ini=%s", script_location, ini_path)
+
+    cfg = Config(ini_path)
+    # ini 側の設定を環境変数で上書き
+    cfg.set_main_option("script_location", script_location)
+    cfg.set_main_option("sqlalchemy.url", db_url)
+
+    # upgrade 実行
+    command.upgrade(cfg, "head")
+    logger.info("Alembic upgrade head 完了。")
+
+
+def _refresh_materialized_view(engine: Engine, name: str, use_concurrently: bool = True) -> None:
+    """
+    マテリアライズドビューを REFRESH。
+    - CONCURRENTLY が使えない場合（初回など）は通常 REFRESH にフォールバック。
+    """
+    with engine.begin() as conn:
+        if use_concurrently:
+            try:
+                conn.execute(text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {name};"))
+                logger.info("REFRESH MATERIALIZED VIEW CONCURRENTLY %s 実行。", name)
+                return
+            except Exception as e:
+                logger.warning("CONCURRENTLY 失敗のため通常 REFRESH にフォールバック: %s", e)
+
+        # 通常 REFRESH
+        try:
+            conn.execute(text(f"REFRESH MATERIALIZED VIEW {name};"))
+            logger.info("REFRESH MATERIALIZED VIEW %s 実行。", name)
+        except Exception as e:
+            # MV が存在しない等は警告ログのみ（冪等運用のため）
+            logger.warning("REFRESH MATERIALIZED VIEW %s 失敗（スキップ）: %s", name, e)
+
+
+def main() -> int:
     try:
-        create_extension_vector(engine)  # pgvector 拡張
-        create_tables(engine)            # 既存：全テーブル作成
-        ensure_convemb_vector_and_index(engine)  # JSONB→vector 修正 & インデックス
-        print("[init_db_script] DB init completed.")
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
+        db_url = _resolve_db_url()
+        max_wait = int(os.getenv("DB_INIT_MAX_WAIT_SEC", "120"))
+        interval = int(os.getenv("DB_INIT_RETRY_INTERVAL_SEC", "2"))
+
+        # 1) DB 起動待機
+        engine = _wait_for_db(db_url, max_wait=max_wait, interval=interval)
+
+        # 2) Alembic upgrade head
+        script_location = _resolve_script_location()
+        _run_alembic_upgrade(script_location, db_url)
+
+        # 3) マテビューの初期 REFRESH（存在すれば）
+        #    - フェーズ5で合意した集計 MV
+        _refresh_materialized_view(engine, "congestion_by_date_spot", use_concurrently=True)
+        #    - 既存互換（もし使っていれば）
+        _refresh_materialized_view(engine, "spot_congestion_mv", use_concurrently=True)
+
+        logger.info("DB 初期化シーケンス完了。")
+        return 0
+
+    except Exception as e:
+        logger.exception("DB 初期化シーケンスで致命的エラー: %s", e)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

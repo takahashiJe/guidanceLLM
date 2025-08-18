@@ -1,126 +1,393 @@
-# worker/app/services/orchestration/state.py
+# -*- coding: utf-8 -*-
+"""
+Orchestration State 管理（ロード/セーブ + 短期記憶 + 長期埋め込み）
+--------------------------------------------------------------------
+責務:
+  - LangGraph 実行前の AgentState ロード（セッション情報・短期記憶）
+  - 実行後の AgentState セーブ（会話履歴の確定・アプリ状態の保存）
+  - セーブ時にユーザー発話/最終応答の埋め込みを ConversationEmbedding へ保存
+  - conversation_id / turn_id の採番規則を一箇所に集約
+
+注意:
+  - スキーマ差分に備え、存在する列のみ安全に更新/挿入する（列名の自動検出）
+  - SYSTEM_TRIGGER の履歴も ConversationHistory に残す（role/system）
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session
 
 from shared.app.database import SessionLocal
-from shared.app import models, schemas
+from shared.app import models
+from worker.app.services.embeddings import EmbeddingService
 
-# 既存の import 期待に合わせて、EmbeddingClient / save_conversation_embeddings をここから参照できるようにする
-from worker.app.services.embeddings import (
-    EmbeddingClient,
-    create_embedding_client,
-    save_conversation_embeddings,
-)
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------
+# 内部ユーティリティ: モデル列の検査と安全な dict 生成
+# ------------------------------------------------------------
+
+def _model_columns(model) -> List[str]:
+    """SQLAlchemy モデルのカラム名一覧を返す。"""
+    return [c.name for c in model.__table__.columns]  # type: ignore[attr-defined]
 
 
-# ========================
-# ドメイン状態
-# ========================
-@dataclass
-class AgentState:
+def _safe_kwargs(model, **kwargs) -> Dict[str, Any]:
+    """存在するカラムだけを抽出して返す。"""
+    cols = set(_model_columns(model))
+    return {k: v for k, v in kwargs.items() if k in cols}
+
+
+def _get_session_pk_name() -> str:
+    """Session モデルの PK に使う列名（id or session_id）を返す。"""
+    cols = set(_model_columns(models.Session))
+    if "id" in cols:
+        return "id"
+    if "session_id" in cols:
+        return "session_id"
+    # 想定外ケース
+    return "id"
+
+
+def _get_history_text_field_name() -> str:
+    """ConversationHistory の本文列名を返す（text / content / message の順で優先）。"""
+    cols = set(_model_columns(models.ConversationHistory))
+    for name in ("text", "content", "message"):
+        if name in cols:
+            return name
+    # 想定外ケース
+    return "text"
+
+
+def _get_history_role_field_name() -> str:
+    """ConversationHistory の話者列名（role/speaker）を返す。"""
+    cols = set(_model_columns(models.ConversationHistory))
+    return "role" if "role" in cols else ("speaker" if "speaker" in cols else "role")
+
+
+def _get_history_time_field_name() -> str:
+    """ConversationHistory の時刻列名（created_at/ts）を返す。"""
+    cols = set(_model_columns(models.ConversationHistory))
+    if "created_at" in cols:
+        return "created_at"
+    if "ts" in cols:
+        return "ts"
+    return "created_at"
+
+
+def _get_history_conv_id_field_name() -> Optional[str]:
+    """ConversationHistory の conversation_id 列名（存在しなければ None）。"""
+    cols = set(_model_columns(models.ConversationHistory))
+    if "conversation_id" in cols:
+        return "conversation_id"
+    return None
+
+
+def _get_history_turn_id_field_name() -> Optional[str]:
+    """ConversationHistory の turn_id 列名（存在しなければ None）。"""
+    cols = set(_model_columns(models.ConversationHistory))
+    if "turn_id" in cols:
+        return "turn_id"
+    return None
+
+
+# ------------------------------------------------------------
+# 公開: 短期記憶の取得（直近 N メッセージ）
+# ------------------------------------------------------------
+
+def get_recent_history(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     """
-    オーケストレーションで使う対話状態のコンテナ。
-    既存の schemas.AgentState との互換を保つため、必要なフィールドは維持。
+    指定セッションの直近 'limit' 件の会話履歴を、時系列（古→新）で返す。
+    - 短期記憶素材として利用（例: 直近5往復=10メッセージ）
     """
-    session_id: str
-    lang: str = "ja"
-    history: List[Dict[str, Any]] = field(default_factory=list)  # [{role, content, ...}]
-    app_status: Optional[str] = None
-    active_plan_id: Optional[str] = None
-    # 他に必要なフィールドがあれば増やすが、既存用途を壊さない範囲に留める
+    with SessionLocal() as db:
+        text_field = _get_history_text_field_name()
+        role_field = _get_history_role_field_name()
+        time_field = _get_history_time_field_name()
 
-
-# ========================
-# 状態のロード / 反映
-# ========================
-def load_state(session_id: str) -> AgentState:
-    """
-    DB から会話履歴やセッション情報を読み込み、AgentState を構成する。
-    既存の「復元処理」の目的を踏襲。
-    """
-    with SessionLocal() as db:  # type: Session
-        sess = db.query(models.Session).filter(models.Session.session_id == session_id).first()
-        if not sess:
-            # セッションがない場合も壊さず返す（上位で生成済みの想定）
-            return AgentState(session_id=session_id)
-
-        # 会話履歴（role, content の一覧を作る）
-        # 既存モデルに合わせて ConversationHistory を role/content に射影
-        histories = (
-            db.query(models.ConversationHistory)
-            .filter(models.ConversationHistory.session_id == session_id)
-            .order_by(models.ConversationHistory.created_at.asc())
-            .all()
+        q = (
+            select(models.ConversationHistory)
+            .where(getattr(models.ConversationHistory, "session_id") == session_id)
+            .order_by(desc(getattr(models.ConversationHistory, time_field)))
+            .limit(limit)
         )
+        rows = list(reversed(db.execute(q).scalars().all()))
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "role": getattr(r, role_field, None),
+                    "text": getattr(r, text_field, None),
+                    "ts": getattr(r, time_field, None).isoformat() if getattr(r, time_field, None) else None,
+                }
+            )
+        return out
 
-        history_payload: List[Dict[str, Any]] = []
-        for h in histories:
-            role = "user" if h.is_user else "assistant"
-            history_payload.append({"role": role, "content": h.content})
 
-        state = AgentState(
-            session_id=session_id,
-            lang=sess.lang or "ja",
-            history=history_payload,
-            app_status=sess.app_status,
-            active_plan_id=sess.active_plan_id,
-        )
+def _build_short_term(history: List[Dict[str, Any]], turns: int = 5) -> List[Dict[str, Any]]:
+    """
+    直近 'turns' 往復（user/assistant の 2 メッセージを 1 往復とみなす）を返す。
+    SYSTEM_TRIGGER は短期記憶には基本含めない（必要に応じて改変可能）。
+    """
+    # 末尾から user/assistant の組を拾う簡易実装
+    filtered = [h for h in history if h.get("role") in ("user", "assistant")]
+    take = max(0, min(len(filtered), turns * 2))
+    return filtered[-take:]
+
+
+# ------------------------------------------------------------
+# 公開: AgentState のロード
+# ------------------------------------------------------------
+
+def load_agent_state(session_id: str) -> Dict[str, Any]:
+    """
+    DB の Session / ConversationHistory から AgentState を構築して返す。
+    - app_status / active_plan_id / lang をセッションから復元
+    - 直近の履歴（短期記憶素材）を付与
+    """
+    with SessionLocal() as db:
+        # セッション本体のロード（なければ作成）
+        sess = _get_or_create_session(db, session_id)
+
+        # 直近10メッセージ（=5往復）を取得
+        full_recent = get_recent_history(session_id, limit=10)
+        short_term = _build_short_term(full_recent, turns=5)
+
+        state: Dict[str, Any] = {
+            "session_id": session_id,
+            "app_status": getattr(sess, "app_status", None),
+            "active_plan_id": getattr(sess, "active_plan_id", None),
+            "lang": getattr(sess, "lang", "ja"),
+            # Graph/N LU 側が参照しやすいキー
+            "chat_history": full_recent,     # 全メッセージ（直近10）
+            "short_term_history": short_term # 直近5往復のみ
+        }
         return state
 
 
-def apply_state_update(
+def _get_or_create_session(db: Session, session_id: str):
+    """Session レコードを取得 or 作成。PK 列名差（id/session_id）にも対応。"""
+    pk = _get_session_pk_name()
+    Sess = models.Session
+    q = select(Sess).where(getattr(Sess, pk) == session_id)
+    row = db.execute(q).scalar_one_or_none()
+    if row:
+        return row
+    # ない場合は作成（最小限の項目だけセット）
+    kwargs = _safe_kwargs(
+        Sess,
+        **{
+            pk: session_id,
+            "app_status": "idle",
+            "active_plan_id": None,
+            "lang": "ja",
+            "created_at": datetime.utcnow(),
+        }
+    )
+    row = Sess(**kwargs)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+# ------------------------------------------------------------
+# 公開: AgentState のセーブ（履歴 & セッション & 埋め込み）
+# ------------------------------------------------------------
+
+def save_agent_state(session_id: str, agent_state: Dict[str, Any]) -> None:
+    """
+    LangGraph 実行後の AgentState を永続化する。
+    - Session の app_status / active_plan_id / lang を更新
+    - ConversationHistory に ユーザー発話 / システム最終応答 を 1 ターンとして追記
+    - 追記後、それぞれのテキストを ConversationEmbedding に保存（長期記憶）
+    - SYSTEM_TRIGGER の場合は role='system' として履歴に含める
+    """
+    latest_user_message: Optional[str] = agent_state.get("latest_user_message")
+    final_response: Optional[str] = agent_state.get("final_response")
+    lang: str = agent_state.get("lang", "ja")
+    app_status: Optional[str] = agent_state.get("app_status")
+    active_plan_id: Optional[int] = agent_state.get("active_plan_id")
+
+    # 会話 ID（セッション単位で固定）
+    conversation_id: str = agent_state.get("conversation_id") or session_id
+
+    with SessionLocal() as db:
+        # 1) セッション更新（存在しなければ作成）
+        sess = _get_or_create_session(db, session_id)
+        _update_session_row(db, sess, app_status=app_status, active_plan_id=active_plan_id, lang=lang)
+
+        # 2) turn_id を採番
+        next_turn_id = _next_turn_id(db, session_id)
+
+        # 3) ConversationHistory へ追記
+        added_rows: List[Tuple[str, int, datetime, str]] = []  # (role, row_id, ts, text)
+
+        # ユーザー発話 or SYSTEM_TRIGGER を記録
+        if latest_user_message and latest_user_message.strip():
+            user_role = "system" if latest_user_message.strip().startswith("[SYSTEM_TRIGGER") else "user"
+            user_text = latest_user_message.strip()
+            r_id, r_ts = _append_history(
+                db=db,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                turn_id=next_turn_id,
+                role=user_role,
+                lang=lang,
+                text=user_text,
+            )
+            added_rows.append((user_role, r_id, r_ts, user_text))
+
+        # 最終応答を記録
+        if final_response and final_response.strip():
+            r_id, r_ts = _append_history(
+                db=db,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                turn_id=next_turn_id,
+                role="assistant",
+                lang=lang,
+                text=final_response.strip(),
+            )
+            added_rows.append(("assistant", r_id, r_ts, final_response.strip()))
+
+        db.commit()  # 履歴コミット
+
+        # 4) 長期記憶（埋め込み）を一括保存
+        _save_embeddings_batch(
+            rows=added_rows,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            lang=lang,
+        )
+
+
+def _update_session_row(
+    db: Session,
+    sess: Any,
+    *,
+    app_status: Optional[str],
+    active_plan_id: Optional[int],
+    lang: Optional[str],
+) -> None:
+    """Session 行を安全に更新。存在する列のみ書き込む。"""
+    Sess = models.Session
+    cols = set(_model_columns(Sess))
+    dirty = False
+
+    if app_status is not None and "app_status" in cols and getattr(sess, "app_status", None) != app_status:
+        setattr(sess, "app_status", app_status)
+        dirty = True
+
+    if "active_plan_id" in cols and getattr(sess, "active_plan_id", None) != active_plan_id:
+        setattr(sess, "active_plan_id", active_plan_id)
+        dirty = True
+
+    if lang is not None and "lang" in cols and getattr(sess, "lang", None) != lang:
+        setattr(sess, "lang", lang)
+        dirty = True
+
+    if dirty:
+        db.add(sess)
+        db.commit()
+        db.refresh(sess)
+
+
+def _next_turn_id(db: Session, session_id: str) -> int:
+    """
+    次の turn_id を返す。
+    - ConversationHistory に turn_id 列がある場合は MAX+1
+    - なければ 1 を返し、以降も固定（列が無い環境では turn_id は未使用）
+    """
+    turn_col = _get_history_turn_id_field_name()
+    if not turn_col:
+        return 1
+
+    CH = models.ConversationHistory
+    q = (
+        select(func.max(getattr(CH, turn_col)))
+        .where(getattr(CH, "session_id") == session_id)
+    )
+    max_turn = db.execute(q).scalar()
+    return int(max_turn or 0) + 1
+
+
+def _append_history(
+    *,
+    db: Session,
     session_id: str,
-    new_messages: List[Dict[str, Any]],
-    app_status: Optional[str] = None,
-    active_plan_id: Optional[str] = None,
-    embed_client: Optional[EmbeddingClient] = None,
+    conversation_id: Optional[str],
+    turn_id: Optional[int],
+    role: str,
+    lang: str,
+    text: str,
+) -> Tuple[int, datetime]:
+    """
+    ConversationHistory に 1 行挿入し、(row_id, ts) を返す。
+    - 列名差に対応（text/content/message, role/speaker, created_at/ts, conversation_id/turn_id は存在時のみ）
+    """
+    CH = models.ConversationHistory
+
+    text_field = _get_history_text_field_name()
+    role_field = _get_history_role_field_name()
+    time_field = _get_history_time_field_name()
+    conv_field = _get_history_conv_id_field_name()
+    turn_field = _get_history_turn_id_field_name()
+
+    now = datetime.utcnow()
+
+    kwargs = {
+        "session_id": session_id,
+        role_field: role,
+        text_field: text,
+        "lang": lang,
+        time_field: now,
+    }
+    if conv_field and conversation_id:
+        kwargs[conv_field] = conversation_id
+    if turn_field and turn_id is not None:
+        kwargs[turn_field] = turn_id
+
+    row = CH(**_safe_kwargs(CH, **kwargs))
+    db.add(row)
+    db.flush()  # id 採番
+    row_id: int = int(getattr(row, "id"))
+    ts: datetime = getattr(row, time_field, now)
+    return row_id, ts
+
+
+def _save_embeddings_batch(
+    *,
+    rows: List[Tuple[str, int, datetime, str]],
+    session_id: str,
+    conversation_id: str,
+    lang: str,
 ) -> None:
     """
-    会話の新規メッセージを保存し、必要なら埋め込みも保存する。
-    既存の「情報フロー確定時の副作用」を踏襲。
+    追加された履歴行に対して、埋め込み保存をまとめて実行。
+    rows: List[(role, row_id, ts, text)]
     """
-    if not new_messages:
+    if not rows:
         return
-
-    with SessionLocal() as db:  # type: Session
-        # 履歴の永続化
-        for m in new_messages:
-            role = (m.get("role") or "user").lower()
-            is_user = role in ("user", "human")
-            content = str(m.get("content") or m.get("text") or "").strip()
-            if not content:
-                continue
-            rec = models.ConversationHistory(
-                session_id=session_id,
-                is_user=is_user,
-                content=content,
-            )
-            db.add(rec)
-
-        # セッションのステータスの更新（必要なら）
-        sess = (
-            db.query(models.Session)
-            .filter(models.Session.session_id == session_id)
-            .with_for_update(nowait=False)
-            .first()
-        )
-        if sess:
-            if app_status is not None:
-                sess.app_status = app_status
-            if active_plan_id is not None:
-                sess.active_plan_id = active_plan_id
-
+    svc = EmbeddingService()
+    with SessionLocal() as db:
+        for role, row_id, ts, text in rows:
+            try:
+                svc.upsert_message(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    speaker=("system" if role == "system" else role),
+                    lang=lang,
+                    text=text,
+                    ts=ts,
+                    db=db,
+                )
+            except Exception as e:
+                # 埋め込み失敗はログのみ（本体の会話継続を阻害しない）
+                logger.warning(f"embedding upsert failed: session={session_id} role={role} id={row_id} err={e}")
         db.commit()
-
-    # 埋め込み保存（上書きしない。追記）
-    try:
-        client = embed_client or create_embedding_client()
-        save_conversation_embeddings(session_id=session_id, messages=new_messages, client=client)
-    except Exception:
-        # 埋め込み失敗は対話継続を阻害しない（既存の堅牢性の目的）
-        # ただしログ基盤があるなら警告を出すのが望ましい
-        pass
