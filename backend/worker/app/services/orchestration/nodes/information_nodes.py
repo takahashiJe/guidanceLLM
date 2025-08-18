@@ -213,3 +213,14 @@ def node_generate_nudge_text(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     state["final_response"] = text
     return state
+
+def information_entry(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    情報探索フェーズの入口ノード。
+    - state に intermediate（中間ワーク領域）が無ければ初期化
+    - そのまま次のノード（find_candidate_spots_node 等）に受け渡す
+    以降の分岐は Graph 側のエッジ定義（router/graph）で制御される。
+    """
+    if state.get("intermediate") is None:
+        state["intermediate"] = {}
+    return state
