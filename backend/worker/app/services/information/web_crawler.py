@@ -5,9 +5,13 @@ from typing import Optional, Dict, List
 import os
 import re
 from datetime import datetime, date
+import datetime as _dt
 
 import requests
 from bs4 import BeautifulSoup
+
+import logging
+
 
 
 def _normalize_condition(raw: str) -> str:
@@ -217,3 +221,64 @@ class TenkiCrawler:
             return condition
 
         return None
+
+_logger = logging.getLogger(__name__)
+_TENKI_CHOKAI_URL = "https://tenki.jp/mountain/famous/point-36/"  # 鳥海山のページ（DOM変動に強いよう大雑把に抽出）
+
+
+def _wc_fetch(url: str) -> Optional[str]:
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        _logger.warning("web_crawler fetch failed: %s (%s)", url, e)
+        return None
+
+def _wc_clean(s: str) -> str:
+    s = re.sub(r"\s+", " ", s or "")
+    return s.strip()
+
+def get_tenkijp_chokai_daily(date: _dt.date) -> str:
+    """
+    tenki.jp 鳥海山ページから当日（近傍）の概況テキストを抽出。
+    既存の関数・クラスには一切触れず、この関数のみ追加します。
+
+    Returns:
+        str: 見出し＋本文をまとめた一文。失敗時はフォールバック文。
+    """
+    html = _wc_fetch(_TENKI_CHOKAI_URL)
+    if not html:
+        return f"（{date:%Y-%m-%d}の鳥海山情報を取得できませんでした）"
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 見出し（ページ先頭の h1/h2/h3 のいずれか）
+        heading = soup.find(["h1", "h2", "h3"])
+        heading_text = _wc_clean(heading.get_text()) if heading else "鳥海山の天気概況"
+
+        # 本文（概況っぽい段落を複数候補から安全側で抽出）
+        paras = []
+        for sel in [
+            "div#weather-news p",
+            "section p",
+            "article p",
+            "div.summary p",
+            "div#main p",
+            "p",
+        ]:
+            for p in soup.select(sel):
+                t = _wc_clean(p.get_text())
+                # あまりに短いもの・コピーライト的なものは弾く
+                if len(t) >= 20 and "tenki.jp" not in t.lower():
+                    paras.append(t)
+            if paras:
+                break
+
+        body = " ".join(paras[:4]) if paras else "（本文の抽出に失敗しました）"
+        return f"{heading_text}: {body}"
+
+    except Exception as e:
+        _logger.warning("tenki.jp parse failed: %s", e)
+        return f"（{date:%Y-%m-%d}の鳥海山情報の解析に失敗しました）"
