@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Information Flow の各ノード群（長期記憶注入対応版）
+Information Flow の各ノード群
 - 役割:
   - ユーザー意図に応じたスポット候補抽出
   - ナッジ材料（距離/天気/混雑）収集と最適日の算出
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+from datetime import date, timedelta
 
 from shared.app.database import SessionLocal
 from shared.app import models
@@ -28,6 +29,13 @@ from worker.app.services.embeddings import embed_text, cosine_similarities
 from worker.app.services.information.information_service import InformationService
 from worker.app.services.routing.routing_service import RoutingService
 from worker.app.services.llm.llm_service import LLMInferenceService
+
+try:
+    # ナッジ集計の本実装：これまで積み上げた天気/混雑/距離スコアや山判定、DB 検索などを内包
+    from worker.app.services.information.information_service import InformationService
+except Exception as e:  # pragma: no cover
+    # ここで失敗すると worker 起動自体が止まるため、明示的に例外化
+    raise ImportError("InformationService の import に失敗しました") from e
 
 
 # =========================
@@ -224,3 +232,89 @@ def information_entry(state: Dict[str, Any]) -> Dict[str, Any]:
     if state.get("intermediate") is None:
         state["intermediate"] = {}
     return state
+
+
+def _extract_spot_ids_from_state(state: Dict[str, Any]) -> List[int]:
+    """
+    state から頑健に Spot ID 群を取り出す。
+    - selected_spot_ids / spot_ids: すでに ID 配列が入っているケース
+    - selected_spots / spots: dict or ORM オブジェクト配列から id を抽出
+    """
+    if not isinstance(state, dict):
+        return []
+
+    # 最優先で ID 配列
+    for key in ("selected_spot_ids", "spot_ids"):
+        ids = state.get(key)
+        if isinstance(ids, list) and ids:
+            return [int(x) for x in ids if x is not None]
+
+    # オブジェクト配列から抽出
+    for key in ("selected_spots", "spots"):
+        arr = state.get(key)
+        if isinstance(arr, list) and arr:
+            out: List[int] = []
+            for s in arr:
+                if isinstance(s, dict):
+                    sid = s.get("id")
+                else:
+                    sid = getattr(s, "id", None)
+                if sid is not None:
+                    out.append(int(sid))
+            if out:
+                return out
+
+    return []
+
+
+def gather_nudge_and_pick_best(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    graph.py が import する想定のノード関数（後方互換用の公開名）。
+    既存の InformationService.find_best_day_and_gather_nudge_data を呼び出し、
+    state へ必要最小の差分を返す。
+
+    入力（state から参照する代表的キー）:
+      - selected_spot_ids / spot_ids / selected_spots / spots
+      - date_from / date_to （無ければ [今日, 今日+6日] を使用）
+      - lang / language      （無ければ "ja"）
+
+    返り値（state への差分）:
+      - nudge:  per-day の詳細や採用根拠を含む辞書（既存サービスの戻りを丸ごと格納）
+      - best_day: nudge["best_day"]
+      - nudge_per_day: nudge["per_day"]
+    """
+    spot_ids = _extract_spot_ids_from_state(state)
+    if not spot_ids:
+        # スポット候補がなければ何もしない（上流で分岐する想定）
+        return {"nudge": None, "best_day": None, "nudge_per_day": []}
+
+    # 日付レンジの既定値（実運用に耐える本実装として 1 週間スコープを採用）
+    today = date.today()
+    date_from = state.get("date_from") or today
+    date_to = state.get("date_to") or (today + timedelta(days=6))
+
+    lang = state.get("lang") or state.get("language") or "ja"
+
+    svc = InformationService()
+    nudge = svc.find_best_day_and_gather_nudge_data(
+        spot_ids=spot_ids,
+        date_from=date_from,
+        date_to=date_to,
+        lang=lang,
+    )
+
+    # 既存の下流ノードで利用される最小差分のみ state 反映
+    return {
+        "nudge": nudge,
+        "best_day": nudge.get("best_day"),
+        "nudge_per_day": nudge.get("per_day") or nudge.get("per_day_details") or [],
+    }
+
+
+# 明示的に公開シンボルへ追加（他の __all__ の定義を壊さない）
+try:
+    __all__  # type: ignore  # noqa
+except NameError:  # pragma: no cover
+    __all__ = []
+if "gather_nudge_and_pick_best" not in __all__:
+    __all__.append("gather_nudge_and_pick_best")
