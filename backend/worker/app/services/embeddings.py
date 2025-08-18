@@ -1,232 +1,293 @@
+# worker/app/services/embeddings.py
 from __future__ import annotations
 
-import json
-import logging
-import math
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
+import math
+import json
+from typing import Iterable, List, Optional, Sequence, Tuple, Union, Any
 
 import requests
+from sqlalchemy import MetaData, Table, insert
+from sqlalchemy.orm import Session
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+from shared.app.database import SessionLocal
+from shared.app import models  # ORM が無い列はリフレクションで対応する
 
-# ============================================================
-# Public protocol (kept for type-compatibility across modules)
-# ============================================================
 
-@runtime_checkable
-class EmbeddingClient(Protocol):
-    """Minimal interface used across worker + scripts."""
+# ===============================
+# Embedding client interface
+# ===============================
 
-    model_name: str
-    dim: int
-
+class EmbeddingClient:
+    """埋め込みクライアントのインターフェース"""
     def embed(self, text: str) -> List[float]:
-        ...
+        raise NotImplementedError
 
     def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
-        ...
+        # デフォルト実装：逐次 embed
+        return [self.embed(t) for t in texts]
 
-# ============================================================
-# Utilities
-# ============================================================
 
-def _l2_norm(vec: Sequence[float]) -> float:
-    return math.sqrt(sum(x * x for x in vec))
+# ===============================
+# Ollama implementation
+# ===============================
 
-def _l2_normalize(vec: Sequence[float]) -> List[float]:
-    n = _l2_norm(vec)
-    if n == 0.0:
-        return [0.0 for _ in vec]
-    inv = 1.0 / n
-    return [x * inv for x in vec]
-
-def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
-    if len(a) != len(b):
-        raise ValueError(f"vector size mismatch: {len(a)} != {len(b)}")
-    # Normalize both (robust to scale)
-    an = _l2_normalize(a)
-    bn = _l2_normalize(b)
-    return float(sum(x * y for x, y in zip(an, bn)))
-
-def cosine_similarities(vec: Sequence[float], mat: Sequence[Sequence[float]]) -> List[float]:
-    return [cosine_similarity(vec, row) for row in mat]
-
-# ============================================================
-# Ollama embedding client
-# ============================================================
-
-@dataclass
 class OllamaEmbeddingClient(EmbeddingClient):
     """
-    Thin client for Ollama /api/embeddings.
-    - OLLAMA_BASE_URL  e.g. http://ollama:11434  (default)
-    - OLLAMA_EMBED_MODEL e.g. nomic-embed-text
+    Ollama の /api/embeddings を使って埋め込みを取得するクライアント。
+    - 環境変数:
+      OLLAMA_BASE_URL (例: http://ollama:11434)
+      OLLAMA_EMBED_MODEL (例: mxbai-embed-large / nomic-embed-text 等)
     """
-    model_name: str = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-    base_url: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-    timeout_sec: float = float(os.getenv("OLLAMA_TIMEOUT_SEC", "60"))
-    dim: int = int(os.getenv("OLLAMA_EMBED_DIM", "768"))  # safe default; will be overwritten if API returns size
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: float = 60.0,
+    ) -> None:
+        self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434").rstrip("/")
+        self.model = model or os.getenv("OLLAMA_EMBED_MODEL") or "nomic-embed-text"
+        self.timeout = timeout
 
-    def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{self.base_url.rstrip('/')}/api/embeddings"
-        resp = requests.post(url, json=payload, timeout=self.timeout_sec)
-        resp.raise_for_status()
-        return resp.json()
+        # tags を叩いて疎通・モデル存在を早期検知（失敗しても遅延検知に任せる）
+        try:
+            requests.get(f"{self.base_url}/api/tags", timeout=5)
+        except Exception:
+            # ログ基盤があれば warning
+            pass
+
+    def _post_embeddings(self, payload: dict) -> dict:
+        url = f"{self.base_url}/api/embeddings"
+        r = requests.post(url, json=payload, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
 
     def embed(self, text: str) -> List[float]:
-        # Ollama expects "prompt"
-        body = {"model": self.model_name, "prompt": text}
-        js = self._post(body)
-        vec = js.get("embedding") or js.get("data") or js.get("vector")
-        if vec is None:
-            raise RuntimeError(f"Ollama embeddings: unexpected response keys: {list(js.keys())}")
-        if isinstance(vec, dict) and "embedding" in vec:
-            vec = vec["embedding"]
-        if not isinstance(vec, list):
-            raise RuntimeError(f"Embedding must be list, got {type(vec)}")
-        # update dim if available
-        self.dim = len(vec)
-        return [float(x) for x in vec]
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+        payload = {"model": self.model, "input": text}
+        data = self._post_embeddings(payload)
+        # Ollama は {"embedding":[...]} を返す
+        emb = data.get("embedding")
+        if isinstance(emb, list):
+            return [float(x) for x in emb]
+        # 念のため複数形式にも対応
+        if isinstance(emb, (tuple,)):
+            return [float(x) for x in list(emb)]
+        raise ValueError("Unexpected embeddings response format from Ollama")
 
     def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
-        # There is no official batch API; iterate.
-        return [self.embed(t) for t in texts]
+        # 現状 Ollama は単発入力想定なので逐次投げる（将来一括 API が安定したら置換可）
+        out: List[List[float]] = []
+        for t in texts:
+            out.append(self.embed(t))
+        return out
 
-# Backward-compat alias (if some code imported this name)
-class OllamaEmbeddings(OllamaEmbeddingClient):
-    pass
 
-# ============================================================
-# OpenAI embedding client (optional; only if OPENAI_API_KEY exists)
-# ============================================================
+# ===============================
+# Factory
+# ===============================
 
-@dataclass
-class OpenAIEmbeddingClient(EmbeddingClient):
+def create_embedding_client() -> EmbeddingClient:
     """
-    Minimal OpenAI embeddings wrapper.
-    - OPENAI_API_KEY must be set
-    - OPENAI_EMBED_MODEL (default: text-embedding-3-small)
+    既定は Ollama。将来 OpenAI などを増やす場合は ENV で切り替え。
     """
-    model_name: str = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-    api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
-    base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    timeout_sec: float = float(os.getenv("OPENAI_TIMEOUT_SEC", "60"))
-    dim: int = int(os.getenv("OPENAI_EMBED_DIM", "1536"))
-
-    def _headers(self) -> Dict[str, str]:
-        if not self.api_key:
-            raise RuntimeError("OPENAI_API_KEY is not set")
-        return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-
-    def embed(self, text: str) -> List[float]:
-        url = f"{self.base_url.rstrip('/')}/embeddings"
-        payload = {"model": self.model_name, "input": text}
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=self.timeout_sec)
-        resp.raise_for_status()
-        js = resp.json()
-        data = js.get("data")
-        if not data:
-            raise RuntimeError(f"OpenAI embeddings: no data in response: {js}")
-        vec = data[0]["embedding"]
-        self.dim = len(vec)
-        return [float(x) for x in vec]
-
-    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
-        # For simplicity and reliability, iterate (rate-limit friendly).
-        return [self.embed(t) for t in texts]
-
-# ============================================================
-# Factory & high-level helpers (kept for compatibility)
-# ============================================================
-
-def _resolve_default_client() -> EmbeddingClient:
-    # Prefer Ollama if reachable, else OpenAI if key exists
-    prefer = os.getenv("EMBEDDINGS_BACKEND", "ollama").lower()
-    if prefer == "openai":
-        return OpenAIEmbeddingClient()
+    provider = (os.getenv("EMBEDDING_BACKEND") or os.getenv("EMBEDDINGS_BACKEND") or "ollama").lower()
+    if provider in ("ollama", "local"):
+        return OllamaEmbeddingClient()
+    # 追加プロバイダはここに分岐を増やす
     return OllamaEmbeddingClient()
 
+
+# ===============================
+# Utilities
+# ===============================
+
+def _norm(v: Sequence[float]) -> float:
+    return math.sqrt(sum(float(x) * float(x) for x in v)) or 1.0
+
+def _cosine(u: Sequence[float], v: Sequence[float]) -> float:
+    # 長さが違う場合は短い方に合わせる
+    n = min(len(u), len(v))
+    if n == 0:
+        return 0.0
+    dot = sum(float(u[i]) * float(v[i]) for i in range(n))
+    return dot / (_norm(u[:n]) * _norm(v[:n]))
+
+def cosine_similarities(
+    query_vector: Sequence[float],
+    matrix_vectors: Sequence[Sequence[float]],
+) -> List[float]:
+    """query_vector と各ベクトルのコサイン類似度を返す"""
+    return [_cosine(query_vector, vec) for vec in matrix_vectors]
+
+
+# 使い勝手のためのショートカット関数（他モジュールが import する前提）
 def embed_text(text: str, client: Optional[EmbeddingClient] = None) -> List[float]:
-    client = client or _resolve_default_client()
-    return client.embed(text)
+    c = client or create_embedding_client()
+    return c.embed(text)
 
-def embed_text_batch(texts: Sequence[str], client: Optional[EmbeddingClient] = None) -> List[List[float]]:
-    client = client or _resolve_default_client()
-    return client.embed_texts(texts)
+def embed_texts(texts: Sequence[str], client: Optional[EmbeddingClient] = None) -> List[List[float]]:
+    c = client or create_embedding_client()
+    return c.embed_texts(texts)
 
-# ============================================================
-# Persistence (best-effort; won't break import if DB not ready)
-# ============================================================
+
+# ===============================
+# Persistence
+# ===============================
+
+def _extract_message_fields(msg: Any) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    ConversationMessage / dict など様々な形から
+    (message_id, role, text) をロバストに抽出する。
+    """
+    # ORM オブジェクト互換
+    message_id = getattr(msg, "id", None) or getattr(msg, "message_id", None)
+    role = getattr(msg, "role", None) or getattr(msg, "speaker", None)
+    text = (
+        getattr(msg, "content", None)
+        or getattr(msg, "message_text", None)
+        or getattr(msg, "text", None)
+    )
+
+    # dict 互換
+    if isinstance(msg, dict):
+        message_id = msg.get("id") or msg.get("message_id") or message_id
+        role = msg.get("role") or msg.get("speaker") or role
+        text = msg.get("content") or msg.get("message_text") or msg.get("text") or text
+
+    if text is None:
+        text = ""
+    else:
+        text = str(text)
+
+    if role is not None:
+        role = str(role)
+
+    if message_id is not None:
+        message_id = str(message_id)
+
+    return message_id, role, text
+
+
+def _reflect_conversation_embeddings_table(bind_engine) -> Tuple[Table, dict]:
+    """
+    conversation_embeddings テーブルをリフレクションし、
+    よくある列名を動的にマッピングして返す。
+    返り値: (Table, column_map)
+      column_map = {
+        "session": "<session列名>",
+        "message": "<message列名>",
+        "role": "<role列名 or None>",
+        "text": "<text列名 or None>",
+        "embedding": "<埋め込み列名>",
+      }
+    """
+    metadata = MetaData()
+    table = Table("conversation_embeddings", metadata, autoload_with=bind_engine)
+    cols = {c.name for c in table.columns}
+
+    def pick(*candidates: str) -> Optional[str]:
+        for name in candidates:
+            if name in cols:
+                return name
+        return None
+
+    col_session = pick("session_id", "conversation_id", "sessionId")
+    col_message = pick("message_id", "messageId")
+    col_role = pick("role", "speaker")
+    col_text = pick("text", "message_text", "content")
+    col_embedding = pick("embedding", "vector", "embedding_vector")
+
+    if not col_session:
+        raise RuntimeError("conversation_embeddings: session id column not found")
+    if not col_message:
+        raise RuntimeError("conversation_embeddings: message id column not found")
+    if not col_embedding:
+        raise RuntimeError("conversation_embeddings: embedding column not found")
+
+    return table, {
+        "session": col_session,
+        "message": col_message,
+        "role": col_role,
+        "text": col_text,
+        "embedding": col_embedding,
+    }
+
 
 def save_conversation_embeddings(
-    session_id: str,
-    messages: List[Dict[str, Any]],
+    session_id: Union[str, int],
+    messages: Sequence[Any],
     client: Optional[EmbeddingClient] = None,
+    db: Optional[Session] = None,
 ) -> None:
     """
-    Best-effort persisting of conversation embeddings.
-    - If DB layer / models are not available at import time, we only log (do not raise).
-    - If available, we insert (or upsert) per message.
+    セッションに紐づくメッセージの埋め込みを conversation_embeddings に保存する。
+    - 既存実装を壊さないため、ORM モデル `ConversationEmbedding` があればそれを利用。
+    - 列名差異にロバストに対応するため、ORM が無い場合はリフレクションで列を解決。
+    - 失敗しても例外を外に伝播させない方針は上位（呼び出し側の try/except）で実施済み。
     """
-    client = client or _resolve_default_client()
+    own_session = False
+    if db is None:
+        db = SessionLocal()
+        own_session = True
+
     try:
-        # Lazy imports (avoid import-time coupling)
-        from shared.app import database as _db
-        from shared.app import models as _models
+        c = client or create_embedding_client()
 
-        engine = _db.get_engine()
-        if not engine:
-            logger.warning("No DB engine available; skip saving conversation embeddings.")
+        # 対象行の抽出
+        records: List[Tuple[Optional[str], Optional[str], str]] = []
+        for m in messages:
+            mid, role, text = _extract_message_fields(m)
+            if not text:
+                continue
+            records.append((mid, role, text))
+
+        if not records:
             return
 
-        # Prepare rows
-        texts: List[str] = []
-        metas: List[Tuple[int, Dict[str, Any]]] = []  # (index, original message)
-        for i, m in enumerate(messages):
-            content = (m.get("content") or "").strip()
-            if content:
-                texts.append(content)
-                metas.append((i, m))
+        # 埋め込み生成
+        texts = [t for (_mid, _role, t) in records]
+        vectors = c.embed_texts(texts)
 
-        if not texts:
-            logger.info("No text messages to embed.")
-            return
+        # まず ORM モデルが存在すればそれを使う
+        conversation_embedding_model = getattr(models, "ConversationEmbedding", None)
 
-        vectors = embed_text_batch(texts, client=client)
-
-        with engine.begin() as conn:
-            for (i, m), vec in zip(metas, vectors):
-                row = _models.ConversationEmbedding(
-                    session_id=session_id,
-                    turn_index=i,
-                    role=m.get("role") or "assistant",
-                    text=m.get("content") or "",
-                    embedding=json.dumps(vec),
-                    model_name=getattr(client, "model_name", "unknown"),
+        if conversation_embedding_model is not None:
+            for (mid, role, text), vec in zip(records, vectors):
+                row = conversation_embedding_model(
+                    session_id=str(session_id),
+                    message_id=mid,
+                    role=role,
+                    text=text,
+                    embedding=json.dumps(vec),  # DB 側が JSON/Text の想定（Array 型なら後段で反映）
                 )
-                conn.execute(_models.conversation_embeddings.insert().values(**row.__dict__))  # type: ignore[attr-defined]
+                db.add(row)
+            db.commit()
+            return
 
-        logger.info("Saved %d conversation embeddings (session=%s).", len(vectors), session_id)
+        # ORM が無ければテーブルをリフレクションして列に合わせて insert
+        engine = db.get_bind()
+        table, cmap = _reflect_conversation_embeddings_table(engine)
 
-    except Exception as e:
-        # Do not break worker startup on optional feature
-        logger.warning("save_conversation_embeddings skipped (reason=%s)", e, exc_info=False)
+        payloads: List[dict] = []
+        for (mid, role, text), vec in zip(records, vectors):
+            row = {
+                cmap["session"]: str(session_id),
+                cmap["message"]: mid,
+                cmap["embedding"]: json.dumps(vec),
+            }
+            if cmap["role"]:
+                row[cmap["role"]] = role
+            if cmap["text"]:
+                row[cmap["text"]] = text
+            payloads.append(row)
 
-# ============================================================
-# Optional: HNSW builder (kept for compatibility if referenced)
-# ============================================================
+        if payloads:
+            stmt = insert(table).values(payloads)
+            db.execute(stmt)
+            db.commit()
 
-def build_hnsw_index(vectors: Sequence[Sequence[float]]) -> Any:
-    """
-    Provide a small hook if callers expect 'build_hnsw_index' to exist.
-    To keep dependencies light, return a naive structure (list) by default.
-    Replace with hnswlib integration if/when needed.
-    """
-    return [list(map(float, v)) for v in vectors]
-
-# Module-level re-exports for backward naming compatibility
-# (some older modules may have imported these names)
-OllamaEmbeddingsClient = OllamaEmbeddingClient  # common typo guard
+    finally:
+        if own_session:
+            db.close()
