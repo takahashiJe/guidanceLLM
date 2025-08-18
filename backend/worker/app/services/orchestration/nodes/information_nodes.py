@@ -318,3 +318,145 @@ except NameError:  # pragma: no cover
     __all__ = []
 if "gather_nudge_and_pick_best" not in __all__:
     __all__.append("gather_nudge_and_pick_best")
+
+def compose_nudge_response(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ナッジ（最適日提案）のユーザー向けレスポンスを合成するノード。
+
+    事前ノード（gather_nudge_and_pick_best など）が state に格納した
+    集計結果を素材に、提示テキストおよび返却用の構造化ペイロードを作る。
+
+    期待する state のキー（存在すれば柔軟に扱う）:
+      - state["nudge"] または state["nudge_result"]: Dict で以下のようなフィールドを想定
+          {
+            "best_day": "YYYY-MM-DD",
+            "per_day": [
+                {
+                  "date": "YYYY-MM-DD",
+                  "weather_score": float,
+                  "congestion_score": float,
+                  "total_score": float,
+                  "weather": {...},         # 任意（天気の生データ）
+                  "congestion": {...},      # 任意（混雑の生データ）
+                  "distance_km": float,     # 任意
+                  "duration_min": float     # 任意
+                },
+                ...
+            ],
+            "spots": [                     # 任意（スポットの配列）
+                {
+                  "id": int|str,
+                  "official_name": str,
+                  "description": str,
+                  "tags": List[str],
+                  "lat": float, "lon": float
+                },
+                ...
+            ]
+          }
+
+      - state["intent"] など他のコンテキスト情報があれば説明文に利用する。
+
+    戻り値:
+      - state に以下を追記/更新する:
+          state["response"] = {
+              "type": "nudge",
+              "best_day": <str|None>,
+              "per_day": <list>,
+              "spots": <list>,
+              "summary_md": <str>  # UI 側でそのまま表示可能な Markdown
+          }
+      - 返り値として更新した state を返す
+    """
+    # --- 入力の取り出し（nudge / nudge_result のどちらでも受ける） ---
+    nudge: Dict[str, Any] = (
+        state.get("nudge")
+        or state.get("nudge_result")
+        or {}
+    )
+
+    best_day: Optional[str] = nudge.get("best_day")
+    per_day: List[Dict[str, Any]] = (
+        nudge.get("per_day")
+        or nudge.get("daily")
+        or nudge.get("days")
+        or []
+    )
+    spots: List[Dict[str, Any]] = (
+        nudge.get("spots")
+        or state.get("spots")
+        or []
+    )
+
+    # --- 表示用のサマリを組み立て（Markdown） ---
+    def _fmt_date(d: str) -> str:
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").strftime("%-m/%-d (%a)")
+        except Exception:
+            return d
+
+    title = "最適日（ナッジ提案）"
+    lines: List[str] = [f"### {title}"]
+
+    if best_day:
+        lines.append(f"- **ベスト日**: **{_fmt_date(best_day)}**")
+    else:
+        lines.append("- **ベスト日**: 算出できませんでした")
+
+    # スポット一覧（あれば）
+    if spots:
+        lines.append("\n**対象スポット**")
+        for s in spots[:10]:
+            name = s.get("official_name") or s.get("name") or f"ID: {s.get('id')}"
+            desc = s.get("description")
+            if desc:
+                lines.append(f"- {name} — {desc}")
+            else:
+                lines.append(f"- {name}")
+
+        if len(spots) > 10:
+            lines.append(f"- ほか {len(spots) - 10} 件…")
+
+    # 日別サマリ（トラックできる限り）:
+    if per_day:
+        lines.append("\n**日別スコア**（高いほどおすすめ）")
+        # total_score の降順に軽く並べる（元順序を尊重したい場合は外してもOK）
+        sorted_days = sorted(
+            per_day,
+            key=lambda d: float(d.get("total_score", 0.0)),
+            reverse=True,
+        )
+        for d in sorted_days[:10]:
+            date_s = d.get("date")
+            total = d.get("total_score")
+            w = d.get("weather_score")
+            c = d.get("congestion_score")
+            dist = d.get("distance_km")
+            dur = d.get("duration_min")
+
+            parts = [f"- {_fmt_date(date_s) if date_s else '(日付不明)'}: 合計 {total:.2f}"]
+            if w is not None:
+                parts.append(f"(天気 {float(w):.2f})")
+            if c is not None:
+                parts.append(f"(混雑 {float(c):.2f})")
+            if dist is not None:
+                parts.append(f"(距離 {float(dist):.1f} km)")
+            if dur is not None:
+                parts.append(f"(所要 {int(round(float(dur)))} 分)")
+            lines.append(" ".join(parts))
+
+        if len(per_day) > 10:
+            lines.append(f"- ほか {len(per_day) - 10} 日…")
+
+    # --- レスポンスオブジェクトを state に格納 ---
+    state.setdefault("response", {})
+    state["response"] = {
+        "type": "nudge",
+        "best_day": best_day,
+        "per_day": per_day,
+        "spots": spots,
+        "summary_md": "\n".join(lines),
+    }
+
+    # LangGraph 互換のため、state を返す
+    return state
