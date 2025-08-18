@@ -1,85 +1,273 @@
-# -*- coding: utf-8 -*-
-"""
-itinerary_nodes.py
-- 計画フロー：CRUD → 暫定ルート計算 → LLM要約
-"""
+# worker/app/services/itinerary/itinerary_service.py
 
 from __future__ import annotations
-from typing import Dict, Any, List, Optional
 
-from worker.app.services.itinerary.itinerary_service import ItineraryService
-from worker.app.services.routing.routing_service import RoutingService
-from worker.app.services.llm.llm_service import LLMInferenceService
-from ..state import AgentState, save_message, persist_session_status
-from .shared_nodes import safe_set_final_response
+import logging
+from typing import Iterable, List, Optional, Sequence, Tuple, Type, Any
+
+logger = logging.getLogger(__name__)
 
 
-def upsert_plan(state: AgentState) -> AgentState:
+class ItineraryService:
     """
-    「計画の作成/編集」要求をLLMでパラメータ抽出し、Itinerary ServiceのCRUDに委譲。
-    - action: add/remove/reorder/create
+    旅程（Plan / Stop）を扱うサービス層。
+    - SQLAlchemy の ORM モデル（Plan, Stop, Spot）を利用
+    - import 時に副作用を出さない（DB/ORM は関数内 import）
+    - itinerary_nodes.py から参照される get_plan_details を中心に、
+      基本的な CRUD 操作を提供する
     """
-    llm = LLMInferenceService()
-    itin = ItineraryService()
 
-    user_msg = state.latest_user_message or ""
-    current_stops = []
-    if state.active_plan_id:
-        current_stops = itin.get_plan_stops(state.active_plan_id)
+    # ---- 内部ユーティリティ -------------------------------------------------
 
-    params = llm.extract_plan_edit_parameters(
-        user_message=user_msg,
-        current_stops=current_stops,
-        lang=state.user_lang,
-    )
+    @staticmethod
+    def _import_sqla() -> Tuple[Any, Any, Any]:
+        """
+        SQLAlchemy 関連を関数内 import（import 時の依存エラー回避）。
+        Returns: (sa, orm, select)
+        """
+        import sqlalchemy as sa
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload, joinedload  # noqa: F401 (型ヒント用/候補で使用)
 
-    # plan がなければ作る
-    plan_id = state.active_plan_id
-    if not plan_id:
-        plan_id = itin.create_new_plan(session_id=state.session_id)
-        state.active_plan_id = plan_id
-        persist_session_status(state.session_id, app_status="planning", active_plan_id=plan_id)
+        return sa, select, selectinload
 
-    # action適用
-    if params.action == "add" and params.spot_name:
-        itin.add_spot_to_plan(plan_id, params.spot_name, position_hint=params.position, target_name=params.target_spot_name)
-    elif params.action == "remove" and params.spot_name:
-        itin.remove_spot_from_plan(plan_id, params.spot_name)
-    elif params.action == "reorder" and params.spot_name and params.target_spot_name:
-        itin.reorder_plan_stops(plan_id, params.spot_name, params.position, params.target_spot_name)
-    # "create" 等、その他は現状ノーオペ
+    @staticmethod
+    def _import_models():
+        """
+        shared.app.models を読み込み、想定名称に対応するモデルを動的に解決する。
+        プロジェクト差を吸収するため、複数候補名をフォールバックで探索。
+        戻り値: (PlanModel, StopModel, SpotModel, UserModel or None)
+        """
+        try:
+            from shared.app import models  # type: ignore
+        except Exception as e:
+            raise RuntimeError("shared.app.models の import に失敗しました") from e
 
-    return state
+        def resolve(*candidates: str) -> Optional[Type[Any]]:
+            for name in candidates:
+                m = getattr(models, name, None)
+                if m is not None:
+                    return m
+            return None
 
+        PlanModel = resolve("ItineraryPlan", "Plan", "TripPlan", "RoutePlan")
+        StopModel = resolve("ItineraryStop", "PlanStop", "TripStop", "RouteStop")
+        SpotModel = resolve("Spot")
+        UserModel = resolve("User", "AppUser")
 
-def calc_preview_route_and_summarize(state: AgentState) -> AgentState:
-    """
-    計画の暫定ルートをRouting Serviceで計算し、LLMでテキスト要約。
-    """
-    itin = ItineraryService()
-    routing = RoutingService()
-    llm = LLMInferenceService()
+        missing = []
+        if PlanModel is None:
+            missing.append("Plan(ItineraryPlan/Plan/TripPlan/RoutePlan)")
+        if StopModel is None:
+            missing.append("Stop(ItineraryStop/PlanStop/TripStop/RouteStop)")
+        if SpotModel is None:
+            missing.append("Spot")
 
-    if not state.active_plan_id:
-        safe_set_final_response(state, "計画が見つかりませんでした。まずは訪問先を追加してみましょう。")
-        return state
+        if missing:
+            raise RuntimeError(
+                "ItineraryService: 必須モデルが見つかりません: " + ", ".join(missing)
+            )
 
-    stops: List[Dict[str, Any]] = itin.get_plan_stops(state.active_plan_id)
-    if not stops:
-        safe_set_final_response(state, "計画にスポットがありません。追加してから再度お試しください。")
-        return state
+        return PlanModel, StopModel, SpotModel, UserModel
 
-    waypoints = [(s["lon"], s["lat"]) for s in stops]  # OSRMは(lon,lat)
-    geojson = routing.calculate_full_itinerary_route(waypoints=waypoints, profile="car", add_return=True)  # FR-5-2
+    @staticmethod
+    def _ensure_session(db) -> None:
+        """
+        db が SQLAlchemy の Session/Session-like か最低限チェック。
+        """
+        # ここでは厳格な isinstance チェックは避け、最低限の属性存在を確認
+        need = ("add", "commit", "refresh", "execute")
+        for attr in need:
+            if not hasattr(db, attr):
+                raise TypeError(f"db は SQLAlchemy Session を想定しています（欠落属性: {attr}）")
 
-    # DBに暫定ルートが必要なら ItineraryService 側で保存する運用でもOK（ここではレスポンスのみに保持）
-    state.bag["preview_geojson"] = geojson
+    # ---- 取得系 -------------------------------------------------------------
 
-    summary = llm.generate_plan_summary(
-        lang=state.user_lang,
-        stops=stops,
-    )
-    state.final_response = summary
-    save_message(state.session_id, "assistant", summary, meta={"type": "plan_summary"})
+    @staticmethod
+    def get_plan_details(db, plan_id: int) -> Any:
+        """
+        プラン詳細を取得して返す。stops は position 昇順でアクセスできるようにする。
+        itinerary_nodes.py 側で plan.stops を前提としているため、ORM オブジェクトをそのまま返す。
 
-    return state
+        Args:
+            db: SQLAlchemy Session
+            plan_id: 取得対象のプラン ID
+
+        Returns:
+            Plan ORM オブジェクト（stops/spot がロード済）
+        """
+        ItineraryService._ensure_session(db)
+        sa, select, selectinload = ItineraryService._import_sqla()
+        Plan, Stop, Spot, _User = ItineraryService._import_models()
+
+        # stops と spot を selectinload（または joinedload）でロード
+        try:
+            # まず selectinload を試す（大量件数に強い）
+            stmt = (
+                select(Plan)
+                .where(Plan.id == plan_id)
+                .options(
+                    selectinload(Plan.stops).selectinload(Stop.spot)
+                )
+            )
+            result = db.execute(stmt).scalars().first()
+        except Exception:
+            # environments により options で失敗するケースがあれば joinedload にフォールバック
+            from sqlalchemy.orm import joinedload  # type: ignore
+
+            stmt = (
+                select(Plan)
+                .where(Plan.id == plan_id)
+                .options(
+                    joinedload(Plan.stops).joinedload(Stop.spot)
+                )
+            )
+            result = db.execute(stmt).scalars().first()
+
+        if result is None:
+            raise ValueError(f"指定された plan_id={plan_id} が見つかりません。")
+
+        # stops を position 昇順に並べ替え（DB 側の order_by が未設定の場合に備える）
+        if hasattr(result, "stops") and isinstance(result.stops, (list, tuple)):
+            try:
+                result.stops.sort(key=lambda s: getattr(s, "position", 0))
+            except Exception:
+                # ソート不可でも致命的ではないためログのみに留める
+                logger.debug("plan.stops の並び替えに失敗しました（position 未定義の可能性）")
+
+        return result
+
+    # ---- 生成・編集系（将来的/他ノードでの利用を考慮し用意） -------------
+
+    @staticmethod
+    def create_plan(
+        db,
+        user_id: Optional[int],
+        spot_ids: Sequence[int],
+        title: Optional[str] = None,
+        travel_date: Optional[Any] = None,
+    ) -> Any:
+        """
+        プランを新規作成し、指定 spot_id 群を stops として追加して返す。
+        """
+        ItineraryService._ensure_session(db)
+        Plan, Stop, Spot, _User = ItineraryService._import_models()
+
+        plan = Plan()
+        if title is not None and hasattr(plan, "title"):
+            setattr(plan, "title", title)
+        if travel_date is not None and hasattr(plan, "travel_date"):
+            setattr(plan, "travel_date", travel_date)
+        if user_id is not None and hasattr(plan, "user_id"):
+            setattr(plan, "user_id", user_id)
+
+        db.add(plan)
+        db.commit()
+        db.refresh(plan)
+
+        # stops 追加
+        position = 1
+        for sid in spot_ids:
+            stop = Stop()
+            # 外部キー
+            if hasattr(stop, "plan_id"):
+                setattr(stop, "plan_id", plan.id)
+            if hasattr(stop, "spot_id"):
+                setattr(stop, "spot_id", sid)
+            # 表示順
+            if hasattr(stop, "position"):
+                setattr(stop, "position", position)
+            position += 1
+            db.add(stop)
+
+        db.commit()
+        db.refresh(plan)
+
+        # 返却時に stops をロード/整列
+        return ItineraryService.get_plan_details(db, plan.id)
+
+    @staticmethod
+    def reorder_stops(db, plan_id: int, ordered_stop_ids: Sequence[int]) -> Any:
+        """
+        stops の並び順を stop_id の並びに合わせて更新。
+        """
+        ItineraryService._ensure_session(db)
+        Plan, Stop, Spot, _User = ItineraryService._import_models()
+
+        plan = ItineraryService.get_plan_details(db, plan_id)
+        # 既存 stop を id -> obj で引く
+        stop_map = {getattr(s, "id"): s for s in getattr(plan, "stops", [])}
+
+        pos = 1
+        for sid in ordered_stop_ids:
+            s = stop_map.get(sid)
+            if s is None:
+                continue
+            if hasattr(s, "position"):
+                setattr(s, "position", pos)
+            pos += 1
+
+        db.commit()
+        return ItineraryService.get_plan_details(db, plan_id)
+
+    @staticmethod
+    def add_stop(
+        db,
+        plan_id: int,
+        spot_id: int,
+        position: Optional[int] = None,
+    ) -> Any:
+        """
+        指定プランに stop を 1 件追加。position を省略した場合は末尾に追加。
+        """
+        ItineraryService._ensure_session(db)
+        Plan, Stop, Spot, _User = ItineraryService._import_models()
+
+        plan = ItineraryService.get_plan_details(db, plan_id)
+        # 既存 stops の末尾+1 を既定 position に
+        max_pos = 0
+        for s in getattr(plan, "stops", []):
+            p = getattr(s, "position", 0)
+            if isinstance(p, int) and p > max_pos:
+                max_pos = p
+        if position is None or not isinstance(position, int) or position <= 0:
+            position = max_pos + 1
+
+        stop = Stop()
+        if hasattr(stop, "plan_id"):
+            setattr(stop, "plan_id", plan_id)
+        if hasattr(stop, "spot_id"):
+            setattr(stop, "spot_id", spot_id)
+        if hasattr(stop, "position"):
+            setattr(stop, "position", position)
+
+        db.add(stop)
+        db.commit()
+        return ItineraryService.get_plan_details(db, plan_id)
+
+    @staticmethod
+    def remove_stop(db, plan_id: int, stop_id: int) -> Any:
+        """
+        指定プランから stop を 1 件削除（物理削除）。論理削除カラムがある場合はそれを優先。
+        """
+        ItineraryService._ensure_session(db)
+        Plan, Stop, Spot, _User = ItineraryService._import_models()
+
+        plan = ItineraryService.get_plan_details(db, plan_id)
+        target = None
+        for s in getattr(plan, "stops", []):
+            if getattr(s, "id", None) == stop_id:
+                target = s
+                break
+        if target is None:
+            raise ValueError(f"plan_id={plan_id} に stop_id={stop_id} は存在しません。")
+
+        # 論理削除が定義されていればそれを使う（deleted 等）
+        if hasattr(target, "deleted"):
+            setattr(target, "deleted", True)
+        else:
+            # 物理削除
+            db.delete(target)
+
+        db.commit()
+        return ItineraryService.get_plan_details(db, plan_id)
