@@ -110,13 +110,16 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
             dest_tags=dest_tags,
             ap_max_km=20.0,
         )
+        print(f"DEBUG: leg return value: {leg}")
 
         # まず legs に格納（GeoJSONの有無に関係なくカウントさせる）
+        # distance_m = leg.get("distance_m") or leg.get("distance_meters")
+        # distance_km = (distance_m / 1000.0) if distance_m is not None else None
         legs.append({
             "from_spot_id": used_spot_ids[i],
             "to_spot_id":   used_spot_ids[i + 1],
-            "distance_km": leg.get("distance_m") or leg.get("distance_meters") / 1000.0,
-            "duration_minutes": int(round(float(leg.get("duration_min", 0.0)))),
+            "distance_km": leg.get("distance_km"),
+            "duration_min": int(round(float(leg.get("duration_min", 0.0)))),
             "mode": leg.get("mode", "hybrid"),
             "used_ap": leg.get("used_ap")  # ← ここで追加
         })
