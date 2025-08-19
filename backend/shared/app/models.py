@@ -34,8 +34,11 @@ from sqlalchemy import (
     Enum as SAEnum,
     JSON,
 )
+import sqlalchemy as sa
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import ENUM as PGEnum
+from sqlalchemy import text
 from geoalchemy2 import Geometry 
 
 # ------------------------------------------------------------
@@ -209,7 +212,7 @@ class Spot(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     official_name = Column(String(255), nullable=False, index=True)
-    spot_type = Column(SAEnum(SpotType), nullable=False, index=True, default=SpotType.tourist_spot)
+    spot_type = sa.Column(sa.String(length=64), nullable=True)
 
     # タグ配列：カテゴリ検索（category intent）に利用
     tags = Column(JSON, nullable=True)  # List[str]
@@ -245,7 +248,11 @@ class AccessPoint(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), nullable=False, index=True)
-    ap_type = Column(String(64), nullable=True)  # 例: "parking", "trailhead"
+    ap_type = sa.Column(
+        PGEnum("parking", "trailhead", "other", name="ap_type", create_type=False),  # ← ここがポイント
+        nullable=False,
+        server_default=text("'other'::ap_type"),  # 既定値が必要なら（現状に合わせて）
+    )
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
 

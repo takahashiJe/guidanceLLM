@@ -6,19 +6,30 @@ AccessPoints ローダ（冪等）
   1) amenity → ap_type マッピングを追加（例: amenity=parking → ap_type="parking"）
   2) 一意判定を (latitude, longitude) ベースに変更（name 依存を廃止）
   3) name 未設定時のデフォルト名を安定生成（AP_<lat>_<lon>）
-  4) 既存行がある場合は，空名/unknown のみを上書き（安全更新）
+  4) 既存行がある場合は，空名/自動生成名のみを上書き（安全更新）
+
+追加の整合調整（今回の修正点）:
+  A) GeoJSON の既定パスを /app/backend/scripts に修正（__file__ 基準）
+     - さらに AP_GEOJSON 環境変数で上書き可能（運用を楽に）
+  B) ap_type の既定値を DB ENUM（parking, trailhead, other）に合わせて "other" に統一
+     - 以前の "unknown" は使わない
+  C) 挿入・更新後に geom を必ず埋める UPDATE を追加（KNN/GiST を確実に有効化）
 """
+
 import json
+import os  # 追加: 環境変数でパス上書きに対応
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
 
+from sqlalchemy import text  # 追加: geom 一括更新に使用
 from shared.app.database import SessionLocal
 from shared.app.models import AccessPoint
 
-# 変更点: パスは従来通り．compose 側で /app/scripts にマウントしておく前提．
-AP_GEOJSON = Path("/app/scripts/access_points.geojson")
+# 変更点A: 既定パスをスクリプトのあるディレクトリに変更し、ENVで上書き可能に
+DEFAULT_GEOJSON = Path(__file__).parent / "access_points.geojson"
+AP_GEOJSON = Path(os.getenv("AP_GEOJSON", DEFAULT_GEOJSON.as_posix()))
 
-# 変更点: 緯度経度の丸め桁を定義（同一判定の揺れを抑える）
+# 既存ロジック: 緯度経度の丸め桁
 ROUND_PLACES = 6
 
 
@@ -29,11 +40,11 @@ def _safe_round_latlon(lon: float, lat: float) -> Tuple[float, float]:
 
 def _infer_ap_type(props: Dict[str, Any]) -> str:
     """
-    変更点: amenity / highway などから ap_type を推定するロジックを追加．
+    amenity / highway などから ap_type を推定するロジック。
     - 明示的に ap_type が与えられていればそれを優先
     - amenity=parking → 'parking'
-    - highway=trailhead → 'trailhead'
-    - それ以外 → 'unknown'
+    - highway=trailhead または trailhead=yes/true/1 → 'trailhead'
+    - それ以外 → 'other'   ← 変更点B: ENUM と整合（unknown は使わない）
     """
     explicit = props.get("ap_type")
     if isinstance(explicit, str) and explicit.strip():
@@ -47,17 +58,14 @@ def _infer_ap_type(props: Dict[str, Any]) -> str:
     if highway == "trailhead":
         return "trailhead"
 
-    # 将来の拡張: 'trailhead'=yes のようなタグ運用に対応
     if (props.get("trailhead") or "").strip().lower() in {"yes", "true", "1"}:
         return "trailhead"
 
-    return "unknown"
+    return "other"  # ← ここを "other" に統一
 
 
 def _build_default_name(lat: float, lon: float) -> str:
-    """
-    変更点: 無名データが多いため，安定的に逆生成できるデフォルト名を導入．
-    """
+    """無名データが多いため，安定的に逆生成できるデフォルト名を導入。"""
     lon_r, lat_r = _safe_round_latlon(lon, lat)
     return f"AP_{lat_r}_{lon_r}"
 
@@ -89,7 +97,7 @@ def main() -> None:
             geom: Dict[str, Any] = feature.get("geometry") or {}
 
             if (geom.get("type") != "Point") or not geom.get("coordinates"):
-                # 変更点: ここでは過剰実装を避け，Point 以外はスキップ（要件最小）
+                # 要件最小: Point 以外はスキップ
                 skipped += 1
                 continue
 
@@ -103,15 +111,14 @@ def main() -> None:
 
             lon_r, lat_r = _safe_round_latlon(lon, lat)
 
-            # 変更点: amenity 等から ap_type を推定
             ap_type = _infer_ap_type(props)
 
-            # 変更点: name は未設定なら安定生成
+            # name は未設定なら安定生成
             name: str = (
                 (props.get("name") or props.get("title") or "").strip()
             ) or _build_default_name(lat_r, lon_r)
 
-            # 変更点: 一意判定は (latitude, longitude) で行う
+            # 一意判定は (latitude, longitude)
             existing: AccessPoint | None = (
                 db.query(AccessPoint)
                 .filter(
@@ -122,17 +129,16 @@ def main() -> None:
             )
 
             if existing:
-                # 変更点: 既存行を安全に更新
-                # - name が空（念のため）や自動生成名のままなら，今回の name で上書き
+                # 既存行を安全に更新
                 is_auto_name_old = isinstance(existing.name, str) and existing.name.startswith("AP_")
                 if (not existing.name) or is_auto_name_old:
                     existing.name = name
 
-                # - ap_type が未設定/unknown なら，今回の推定で補完
-                if (not existing.ap_type) or (existing.ap_type == "unknown"):
+                # 変更点B: 未設定/other の時のみ補完
+                if (not existing.ap_type) or (existing.ap_type == "other"):
                     existing.ap_type = ap_type
 
-                # ここではその他のカラムを安易に変更しない（冪等性維持）
+                # 他カラムは冪等性のため変更しない
             else:
                 # 追加
                 ap = AccessPoint(
@@ -144,6 +150,13 @@ def main() -> None:
                 db.add(ap)
 
             upserted += 1
+
+        # 変更点C: 新規挿入/既存更新に関わらず、geom が NULL の行は必ず埋める
+        db.execute(text(
+            "UPDATE access_points "
+            "SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326) "
+            "WHERE geom IS NULL"
+        ))
 
         db.commit()
         print(f"[load_access_points] upserted={upserted} skipped={skipped}")
