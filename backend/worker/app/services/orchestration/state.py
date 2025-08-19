@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Literal, Tuple
 
 from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session
@@ -391,3 +392,64 @@ def _save_embeddings_batch(
                 # 埋め込み失敗はログのみ（本体の会話継続を阻害しない）
                 logger.warning(f"embedding upsert failed: session={session_id} role={role} id={row_id} err={e}")
         db.commit()
+
+Role = Literal["user", "assistant", "system"]
+Mode = Literal["text", "voice"]
+AppStatus = Literal["idle","information","planning","navigating","error"]
+Intent = Literal["general_question","specific_question","plan_creation_request","plan_edit_request","chitchat","navigation_event","end"]
+
+@dataclass
+class ChatItem:
+    role: Role
+    content: str
+    lang: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+@dataclass
+class SpotLite:
+    id: int
+    official_name: str
+    lat: float
+    lon: float
+    tags: List[str] = field(default_factory=list)
+    spot_type: Optional[str] = None
+
+@dataclass
+class AgentState:
+    # A: セッション核
+    session_id: str
+    lang: str = "ja"
+    app_status: AppStatus = "idle"
+    active_plan_id: Optional[int] = None
+    final_response: Optional[str] = None
+
+    # B: 短期記憶
+    chat_history: List[ChatItem] = field(default_factory=list)
+
+    # C: 実行一回分入力
+    latest_user_message: Optional[str] = None
+    input_mode: Mode = "text"
+    system_trigger: Optional[str] = None
+
+    # D: NLU
+    intent: Optional[Intent] = None
+    plan_edit_params: Optional[Dict[str, Any]] = None
+    intent_query: Optional[str] = None  # Eに寄せるならここでもOK
+
+    # E: 情報フロー
+    candidate_spots: List[SpotLite] = field(default_factory=list)
+    nudge_materials: Dict[str, Any] = field(default_factory=dict)  # spot_id -> dict
+    long_term_retrievals: List[Dict[str, Any]] = field(default_factory=list)
+
+    # F: 計画フロー
+    plan_ops: Optional[Dict[str, Any]] = None
+    provisional_route: Optional[Dict[str, Any]] = None
+    plan_summary_text: Optional[str] = None
+
+    # G: ナビ
+    navigation_events: List[Dict[str, Any]] = field(default_factory=list)
+    guide_generation_done: bool = False
+
+    # H: エラー/診断
+    error: Optional[str] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
