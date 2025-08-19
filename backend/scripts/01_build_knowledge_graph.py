@@ -52,7 +52,7 @@ def persist_dir_for(lang: str) -> Path:
 # 依存（アプリの埋め込み実装を使用）
 # =========================
 # PYTHONPATH=/app/backend を前提として、アプリ内の Embeddings ファサードを利用
-from worker.app.services.embeddings import Embeddings
+from worker.app.services.embeddings import EmbeddingService
 
 # =========================
 # Vectorstore (ChromaDB)
@@ -162,8 +162,7 @@ def build_for_lang(*, lang: str, knowledge_root: Path, persist_dir: Path) -> Non
 
     print(f"[{lang}] 発見ファイル数: {len(md_files)}")
 
-    # Embeddings ファサードを使用（mxbai-embed-large / 1024 次元）
-    embedder = Embeddings()
+    embedder = EmbeddingService()
 
     # ChromaDB の永続クライアント
     client = chromadb.PersistentClient(path=str(persist_dir))
@@ -200,7 +199,7 @@ def build_for_lang(*, lang: str, knowledge_root: Path, persist_dir: Path) -> Non
             })
 
         # 埋め込み（バッチ）
-        embeddings = embedder.embed_texts(chunks, lang=lang)  # -> List[List[float]]
+        embeddings = embedder.embed_texts(chunks)  # -> List[List[float]]
 
         # upsert
         collection.upsert(
