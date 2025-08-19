@@ -461,3 +461,163 @@ class EmbeddingsService:
         Chroma などの embedding_function に渡すためのコール可能を返す。
         """
         return _VectorStoreEmbeddingFn(self._client)
+    
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        """
+        複数テキストを一括で埋め込み。
+        - 入力と同じ長さ・順序で List[List[float]] を返す。
+        - 空文字や None はゼロベクトルで埋める（順序維持のため）。
+        - 現実装は embed_text() の逐次呼び出しで確実性重視。
+          （将来的に Ollama が input: List[str] を正式サポートしたら
+            ここをまとめて呼ぶ実装に差し替え可能）
+        """
+        if not texts:
+            return []
+
+        dim = int(getattr(self, "embedding_dim", 1024))
+        zero = [0.0] * dim
+
+        results: List[List[float]] = []
+        for t in texts:
+            s = (t or "").strip() if isinstance(t, str) else ""
+            if not s:
+                # 空はゼロベクトルで位置を確保
+                results.append(list(zero))
+                continue
+
+            try:
+                vec = self.embed_text(s)
+            except Exception:
+                # 例外時も配列長を崩さない
+                results.append(list(zero))
+                continue
+
+            # 念のため次元を合わせる（モデル更新等の防御）
+            if len(vec) != dim:
+                if len(vec) > dim:
+                    vec = vec[:dim]
+                else:
+                    vec = vec + [0.0] * (dim - len(vec))
+
+            results.append(vec)
+
+        return results
+
+# ============================================================
+# 互換アダプタ: Embeddings
+# ------------------------------------------------------------
+# 目的:
+# - 既存の 01_build_knowledge_graph.py などが
+#   `from ...embeddings import Embeddings` を前提としているため、
+#   新実装（EmbeddingsService）を内部で利用する薄いラッパーを提供する。
+# - Chroma の embedding_function (= callable) としても利用可能。
+# - すべての計算系（正規化・次元検証・リトライ・タイムアウト）は
+#   EmbeddingsService の実装に委譲し、一貫性を保つ。
+# ============================================================
+
+class Embeddings:
+    """
+    後方互換アダプタ。
+    - __call__(List[str]) -> List[List[float]] : Chroma の embedding_function 互換
+    - embed_documents(List[str]) -> List[List[float]]
+    - embed_query(str) -> List[float]
+    - embed(str) -> List[float]  # alias
+    """
+
+    def __init__(
+        self,
+        model: str = EMBEDDING_MODEL,
+        host: str = OLLAMA_HOST,
+        dim: int = EMBEDDING_DIM,
+        version: str = EMBEDDING_VERSION,
+        session_factory: Callable[[], Session] = SessionLocal,
+    ) -> None:
+        # EmbeddingsService を内部で生成して使い回す
+        self._svc = EmbeddingsService(
+            model=model,
+            ollama_host=host,
+            embedding_dim=dim,
+            embedding_version=version,
+            session_factory=session_factory,
+        )
+        # Chroma 互換の callable をキャッシュ
+        self._fn = self._svc.embedding_function_for_vectorstore()
+
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        """
+        Chroma の collection.get_or_create(..., embedding_function=Embeddings(...))
+        のような使い方に対応するための callable 実装。
+        """
+        if not isinstance(texts, list):
+            raise TypeError("Embeddings.__call__ には List[str] を渡してください。")
+        return self._fn(texts)
+
+    # 既存コードの互換メソッド群 ------------------------------------------
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """文書群の埋め込みベクトル取得（L2 正規化済み）。"""
+        return self._svc.embed_texts(texts)
+
+    def embed_query(self, text: str) -> List[float]:
+        """検索クエリ用の埋め込みベクトル取得（L2 正規化済み）。"""
+        return self._svc.embed_text(text)
+
+    def embed(self, text: str) -> List[float]:
+        """別名（embed_query と同等）。"""
+        return self.embed_query(text)
+    
+    def embed_text(self, text: str, lang: Optional[str] = None) -> List[float]:
+        """
+        単一テキストの埋め込み。
+        lang は現在はヒントとして無視（mxbai-embed-large は多言語対応）。
+        """
+        if text is None:
+            text = ""
+        return self._svc.embed_text(str(text))
+
+    def embed_texts(self, texts: Sequence[str], lang: Optional[str] = None) -> List[List[float]]:
+        """
+        複数テキストを一括埋め込み。
+        - 入力と同じ長さ・順序で List[List[float]] を返す。
+        - 空文字や None が混じっても長さを維持するため、ゼロベクトルで埋める。
+        - 実体は EmbeddingsService に委譲（内部でバッチ処理・リトライ等を実装）。
+        """
+        if not texts:
+            return []
+
+        # 空要素を識別して、非空のみ埋め込み→後で元の位置へ戻す
+        norm_texts: List[str] = []
+        non_empty_indices: List[int] = []
+        for i, t in enumerate(texts):
+            s = (t or "").strip() if isinstance(t, str) else ""
+            if s:
+                non_empty_indices.append(i)
+                norm_texts.append(s)
+
+        # サービスから埋め込み（非空のみ）
+        vectors_non_empty: List[List[float]] = []
+        if norm_texts:
+            vectors_non_empty = self._svc.embed_texts(norm_texts)
+
+        # 出力配列を初期化（ゼロベクトルで埋めておく）
+        dim = getattr(self._svc, "embedding_dim", None)
+        if dim is None:
+            try:
+                dim = int(os.getenv("EMBEDDING_DIM", "1024"))
+            except Exception:
+                dim = 1024
+        zero_vec = [0.0] * int(dim)
+
+        result: List[List[float]] = [list(zero_vec) for _ in range(len(texts))]
+
+        # 非空だった位置にだけ実ベクトルを配置
+        for idx, vec in zip(non_empty_indices, vectors_non_empty):
+            # 念のためサイズを合わせる（モデル側の仕様変更対策）
+            if len(vec) != dim:
+                if len(vec) > dim:
+                    vec = vec[:dim]
+                else:
+                    vec = vec + [0.0] * (dim - len(vec))
+            result[idx] = vec
+
+        return result
