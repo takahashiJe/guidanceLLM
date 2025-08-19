@@ -22,6 +22,7 @@ from .nodes.itinerary_nodes import (
     calc_preview_route_and_summarize,
 )
 from .nodes.shared_nodes import chitchat_node, error_node
+from .nodes.navigation_nodes import start_navigation_node, end_navigation_node
 
 
 def _information_flow(state: AgentState) -> AgentState:
@@ -61,6 +62,7 @@ def build_graph():
     sg.add_node("information_flow", _information_flow)
     sg.add_node("planning_flow", _planning_flow)
     sg.add_node("chitchat", chitchat_node)
+    sg.add_node("start_navigation", start_navigation_node)
 
     # Entry: router ノード
     def _router(state: AgentState) -> AgentState:
@@ -82,6 +84,8 @@ def build_graph():
             "information_flow": "information_flow",
             "planning_flow": "planning_flow",
             "chitchat": "chitchat",
+            "navigation": "start_navigation",  # 「案内開始」の意図
+            "end_navigation": "end_navigation",# 「案内終了」の意図
             "__END__": END,
         },
     )
@@ -90,6 +94,8 @@ def build_graph():
     sg.add_edge("information_flow", END)
     sg.add_edge("planning_flow", END)
     sg.add_edge("chitchat", END)
+    sg.add_edge("start_navigation", END)
+    sg.add_edge("end_navigation", END)
 
     # --- エントリポイント ---
     sg.set_entry_point("router")

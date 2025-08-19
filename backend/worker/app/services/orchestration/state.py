@@ -452,6 +452,8 @@ class AgentState:
     # G: ナビ
     navigation_events: List[Dict[str, Any]] = field(default_factory=list)
     guide_generation_done: bool = False
+    is_navigating: bool  # ナビゲーションモードが有効かどうかのフラグ
+    pre_generated_guides: Optional[List[dict]] # 事前生成されたガイドテキストのリスト
 
     # H: エラー/診断
     error: Optional[str] = None
