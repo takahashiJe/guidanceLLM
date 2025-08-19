@@ -55,7 +55,7 @@ def create_new_plan(db: Session, *, user_id: int, session_id: str, start_date: d
     # 対応セッションがあれば active_plan_id を更新
     sess = (
         db.execute(
-            select(UserSession).where(UserSession.session_id == session_id).with_for_update()
+            select(UserSession).where(UserSession.id == session_id).with_for_update()
         )
         .scalars()
         .first()

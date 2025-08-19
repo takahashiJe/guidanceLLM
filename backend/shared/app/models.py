@@ -129,7 +129,11 @@ class Session(Base):
     def __repr__(self) -> str:
         return f"<Session id={self.id} user_id={self.user_id} app_status={self.app_status}>"
     
-    # plans = relationship("Plan", back_populates="session")
+    plans = relationship(
+        "Plan",
+        back_populates="session",
+        foreign_keys="[Plan.session_id]",
+    )
 
 
 class ConversationHistory(Base):
@@ -311,6 +315,13 @@ class Plan(Base):
 
     def __repr__(self) -> str:
         return f"<Plan id={self.id} user_id={self.user_id} start_date={self.start_date}>"
+    
+    session = relationship(
+        "Session",
+        back_populates="plans",
+        foreign_keys=[session_id],
+    )
+
 
 
 class Stop(Base):
