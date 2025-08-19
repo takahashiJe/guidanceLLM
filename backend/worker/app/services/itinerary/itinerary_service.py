@@ -110,6 +110,7 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
     features: List[Dict[str, Any]] = []
     total_min: float = 0.0
 
+    legs: List[Dict[str, Any]] = []
     # 隣接ペアごとにハイブリッドルートを取得して積み上げ
     for i in range(len(waypoints) - 1):
         origin = waypoints[i]
@@ -124,6 +125,7 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
             dest_tags=dest_tags,
             ap_max_km=20.0,   # 必要なら設定値に
         )
+        legs.append(leg)  # ここでlegsに追加
 
         total_min += float(leg.get("duration_min", 0.0))
 
@@ -152,6 +154,7 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
         plan_summary["route_geojson"] = None
         plan_summary["total_duration_minutes"] = 0
 
+    plan_summary["legs"] = legs
     return plan_summary
 
 
