@@ -42,7 +42,7 @@ from worker.app.services.navigation.navigation_service import NavigationService
 
 # 必要に応じて利用（ナッジ・距離/時間などは内部で他サービスへ連携）
 from worker.app.services.information.information_service import InformationService
-from worker.app.services.itinerary.itinerary_service import ItineraryService
+# from worker.app.services.itinerary.itinerary_service import ItineraryService
 from worker.app.services.routing.routing_service import RoutingService
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
 
-from app.services.navigation.navigation_service import NavigationService
+from worker.app.services.navigation.navigation_service import NavigationService
 from ..state import AgentState
 
 def start_navigation_node(state: AgentState) -> Dict[str, Any]:

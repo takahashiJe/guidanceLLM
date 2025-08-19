@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Literal, Tuple
 
 from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from shared.app.database import SessionLocal
 from shared.app import models
@@ -458,3 +459,38 @@ class AgentState:
     # H: エラー/診断
     error: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
+
+# ==============================================================================================
+# === ここから追記 =============================================================================
+# ==============================================================================================
+
+def save_message(
+    state: AgentState,
+    role: Literal["user", "assistant", "system"],
+    content: str,
+    meta: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    AgentStateのchat_history（短期記憶）に新しいメッセージを追加するヘルパー関数。
+
+    この関数は、`shared_nodes.py` などのLangGraphノード実装から呼び出されることを想定しています。
+    状態（state）オブジェクトを直接変更することで、対話履歴を管理するロジックをこのファイルに集約し、
+    コードの再利用性と保守性を高めます。
+
+    Args:
+        state (AgentState): 現在の対話状態を保持するオブジェクト。このオブジェクトの `chat_history` が更新されます。
+        role (Literal["user", "assistant", "system"]): メッセージの送信者（役割）。
+        content (str): メッセージの本文。
+        meta (Optional[Dict[str, Any]], optional): ログや後続処理で使用するための追加情報。デフォルトはNone。
+    """
+    # 既存の AgentState が持つ ChatItem データクラスのインスタンスを作成します。
+    new_message = ChatItem(
+        role=role,
+        content=content,
+        # metaがNoneの場合は空の辞書をデフォルト値として設定します。
+        meta=meta or {}
+    )
+    
+    # 引数で受け取った state オブジェクトの chat_history リストに、新しいメッセージを追加します。
+    # これにより、この関数を呼び出したノードの後続処理で、更新された対話履歴を参照できます。
+    state.chat_history.append(new_message)
