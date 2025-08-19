@@ -1,162 +1,115 @@
 # -*- coding: utf-8 -*-
 """
-DB 初期化スクリプト（db-init コンテナ用）
-------------------------------------------------------------
-役割:
-  1) Postgres の起動を待つ（リトライ）
-  2) Alembic によりスキーマを最新化（upgrade head）
-  3) 初回起動直後に、存在するマテビューをリフレッシュ
-     - congestion_by_date_spot（ユニークインデックスがあれば CONCURRENTLY）
-     - spot_congestion_mv（存在する場合の後方互換）
+初期化スクリプト（db-init コンテナで実行）
+- Alembic マイグレーション (INIT_RUN_ALEMBIC)
+- Access Points ロード (INIT_LOAD_ACCESS_POINTS)
+- Spots ロード (INIT_LOAD_SPOTS)
 
-環境変数:
-  - DATABASE_URL / ALEMBIC_DB_URL: DB 接続 URL（どちらかがあれば可）
-  - ALEMBIC_SCRIPT_LOCATION: Alembic の migrations ディレクトリ
-      例: backend/shared/app/migrations
-      未指定の場合は __file__ から相対で解決
-  - ALEMBIC_INI_PATH: alembic.ini のパス（既定 "alembic.ini"）
-  - DB_INIT_MAX_WAIT_SEC: DB 起動待機の最大秒数（既定 120）
-  - DB_INIT_RETRY_INTERVAL_SEC: 接続リトライ間隔（既定 2）
+環境変数（docker-compose.yml で設定済み）:
+  DATABASE_URL
+  ALEMBIC_SCRIPT_LOCATION  例: backend/shared/app/migrations
+  ALEMBIC_DB_URL           省略可。未設定なら DATABASE_URL を使用
+  INIT_RUN_ALEMBIC         "true"/"false" (デフォルト: true)
+  INIT_LOAD_ACCESS_POINTS  "true"/"false" (デフォルト: true)
+  INIT_LOAD_SPOTS          "true"/"false" (デフォルト: true)
+
+ローダの実体は backend/script 下に配置されている想定:
+  - backend/script/load_access_points.py
+  - backend/script/load_spots.py
 """
 
-from __future__ import annotations
-
 import os
+import shlex
+import subprocess
 import sys
-import time
-import logging
 from pathlib import Path
-from typing import Optional
-
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
-
-from alembic import command
-from alembic.config import Config
+from typing import Dict
 
 
-# ------------------------------------------------------------
-# ロガー設定
-# ------------------------------------------------------------
-logger = logging.getLogger("db-init")
-handler = logging.StreamHandler(stream=sys.stdout)
-formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+def _as_bool(val: str | None, default: bool) -> bool:
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-# ------------------------------------------------------------
-# ユーティリティ
-# ------------------------------------------------------------
-def _resolve_db_url() -> str:
-    """DATABASE_URL / ALEMBIC_DB_URL のいずれかから DB URL を決定。"""
-    db_url = os.getenv("ALEMBIC_DB_URL") or os.getenv("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL または ALEMBIC_DB_URL が未設定です。")
-    return db_url
+def run(cmd: str, env: Dict[str, str] | None = None) -> None:
+    """サブプロセス実行（失敗時は例外で落とす）。"""
+    print(f"[init] $ {cmd}", flush=True)
+    completed = subprocess.run(shlex.split(cmd), env=env)
+    if completed.returncode != 0:
+        raise SystemExit(completed.returncode)
 
 
-def _resolve_script_location() -> str:
-    """
-    Alembic の migrations ディレクトリを特定。
-    環境変数がなければ、__file__ から:
-      backend/worker/app/init_db_script.py
-      -> backend/shared/app/migrations
-    """
-    env_loc = os.getenv("ALEMBIC_SCRIPT_LOCATION")
-    if env_loc:
-        return env_loc
+def main() -> None:
+    # --- 環境変数の取得・整備 ---------------------------------------------
+    alembic_loc = os.getenv("ALEMBIC_SCRIPT_LOCATION", "backend/shared/app/migrations")
+    alembic_ini = Path(alembic_loc) / "alembic.ini"
 
-    here = Path(__file__).resolve()
-    backend_dir = here.parents[2]  # .../backend
-    migrations = backend_dir / "shared" / "app" / "migrations"
-    return str(migrations)
+    alembic_db_url = os.getenv("ALEMBIC_DB_URL") or os.getenv("DATABASE_URL")
+    do_alembic = _as_bool(os.getenv("INIT_RUN_ALEMBIC"), True)
+    do_ap      = _as_bool(os.getenv("INIT_LOAD_ACCESS_POINTS"), True)
+    do_spots   = _as_bool(os.getenv("INIT_LOAD_SPOTS"), True)
 
+    # 実行環境（PYTHONPATH等）は compose 側で与えられているのでそのまま継承
+    env = os.environ.copy()
 
-def _wait_for_db(db_url: str, max_wait: int = 120, interval: int = 2) -> Engine:
-    """Postgres 起動待機（接続が開くまでリトライ）。"""
-    engine = create_engine(db_url, future=True)
-    start = time.time()
-    while True:
-        try:
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            logger.info("DB 接続に成功しました。")
-            return engine
-        except Exception as e:
-            elapsed = int(time.time() - start)
-            if elapsed >= max_wait:
-                logger.error("DB 接続待機のタイムアウト: %s", str(e))
-                raise
-            logger.info("DB 起動待機中... (%ds/%ds): %s", elapsed, max_wait, str(e))
-            time.sleep(interval)
+    print("[init] ===== DB Init Settings =====", flush=True)
+    print(f"[init] WORKDIR:            {Path.cwd()}", flush=True)
+    print(f"[init] ALEMBIC_LOCATION:   {alembic_loc}", flush=True)
+    print(f"[init] ALEMBIC_INI:        {alembic_ini}", flush=True)
+    print(f"[init] ALEMBIC_DB_URL set: {bool(alembic_db_url)}", flush=True)
+    print(f"[init] INIT_RUN_ALEMBIC:   {do_alembic}", flush=True)
+    print(f"[init] INIT_LOAD_AP:       {do_ap}", flush=True)
+    print(f"[init] INIT_LOAD_SPOTS:    {do_spots}", flush=True)
+    print("[init] =============================", flush=True)
 
+    # --- 0) 前提ファイルチェック（分かりやすい失敗にする） ---------------
+    if do_alembic and not alembic_ini.is_file():
+        print(f"[init][ERROR] alembic.ini が見つかりません: {alembic_ini}", flush=True)
+        print("[init][HINT] ALEMBIC_SCRIPT_LOCATION の指定を確認してください。", flush=True)
+        raise SystemExit(2)
 
-def _run_alembic_upgrade(script_location: str, db_url: str) -> None:
-    """Alembic で upgrade head を実行。"""
-    ini_path = os.getenv("ALEMBIC_INI_PATH", "alembic.ini")
-    logger.info("Alembic 実行開始: script_location=%s, ini=%s", script_location, ini_path)
+    # --- 1) Alembic -------------------------------------------------------
+    if do_alembic:
+        # env.py が ALEMBIC_DB_URL/DATABASE_URL を優先して読みます
+        cmd = f'alembic -c "{alembic_ini.as_posix()}" upgrade head'
+        run(cmd, env=env)
+    else:
+        print("[init] Alembic はスキップ (INIT_RUN_ALEMBIC=false)", flush=True)
 
-    cfg = Config(ini_path)
-    # ini 側の設定を環境変数で上書き
-    cfg.set_main_option("script_location", script_location)
-    cfg.set_main_option("sqlalchemy.url", db_url)
+    # --- 2) Access Points ロード ------------------------------------------
+    ap_loader = Path("backend/script/load_access_points.py")
+    if do_ap:
+        if ap_loader.is_file():
+            print("[init] ---- Load Access Points START ----", flush=True)
+            run(f'{shlex.quote(sys.executable)} {ap_loader.as_posix()}', env=env)
+            print("[init] ---- Load Access Points DONE ----", flush=True)
+        else:
+            print(f"[init][WARN] {ap_loader} が見つかりません。AP ロードをスキップします。", flush=True)
+    else:
+        print("[init] Access Points ロードはスキップ (INIT_LOAD_ACCESS_POINTS=false)", flush=True)
 
-    # upgrade 実行
-    command.upgrade(cfg, "head")
-    logger.info("Alembic upgrade head 完了。")
+    # --- 3) Spots ロード ---------------------------------------------------
+    spots_loader = Path("backend/script/load_spots.py")
+    if do_spots:
+        if spots_loader.is_file():
+            print("[init] ---- Load Spots START ----", flush=True)
+            run(f'{shlex.quote(sys.executable)} {spots_loader.as_posix()}', env=env)
+            print("[init] ---- Load Spots DONE ----", flush=True)
+        else:
+            print(f"[init][WARN] {spots_loader} が見つかりません。Spots ロードをスキップします。", flush=True)
+    else:
+        print("[init] Spots ロードはスキップ (INIT_LOAD_SPOTS=false)", flush=True)
 
-
-def _refresh_materialized_view(engine: Engine, name: str, use_concurrently: bool = True) -> None:
-    """
-    マテリアライズドビューを REFRESH。
-    - CONCURRENTLY が使えない場合（初回など）は通常 REFRESH にフォールバック。
-    """
-    with engine.begin() as conn:
-        if use_concurrently:
-            try:
-                conn.execute(text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {name};"))
-                logger.info("REFRESH MATERIALIZED VIEW CONCURRENTLY %s 実行。", name)
-                return
-            except Exception as e:
-                logger.warning("CONCURRENTLY 失敗のため通常 REFRESH にフォールバック: %s", e)
-
-        # 通常 REFRESH
-        try:
-            conn.execute(text(f"REFRESH MATERIALIZED VIEW {name};"))
-            logger.info("REFRESH MATERIALIZED VIEW %s 実行。", name)
-        except Exception as e:
-            # MV が存在しない等は警告ログのみ（冪等運用のため）
-            logger.warning("REFRESH MATERIALIZED VIEW %s 失敗（スキップ）: %s", name, e)
-
-
-def main() -> int:
-    try:
-        db_url = _resolve_db_url()
-        max_wait = int(os.getenv("DB_INIT_MAX_WAIT_SEC", "120"))
-        interval = int(os.getenv("DB_INIT_RETRY_INTERVAL_SEC", "2"))
-
-        # 1) DB 起動待機
-        engine = _wait_for_db(db_url, max_wait=max_wait, interval=interval)
-
-        # 2) Alembic upgrade head
-        script_location = _resolve_script_location()
-        _run_alembic_upgrade(script_location, db_url)
-
-        # 3) マテビューの初期 REFRESH（存在すれば）
-        #    - フェーズ5で合意した集計 MV
-        _refresh_materialized_view(engine, "congestion_by_date_spot", use_concurrently=True)
-        #    - 既存互換（もし使っていれば）
-        _refresh_materialized_view(engine, "spot_congestion_mv", use_concurrently=True)
-
-        logger.info("DB 初期化シーケンス完了。")
-        return 0
-
-    except Exception as e:
-        logger.exception("DB 初期化シーケンスで致命的エラー: %s", e)
-        return 1
+    print("[init] ✅ 初期化完了", flush=True)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        main()
+    except SystemExit as e:
+        # そのまま終了コードを返す（compose は exit code で成否を検知）
+        raise
+    except Exception as e:
+        print(f"[init][ERROR] {e}", flush=True)
+        sys.exit(1)

@@ -1,83 +1,138 @@
-# backend/shared/app/migrations/versions/20250815_02_add_conversation_embeddings_and_mv.py
-# -----------------------------------------------------------------------------
-# 目的:
-#   1) conversation_embeddings テーブルの追加
-#      - mxbai-embed-large のベクトルを float8[] で保持
-#      - 検索はアプリ側（Python）でコサイン類似度計算
-#   2) congestion_by_date_spot マテリアライズドビューの作成
-#      - plans.start_date × stops.spot_id でJOIN集計
-#      - UNIQUE INDEX (visit_date, spot_id) を作成し、CONCURRENTLY での REFRESH を可能に
-# -----------------------------------------------------------------------------
-
+# -*- coding: utf-8 -*-
+# conversation_embeddings（条件付きFK） + MV(congestion_by_date_spot は親揃い時のみ作成)
 from __future__ import annotations
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql as psql
 
-# リビジョン識別子
-revision = "rev_2025081502"
-down_revision = "rev_2025081501"
+revision = "0003_embeddings_mv"
+down_revision = "0002_pre_guides"
 branch_labels = None
 depends_on = None
 
 EMB_TABLE = "conversation_embeddings"
+EMB_IDX = "ix_convemb_session_ts"
+FK_SESS = "fk_convemb_session_id"
+
 MV_NAME = "congestion_by_date_spot"
 MV_UNIQUE_INDEX = "ux_congestion_by_date_spot"
+
+def _has_table(inspector, name: str) -> bool:
+    return name in inspector.get_table_names()
+
+def _has_fk(conn, table: str, fk_name: str) -> bool:
+    sql = sa.text("""
+        SELECT 1
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = :table AND c.conname = :fk AND c.contype = 'f'
+        LIMIT 1
+    """)
+    return bool(conn.execute(sql, {"table": table, "fk": fk_name}).scalar())
+
+def _mv_exists(conn, name: str) -> bool:
+    return bool(conn.execute(sa.text(
+        "SELECT 1 FROM pg_matviews WHERE matviewname = :n LIMIT 1"
+    ), {"n": name}).scalar())
 
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
 
-    # -------------------------------------------------------------------------
-    # 1) conversation_embeddings（冪等対応）
-    # -------------------------------------------------------------------------
+    has_sessions = _has_table(inspector, "sessions")
+    has_plans    = _has_table(inspector, "plans")
+    has_stops    = _has_table(inspector, "stops")
+
+    # 0) ENUM 'speaker' を「無ければ作成」：IF NOT EXISTS 相当
+    op.execute(sa.text("""
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'speaker') THEN
+            CREATE TYPE speaker AS ENUM ('user', 'assistant', 'system');
+        END IF;
+    END$$;
+    """))
+
+    # 1) conversation_embeddings
+    #    ここでは ENUM を直接使わず、一旦 VARCHAR で作成 → 直後に ALTER で ENUM へ変換
     if EMB_TABLE not in inspector.get_table_names():
         op.create_table(
             EMB_TABLE,
-            sa.Column("id", sa.Integer, primary_key=True, nullable=False),
+            sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True, nullable=False),
             sa.Column("session_id", sa.String(length=64), nullable=False, index=True),
-            sa.Column("speaker", sa.String(length=16), nullable=False),  # "user" | "assistant" | "system"
-            sa.Column("lang", sa.String(length=8), nullable=False),
-            sa.Column("ts", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+            sa.Column("speaker", sa.String(length=16), nullable=False),  # ← まずは文字列で作る
+            sa.Column("lang", sa.String(length=8), nullable=True),
             sa.Column("text", sa.Text, nullable=False),
+            sa.Column("ts", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
             sa.Column("embedding_version", sa.String(length=64), nullable=False, server_default=sa.text("'mxbai-embed-large'")),
-            # ベクトルは float8[] として保存（pgvector 未使用方針）
-            sa.Column("embedding", psql.ARRAY(sa.FLOAT), nullable=False),
+            sa.Column("embedding", sa.JSON, nullable=False),
         )
-        # 検索用の基本インデックス（セッションと時系列）
-        op.create_index("ix_conversation_embeddings_session_ts", EMB_TABLE, ["session_id", "ts"], unique=False)
+        # 作成直後に ENUM へ型変換（テーブルはまだ空なので安全）
+        op.execute(sa.text(
+            f"ALTER TABLE {EMB_TABLE} "
+            f"ALTER COLUMN speaker TYPE speaker USING speaker::speaker"
+        ))
 
-    # -------------------------------------------------------------------------
-    # 2) マテリアライズドビュー congestion_by_date_spot（冪等対応）
-    # -------------------------------------------------------------------------
-    # 既に存在するか確認（Postgres の情報スキーマからは視認しにくいので try/except で作成）
-    # 初回作成時はユニークインデックスも作成
-    try:
-        op.execute(sa.text(f"CREATE MATERIALIZED VIEW {MV_NAME} AS "
-                           "SELECT p.start_date::date AS visit_date, s.spot_id, COUNT(DISTINCT p.user_id) AS num_plans "
-                           "FROM plans p "
-                           "JOIN stops s ON s.plan_id = p.id "
-                           "GROUP BY visit_date, s.spot_id"))
-        # UNIQUE INDEX（CONCURRENTLY は MV 作成直後は使えないため通常作成）
+    # インデックス
+    if EMB_IDX not in [ix["name"] for ix in inspector.get_indexes(EMB_TABLE)]:
+        op.create_index(EMB_IDX, EMB_TABLE, ["session_id", "ts"], unique=False)
+
+    # FK（sessions がある場合のみ）
+    if has_sessions and not _has_fk(bind, EMB_TABLE, FK_SESS):
+        op.create_foreign_key(FK_SESS, EMB_TABLE, "sessions", ["session_id"], ["id"], ondelete="CASCADE")
+
+    # 2) 混雑マテビューは plans & stops が揃っているときだけ作成
+    if has_plans and has_stops and not _mv_exists(bind, MV_NAME):
+        op.execute(sa.text(f"""
+            CREATE MATERIALIZED VIEW {MV_NAME} AS
+            SELECT
+                p.start_date::date AS visit_date,
+                s.spot_id::int     AS spot_id,
+                COUNT(*)::int      AS plan_count
+            FROM plans p
+            JOIN stops s ON s.plan_id = p.id
+            WHERE p.start_date IS NOT NULL
+            GROUP BY p.start_date, s.spot_id
+        """))
         op.execute(sa.text(f"CREATE UNIQUE INDEX {MV_UNIQUE_INDEX} ON {MV_NAME} (visit_date, spot_id)"))
-    except Exception:
-        # 既に存在する場合はスキップ
-        pass
 
 def downgrade() -> None:
-    # 逆順で削除
     bind = op.get_bind()
     inspector = sa.inspect(bind)
 
-    # MV の削除
+    # MV
     try:
         op.execute(sa.text(f"DROP INDEX IF EXISTS {MV_UNIQUE_INDEX}"))
         op.execute(sa.text(f"DROP MATERIALIZED VIEW IF EXISTS {MV_NAME}"))
     except Exception:
         pass
 
-    # conversation_embeddings の削除
+    # conversation_embeddings
+    try:
+        if _has_fk(bind, EMB_TABLE, FK_SESS):
+            op.drop_constraint(FK_SESS, EMB_TABLE, type_="foreignkey")
+    except Exception:
+        pass
+
+    try:
+        op.drop_index(EMB_IDX, table_name=EMB_TABLE)
+    except Exception:
+        pass
+
     if EMB_TABLE in inspector.get_table_names():
-        op.drop_index("ix_conversation_embeddings_session_ts", table_name=EMB_TABLE)
         op.drop_table(EMB_TABLE)
+
+    # ENUM 'speaker' は、他で使われていなければ落とす
+    op.execute(sa.text("""
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_attribute a
+            JOIN pg_type t ON a.atttypid = t.oid
+            WHERE t.typname = 'speaker'
+        ) THEN
+            DROP TYPE IF EXISTS speaker;
+        END IF;
+    END$$;
+    """))
