@@ -9,6 +9,10 @@ from sqlalchemy.orm import Session
 from worker.app.services.itinerary import crud_plan
 from worker.app.services.routing.routing_service import RoutingService
 
+from worker.app.services.routing.client import OSRMNoRouteError
+from worker.app.services.routing.access_points_repo import find_nearest_access_point
+from worker.app.services.routing.drive_rules import is_car_direct_accessible
+
 # --- Public API for Orchestration Layer ---
 
 def create_plan_for_user(
@@ -54,35 +58,116 @@ def reorder_user_plan_stops(
 def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
     """
     指定された計画の現在の状態（訪問地リスト、ルート情報など）を要約して返す。
-    ルート計算サービスとの連携もここで行う。
+    ここで“ハイブリッド経路（car＋foot）”をレグ単位で構築する。
     """
-    # 1. DBから訪問地の基本情報を取得
-    plan_summary = crud_plan.summarize_plan_stops(db, plan_id=plan_id)
-    routingService = RoutingService()
+    # --- Stop一覧（順序付き）を取得（List[Stop]）
+    stops = crud_plan.summarize_plan_stops(db, plan_id=plan_id)
 
-    if not plan_summary or not plan_summary.get("stops"):
-        plan_summary["route_geojson"] = None
-        plan_summary["total_duration_minutes"] = 0
-        return plan_summary
+    # --- 出力用の stops 配列（UI/LLM向けの軽量辞書）を組み立て
+    stops_out: List[Dict[str, Any]] = []
+    for st in stops:
+        sp = getattr(st, "spot", None)
+        if not sp:
+            # 万一リレーションが無い/参照切れならスキップ
+            continue
 
-    # 2. 訪問地が2か所以上ある場合、ルート計算サービスを呼び出す
-    if len(plan_summary["stops"]) >= 2:
+        # position or order_index のどちらでも拾えるように
+        idx = getattr(st, "position", None)
+        if idx is None:
+            idx = getattr(st, "order_index", None)
+
+        stops_out.append(
+            {
+                "stop_id": st.id,
+                "spot_id": sp.id,
+                "index": idx,
+                "official_name": getattr(sp, "official_name", None),
+                "spot_type": getattr(sp, "spot_type", None),
+                "tags": getattr(sp, "tags", None),
+                "latitude": float(getattr(sp, "latitude", 0.0)),
+                "longitude": float(getattr(sp, "longitude", 0.0)),
+            }
+        )
+
+    # --- 訪問地が2未満ならルート無しで返す
+    if len(stops_out) < 2:
+        return {
+            "plan_id": plan_id,
+            "stops": stops_out,
+            "route_geojson": None,
+            "total_duration_minutes": 0.0,
+            "total_distance_km": 0.0,
+            "legs": [],
+        }
+
+    rs = RoutingService()
+    legs: List[Dict[str, Any]] = []
+    total_km = 0.0
+    total_min = 0.0
+
+    # --- 連続する Stop 間を 1 レグとして、ハイブリッドで構築
+    for i in range(len(stops_out) - 1):
+        a = stops_out[i]
+        b = stops_out[i + 1]
+
+        origin = (a["latitude"], a["longitude"])
+        dest = (b["latitude"], b["longitude"])
+        dest_spot_type = b.get("spot_type")
+        dest_tags = b.get("tags")
+
+        # 目的地が車で直行可能か？
+        car_ok = is_car_direct_accessible(dest_spot_type, dest_tags)
+
         try:
-            # routing_serviceはspot_idのリストを要求する
-            spot_ids = [stop["spot_id"] for stop in plan_summary["stops"]]
-            route_info = routingService.calculate_full_itinerary_route(db, spot_ids)
-            plan_summary["route_geojson"] = route_info["geojson"]
-            plan_summary["total_duration_minutes"] = route_info["total_duration_minutes"]
-        except Exception as e:
-            # ルート計算に失敗しても処理を続行し、情報はNoneとする
-            print(f"Error calculating route for plan_id={plan_id}: {e}")
-            plan_summary["route_geojson"] = None
-            plan_summary["total_duration_minutes"] = 0
-    else:
-        plan_summary["route_geojson"] = None
-        plan_summary["total_duration_minutes"] = 0
+            if car_ok:
+                # 直行可 → car 一本（ダメなら foot フォールバック）
+                leg = rs.calculate_full_itinerary_route([origin, dest], profile="car")
+            else:
+                # 直行不可 → 最近傍 AP（駐車場/登山口）を探索
+                ap = find_nearest_access_point(db, lat=dest[0], lon=dest[1], max_km=20.0)
+                if ap:
+                    _, ap_name, ap_type, ap_lat, ap_lon = ap
+                    ap_pt = (ap_lat, ap_lon)
 
-    return plan_summary
+                    car_seg = rs.calculate_full_itinerary_route([origin, ap_pt], profile="car")
+                    foot_seg = rs.calculate_full_itinerary_route([ap_pt, dest], profile="foot")
+
+                    merged = _merge_feature_collections([car_seg["geojson"], foot_seg["geojson"]])
+                    leg = {
+                        "geojson": merged,
+                        "distance_km": float(car_seg["distance_km"]) + float(foot_seg["distance_km"]),
+                        "duration_min": float(car_seg["duration_min"]) + float(foot_seg["duration_min"]),
+                        "used_ap": {
+                            "name": ap_name,
+                            "type": ap_type,
+                            "latitude": ap_lat,
+                            "longitude": ap_lon,
+                        },
+                    }
+                else:
+                    # APが見つからない → car 試行（ダメなら foot）
+                    leg = rs.calculate_full_itinerary_route([origin, dest], profile="car")
+
+        except OSRMNoRouteError:
+            # car が失敗した等 → foot で最後のフォールバック
+            leg = rs.calculate_full_itinerary_route([origin, dest], profile="foot")
+
+        # legs 集計
+        legs.append(leg)
+        total_km += float(leg["distance_km"])
+        total_min += float(leg["duration_min"])
+
+    # --- ルート（GeoJSON）全結合
+    route_geojson = _merge_feature_collections([leg["geojson"] for leg in legs])
+
+    return {
+        "plan_id": plan_id,
+        "stops": stops_out,
+        "route_geojson": route_geojson,
+        "total_duration_minutes": total_min,
+        "total_distance_km": total_km,
+        "legs": legs,  # used_ap が入るのでデバッグ/LLM提示に便利
+    }
 
 
 # --- API for Information Service ---
@@ -145,3 +230,13 @@ def _get_congestion_status(count: int) -> str:
     elif count <= CONGESTION_THRESHOLDS["mid_max"]:
         return "比較的穏やかでしょう"
     return "混雑が予想されます"
+
+def _merge_feature_collections(collections: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """複数の FeatureCollection を単純結合"""
+    merged = {"type": "FeatureCollection", "features": []}
+    for col in collections:
+        if not col:
+            continue
+        feats = col.get("features") or []
+        merged["features"].extend(feats)
+    return merged
