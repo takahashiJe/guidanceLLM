@@ -48,7 +48,7 @@ def create_new_plan(db: Session, *, user_id: int, session_id: str, start_date: d
     新しい計画を作成し、sessions.active_plan_id を更新する。
     - 要件: 新セッション開始で計画リセット
     """
-    new_plan = Plan(user_id=user_id, start_date=start_date)
+    new_plan = Plan(user_id=user_id, session_id=session_id, start_date=start_date)
     db.add(new_plan)
     db.flush()  # id 採番
 
