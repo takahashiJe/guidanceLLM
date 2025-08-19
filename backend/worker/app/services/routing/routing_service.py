@@ -66,51 +66,48 @@ class RoutingService:
         ap_max_km: float = 20.0,
         piston: bool = False,
     ) -> Dict[str, Any]:
-        """
-        origin→dest の1区間をハイブリッド計算:
-          - 目的地が車直行可なら car で1本
-          - 目的地が直行不可なら: 最近傍APを取り car(origin→AP) + foot(AP→dest)
-        戻り値: {
-          "geojson": FeatureCollection,
-          "distance_km": float,
-          "duration_min": float,
-          "used_ap": {"name":..,"type":..,"latitude":..,"longitude":..} or None
-        }
-        """
         car_ok = is_car_direct_accessible(dest_spot_type, dest_tags)
 
         # 1) 直行可: car をまず試し、ダメなら foot にフォールバック
         if car_ok:
             try:
-                return self.calculate_full_itinerary_route([origin, dest], profile="car", piston=piston)
+                r = self.calculate_full_itinerary_route([origin, dest], profile="car", piston=piston)
+                r["used_ap"] = None            # ← 追加
+                return r
             except OSRMNoRouteError:
-                return self.calculate_full_itinerary_route([origin, dest], profile="foot", piston=piston)
+                r = self.calculate_full_itinerary_route([origin, dest], profile="foot", piston=piston)
+                r["used_ap"] = None            # ← 追加
+                return r
 
-        # 2) 直行不可: 目的地の近傍APを取得（駐車場/登山口）
+        # 2) 直行不可: 目的地の近傍APを取得
         ap = find_nearest_access_point(db, lat=dest[0], lon=dest[1], max_km=ap_max_km)
         if not ap:
-            # AP不在 → 最後の手段で car, それもダメなら foot
+            # AP不在 → 車に挑戦、ダメなら徒歩
             try:
-                return self.calculate_full_itinerary_route([origin, dest], profile="car", piston=piston)
+                r = self.calculate_full_itinerary_route([origin, dest], profile="car", piston=piston)
+                r["used_ap"] = None            # ← 追加
+                return r
             except OSRMNoRouteError:
-                return self.calculate_full_itinerary_route([origin, dest], profile="foot", piston=piston)
+                r = self.calculate_full_itinerary_route([origin, dest], profile="foot", piston=piston)
+                r["used_ap"] = None            # ← 追加
+                return r
 
-        _, ap_name, ap_type, ap_lat, ap_lon = ap
+        # APあり → ハイブリッド経路
+        ap_id, ap_name, ap_type, ap_lat, ap_lon = ap   # ← id も拾うのがおすすめ
         ap_pt = (ap_lat, ap_lon)
 
-        # car: origin→AP
         car_seg = self.calculate_full_itinerary_route([origin, ap_pt], profile="car", piston=piston)
-        # foot: AP→dest
-        foot_seg = self.calculate_full_itinerary_route([ap_pt, dest], profile="foot", piston=piston)
+        foot_seg = self.calculate_full_itinerary_route([ap_pt, dest],  profile="foot", piston=piston)
 
-        # 結合・集計
         merged = self._merge_features([car_seg["geojson"], foot_seg["geojson"]])
         return {
             "geojson": merged,
             "distance_km": float(car_seg["distance_km"]) + float(foot_seg["distance_km"]),
             "duration_min": float(car_seg["duration_min"]) + float(foot_seg["duration_min"]),
-            "used_ap": {"name": ap_name, "type": ap_type, "latitude": ap_lat, "longitude": ap_lon},
+            # ここでは dict をセット（テストは not None を期待）
+            "used_ap": {"id": ap_id, "name": ap_name, "ap_type": ap_type, "latitude": ap_lat, "longitude": ap_lon},
         }
+
 
     @staticmethod
     def _merge_features(collections: list[dict]) -> dict:
@@ -125,7 +122,7 @@ class RoutingService:
             feats = col.get("features") or []
             merged["features"].extend(feats)
         return merged
-        
+
     # ===================================
     # 将来用: 現在地からのリルート（薄いラッパ）
     # ===================================

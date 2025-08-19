@@ -53,66 +53,43 @@ def create_new_plan(db: Session, *, user_id: int, session_id: str, start_date: d
     db.flush()  # id 採番
 
     # 対応セッションがあれば active_plan_id を更新
-    sess = (
-        db.execute(
-            select(UserSession).where(UserSession.id == session_id).with_for_update()
-        )
-        .scalars()
-        .first()
-    )
+    sess = db.get(UserSession, session_id)
     if sess:
         sess.active_plan_id = new_plan.id
-        sess.current_status = "planning"
 
     db.commit()
     db.refresh(new_plan)
     return new_plan
 
 
-def add_spot_to_plan(
-    db: Session,
-    *,
-    plan_id: int,
-    spot_id: int,
-    position: Optional[int] = None,
-) -> Stop:
-    """
-    スポットを計画に追加する。
-    - spot_type による制限は行わない（観光/宿泊ともOK）
-    - position 未指定なら末尾に追加
-    - position 指定時は以降をシフト
-    """
+def add_spot_to_plan(db: Session, *, plan_id: int, spot_id: int, position: Optional[int] = None) -> Stop:
     plan = db.get(Plan, plan_id)
     if not plan:
         raise ValueError("plan not found")
 
-    # Spotの存在チェック
     spot = db.get(Spot, spot_id)
     if not spot:
         raise ValueError("spot not found")
 
-    # 現在の末尾計算
-    max_pos = db.execute(
-        select(func.coalesce(func.max(Stop.position), 0)).where(Stop.plan_id == plan_id)
+    # 末尾インデックスを取得（position → order_index に変更）
+    max_idx = db.execute(
+        select(func.coalesce(func.max(Stop.order_index), 0)).where(Stop.plan_id == plan_id)
     ).scalar_one()
+    next_idx = (max_idx or 0) + 1
 
-    insert_pos = max_pos + 1 if position is None else max(1, min(position, max_pos + 1))
-
-    # position >= insert_pos を +1 シフト
-    if insert_pos <= max_pos:
+    if position is None:
+        new_index = next_idx
+    else:
+        # シフト（position 以上を +1）→ order_index に変更
         db.execute(
             update(Stop)
-            .where(and_(Stop.plan_id == plan_id, Stop.position >= insert_pos))
-            .values(position=Stop.position + 1)
+            .where(Stop.plan_id == plan_id, Stop.order_index >= position)
+            .values(order_index=Stop.order_index + 1)
         )
+        new_index = position
 
-    st = Stop(plan_id=plan_id, spot_id=spot_id, position=insert_pos)
+    st = Stop(plan_id=plan_id, spot_id=spot_id, order_index=new_index)
     db.add(st)
-    db.flush()
-
-    _normalize_positions(db, plan_id)
-    db.commit()
-    db.refresh(st)
     return st
 
 
@@ -163,15 +140,60 @@ def reorder_plan_stops(db: Session, *, plan_id: int, new_order_stop_ids: List[in
     db.commit()
 
 
-def summarize_plan_stops(db: Session, *, plan_id: int) -> List[Stop]:
-    """
-    現在の並び順でStopを返す（要約用の材料）。
-    """
-    stops = (
+def summarize_plan_stops(db: Session, *, plan_id: int) -> dict[str, Any]:
+    rows = (
         db.execute(
-            select(Stop).where(Stop.plan_id == plan_id).order_by(Stop.position.asc(), Stop.id.asc())
+            select(
+                Stop.id.label("stop_id"),
+                Stop.order_index.label("order_index"),
+                Spot.id.label("spot_id"),
+                Spot.official_name.label("official_name"),
+                Spot.spot_type.label("spot_type"),
+                Spot.tags.label("tags"),
+                Spot.latitude,
+                Spot.longitude,
+            )
+            .join(Spot, Stop.spot_id == Spot.id)
+            .where(Stop.plan_id == plan_id)
+            .order_by(Stop.order_index.asc(), Stop.id.asc())
+        )
+        .mappings()
+        .all()
+    )
+
+    return {
+        "plan_id": plan_id,
+        "stops": [
+            {
+                "stop_id": r["stop_id"],
+                "order_index": r["order_index"],
+                "spot_id": r["spot_id"],
+                "official_name": r["official_name"],
+                "spot_type": r["spot_type"],
+                "tags": r["tags"],
+                "latitude": float(r["latitude"]),
+                "longitude": float(r["longitude"]),
+            }
+            for r in rows
+        ],
+    }
+
+def list_stops_for_plan(db: Session, *, plan_id: int) -> list[Stop]:
+    return (
+        db.execute(
+            select(Stop).where(Stop.plan_id == plan_id).order_by(Stop.order_index.asc(), Stop.id.asc())
         )
         .scalars()
         .all()
     )
-    return stops
+
+def reorder_stops(db: Session, *, plan_id: int, ordered_stop_ids: list[int]) -> None:
+    if not ordered_stop_ids:
+        return
+    # 1 から連番で order_index を振り直す
+    for i, sid in enumerate(ordered_stop_ids, start=1):
+        db.execute(
+            update(Stop)
+            .where(Stop.id == sid, Stop.plan_id == plan_id)
+            .values(order_index=i)
+        )
