@@ -255,6 +255,35 @@ def reorder_stops(db: Session, *, plan_id: int, ordered_stop_ids: list[int]) -> 
             .values(order_index=i)
         )
 
-def add_spot_to_plan(db: Session, *, plan_id: int, spot_id: int, position: Optional[int] = None) -> Stop:
-    """Backward-compatible wrapper for tests."""
-    return add_spot(db, plan_id=plan_id, spot_id=spot_id, position=position)
+def add_spot_to_plan(
+    db: Session, *, plan_id: int, spot_id: int, position: Optional[int] = None
+) -> Stop:
+    plan = db.get(Plan, plan_id)
+    if not plan:
+        raise ValueError("plan not found")
+
+    spot = db.get(Spot, spot_id)
+    if not spot:
+        raise ValueError("spot not found")
+
+    # 末尾 index を取得（order_index ベース）
+    max_idx = db.execute(
+        select(func.coalesce(func.max(Stop.order_index), 0)).where(Stop.plan_id == plan_id)
+    ).scalar_one()
+    next_idx = (max_idx or 0) + 1
+
+    if position is None:
+        new_index = next_idx
+    else:
+        # position 以上をシフト
+        db.execute(
+            update(Stop)
+            .where(Stop.plan_id == plan_id, Stop.order_index >= position)
+            .values(order_index=Stop.order_index + 1)
+        )
+        new_index = position
+
+    st = Stop(plan_id=plan_id, spot_id=spot_id, order_index=new_index)
+    db.add(st)
+    db.flush()  # id 採番
+    return st
