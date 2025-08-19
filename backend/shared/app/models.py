@@ -38,6 +38,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import text
 from geoalchemy2 import Geometry 
 
@@ -215,7 +216,7 @@ class Spot(Base):
     spot_type = sa.Column(sa.String(length=64), nullable=True)
 
     # タグ配列：カテゴリ検索（category intent）に利用
-    tags = Column(JSON, nullable=True)  # List[str]
+    tags = Column(JSONB, nullable=True)
 
     # 位置情報
     latitude = Column(Float, nullable=False)
@@ -223,7 +224,7 @@ class Spot(Base):
 
     # ガイド文作成に必要な静的情報
     description = Column(Text, nullable=True)
-    social_proof = Column(Text, nullable=True)
+    social_proof = Column(JSONB, nullable=True)  # ← JSONB に変更
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

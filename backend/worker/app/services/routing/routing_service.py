@@ -65,3 +65,4 @@ class RoutingService:
         """
         waypoints = [current_location, *remaining_waypoints]
         return self.calculate_full_itinerary_route(waypoints, profile, piston=False)
+

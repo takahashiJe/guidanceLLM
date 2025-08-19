@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import JSONB
 
 from shared.app.database import SessionLocal
 from shared.app.models import Spot, SpotType  # Spot スキーマに official_name/spot_type/tags/lat/lon 等が定義済み
@@ -25,6 +26,26 @@ POI_JSON = Path("/app/backend/worker/data/POI.json")
 # --- ユーティリティ ---------------------------------------------------------
 
 LANG_ORDER = ("ja", "en", "zh")  # 多言語 -> 代表値を選ぶ優先順
+
+def to_jsonb(v):
+    if v is None:
+        return None
+    if isinstance(v, (dict, list)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        # JSON文字列ならパース
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except Exception:
+            pass
+        # 純テキストならラップして JSON に
+        return {"text": s}
+    return v
 
 
 def pick_lang(d: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -116,7 +137,17 @@ def upsert_spot(db: Session, item: Dict[str, Any]) -> None:
 
     # 説明系も優先順で選ぶ
     description = pick_lang(item.get("description"))
-    social_proof = pick_lang(item.get("social_proof"))
+    social_proof = to_jsonb(item.get("social_proof"))  
+
+    Spot(
+        official_name=name,
+        spot_type=spot_type,
+        tags=to_jsonb(item.get("tags")),        # ここも JSONB なので dict/list 推奨
+        latitude=float(lat),
+        longitude=float(lon),
+        description=description,
+        social_proof=social_proof,              # ← JSONB に渡る
+    )
 
     # 既存行を検索（完全一致）
     existing: Optional[Spot] = (
