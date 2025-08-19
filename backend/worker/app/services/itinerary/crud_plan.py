@@ -6,9 +6,8 @@
 - レースコンディションに強い実装（position の再採番・ギャップ解消）
 """
 
-from typing import List, Optional
+from typing import List, Optional, Any
 from datetime import date
-
 from sqlalchemy import select, func, update, delete, text, and_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
