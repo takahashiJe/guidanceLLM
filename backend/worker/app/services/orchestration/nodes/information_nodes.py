@@ -156,28 +156,21 @@ def _safe_call_generate_nudge(llm: LLMInferenceService, payload: Dict[str, Any],
         # どうしてもダメなら呼び出し元でエラー文生成へ
         raise e
 
-
 # =========================
-# コア・パイプライン
+# STEP 1: 意図分類ノード
 # =========================
 
-def _run_information_pipeline(state: Dict[str, Any]) -> Dict[str, Any]:
+def information_entry(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    情報提供フェーズの中核。NLU → 候補/材料 → 長期記憶注入 → 生成
+    情報提供フローのエントリーポイント。
+    ユーザーの最新メッセージから意図を分類し、後続のRAGで利用する情報をstateに格納する。
     """
     lang: str = state.get("lang", "ja")
-    session_id: Optional[str] = state.get("session_id")
     latest_user_message: str = state.get("latest_user_message", "").strip()
-
-    info = InformationService()
     llm = LLMInferenceService()
-    emb = EmbeddingService()
 
-    # ----------------------
-    # 1) NLU: 意図分類
-    # ----------------------
     try:
-        # できるだけ寛容に: 返り値が Pydantic / dict / str のいずれでも対応
+        # LLMで意図を分類
         intent_result = llm.classify_intent(
             latest_message=latest_user_message,
             app_status=(state.get("agent_state") or {}).get("app_status"),
@@ -189,7 +182,10 @@ def _run_information_pipeline(state: Dict[str, Any]) -> Dict[str, Any]:
         elif not isinstance(intent_result, dict):
             intent_result = {"intent": str(intent_result)}
 
+        # 分類結果を後続処理で使いやすい形式にマッピング
         intent_type, query_for_search = _map_intent_for_information(intent_result, latest_user_message)
+        
+        # stateを更新
         state["intent_result"] = intent_result
         state["intent_type"] = intent_type
         state["intent_query"] = query_for_search
@@ -204,54 +200,83 @@ def _run_information_pipeline(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             err_text = "うまく意図を理解できませんでした。もう少し詳しく教えてください。"
         state["final_response"] = err_text
-        state["app_status"] = "information"
+        state["app_status"] = "error" # エラーステータスへ
+
+    return state
+
+
+# =========================
+# STEP 2: RAG・ナッジ情報収集ノード
+# =========================
+
+def gather_nudge_and_pick_best(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    意図分類の結果に基づき、候補スポットとナッジ材料（天気、混雑等）を収集し、
+    最適なものを評価・選択してstateに格納する。
+    """
+    # 前のステップでエラーが発生していたら、このノードはスキップ
+    if state.get("app_status") == "error":
         return state
 
-    # ----------------------
-    # 2) RAG: 候補抽出 → 最適日/材料 収集
-    # ----------------------
+    lang: str = state.get("lang", "ja")
+    intent_type: str = state.get("intent_type", "general_tourist")
+    query_for_search: str = state.get("intent_query", "")
+    info = InformationService()
+    llm = LLMInferenceService()
+
     try:
         date_range = _get_date_range_from_state(state)
         user_location = _get_user_location_from_state(state)
 
-        # 候補抽出
+        # 意図に基づき候補スポットをDBから検索
         spots = info.find_spots_by_intent(
-            intent_type=intent_type,
-            query=query_for_search,
+            intent=intent_type,
+            query_text=query_for_search,
             language=lang,
         )
-        state["candidate_spots"] = [getattr(s, "id", None) for s in spots]
+        
+        if not spots:
+            # 候補が見つからない場合も応答を生成して終了
+            state["final_response"] = "申し訳ありません、ご要望に合う場所を見つけられませんでした。別の探し方を試しましょうか？"
+            state["app_status"] = "information"
+            return state
 
-        # 材料（距離/時間、日別天気、混雑→最適日）
+        # ナッジ材料（距離/時間、日別天気、混雑→最適日）を収集
+        spot_ids = [s.get("id") for s in spots if s.get("id")]
         materials = info.find_best_day_and_gather_nudge_data(
-            spots=spots,
-            user_location=user_location,
-            date_range=date_range,
+            spot_ids=spot_ids,
+            start_date=date.fromisoformat(date_range["start"]),
+            end_date=date.fromisoformat(date_range["end"]),
+            origin_lat=user_location.get("lat") if user_location else None,
+            origin_lon=user_location.get("lon") if user_location else None,
+            lang=lang,
         )
 
-        # 固有名詞質問の場合、詳細テキスト（official_name, description, social_proof）を追加で取得
+        # 固有名詞質問の場合、追加で詳細情報（説明文、社会的証明など）を取得
         spot_details_map = {}
         if intent_type == "specific":
             for s in spots:
+                spot_id = s.get("id")
+                if not spot_id: continue
                 try:
-                    d = info.get_spot_details(getattr(s, "id"))
-                    spot_details_map[getattr(s, "id")] = {
-                        "official_name": getattr(d, "official_name", None),
-                        "description": getattr(d, "description", None),
-                        "social_proof": getattr(d, "social_proof", None),
+                    d = info.get_spot_details(spot_id)
+                    spot_details_map[spot_id] = {
+                        "official_name": d.get("official_name"),
+                        "description": d.get("description"),
+                        "social_proof": d.get("social_proof"), # このキーは現状get_spot_detailsにないが将来用に残す
                     }
                 except Exception:
-                    # 1件でも失敗しても他は継続
                     pass
 
-        # 生成向けに state に格納（デバッグ/再利用用）
+        # stateを更新
+        state["candidate_spots"] = spots # ORMオブジェクトではなく辞書を格納
         state["nudge_materials"] = materials
         state["spot_details"] = spot_details_map
         state["date_range"] = date_range
         state["user_location"] = user_location
 
     except Exception as e:
-        # 情報収集に失敗した場合はエラーメッセージを生成
+        # 情報収集に失敗した場合のエラーメッセージ
         try:
             err_text = llm.generate_error_message(
                 context={"phase": "nudge_materials", "error": str(e)},
@@ -260,56 +285,55 @@ def _run_information_pipeline(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             err_text = "うまく候補の情報を集められませんでした。別の条件でもう一度試しましょうか？"
         state["final_response"] = err_text
-        state["app_status"] = "information"
-        return state
+        state["app_status"] = "error"
 
-    # ----------------------
-    # 3) 長期記憶（会話のKNN）注入
-    # ----------------------
+    return state
+
+
+# =========================
+# STEP 3: 応答生成ノード
+# =========================
+
+def compose_nudge_response(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    収集した情報と長期記憶を元に、最終的なナッジ提案文を生成する。
+    """
+    # 前のステップでエラーまたは候補なし応答が設定されていたらスキップ
+    if state.get("app_status") == "error" or state.get("final_response"):
+        return state
+        
+    lang: str = state.get("lang", "ja")
+    session_id: Optional[str] = state.get("session_id")
+    latest_user_message: str = state.get("latest_user_message", "")
+    emb = EmbeddingService()
+    llm = LLMInferenceService()
+
+    # 長期記憶（会話履歴のKNN検索）を注入
     try:
-        long_term = []
+        long_term_context = []
         if session_id and latest_user_message:
-            long_term = emb.knn_messages(
+            similar_messages = emb.knn_messages(
                 session_id=session_id,
                 query_text=latest_user_message,
                 k=5,
                 lang=lang,
             )
-        # LLM に渡しやすい形へ（speaker/text/ts）
-        long_term_context = []
-        for m in long_term:
-            long_term_context.append({
-                "speaker": m.get("speaker"),
-                "text": m.get("text"),
-                "ts": m.get("ts"),
-            })
+            for m in similar_messages:
+                long_term_context.append({
+                    "speaker": m.get("speaker"),
+                    "text": m.get("text"),
+                    "ts": m.get("ts"),
+                })
         state["long_term_context"] = long_term_context
     except Exception:
-        # 長期記憶の失敗は致命ではないので無視（ログは上位で拾う想定）
-        state["long_term_context"] = []
+        state["long_term_context"] = [] # 失敗は許容
 
-    # ----------------------
-    # 4) 生成: 最終ナッジ提案文
-    # ----------------------
+    # LLMに渡す最終的なコンテキストを構築
     try:
-        # LLMへ渡すコンテキストを1つにまとめる
-        # InformationService の find_spots_by_intent は ORM オブジェクトを返す想定なので、
-        # LLM に渡しやすい軽量データへ変換（id/official_name 程度）
-        compact_spots = []
-        for s in spots:
-            compact_spots.append({
-                "id": getattr(s, "id", None),
-                "official_name": getattr(s, "official_name", None),
-                "tags": getattr(s, "tags", None),
-                "spot_type": getattr(s, "spot_type", None),
-                "lat": getattr(s, "lat", None),
-                "lon": getattr(s, "lon", None),
-            })
-
         context_payload = {
-            "spots": compact_spots,                         # 候補
-            "materials": materials,                         # id -> {best_date, weather, congestion, distance_km, duration_min, ...}
-            "spot_details": spot_details_map,               # id -> {official_name, description, social_proof}
+            "spots": state.get("candidate_spots", []),
+            "materials": state.get("nudge_materials", {}),
+            "spot_details": state.get("spot_details", {}),
             "long_term_context": state.get("long_term_context", []),
             "user_query": latest_user_message,
             "date_range": state.get("date_range"),
@@ -317,12 +341,15 @@ def _run_information_pipeline(state: Dict[str, Any]) -> Dict[str, Any]:
             "today": _today_str(),
         }
 
+        # LLMを呼び出して応答文を生成
         text = _safe_call_generate_nudge(llm, context_payload, lang=lang)
-        # 状態更新
+        
+        # stateを更新
         state["final_response"] = text
         state["app_status"] = "information"
 
     except Exception as e:
+        # 最終生成に失敗した場合のエラーメッセージ
         try:
             err_text = llm.generate_error_message(
                 context={"phase": "nudge_generation", "error": str(e)},
@@ -331,159 +358,6 @@ def _run_information_pipeline(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             err_text = "最終文面の生成に失敗しました。条件を少し変えてもう一度試しましょう。"
         state["final_response"] = err_text
-        state["app_status"] = "information"
+        state["app_status"] = "error"
 
-    return state
-
-
-# =========================
-# 公開ノード（エイリアス）
-# =========================
-
-def run_information_pipeline(state: Dict[str, Any]) -> Dict[str, Any]:
-    """グラフから直接呼ばれるメイン関数（別名1）。"""
-    return _run_information_pipeline(state)
-
-
-def information_flow(state: Dict[str, Any]) -> Dict[str, Any]:
-    """グラフから直接呼ばれるメイン関数（別名2）。"""
-    return _run_information_pipeline(state)
-
-
-def collect_candidates_and_materials(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    既存互換: 候補抽出と材料集めだけ先に行い、一時保存する。
-    その後の長期記憶注入/生成は別ノードで行う場合に利用。
-    """
-    lang: str = state.get("lang", "ja")
-    latest_user_message: str = state.get("latest_user_message", "").strip()
-    llm = LLMInferenceService()
-
-    # 意図のみ判定
-    intent_result = llm.classify_intent(
-        latest_message=latest_user_message,
-        app_status=(state.get("agent_state") or {}).get("app_status"),
-        chat_history=(state.get("agent_state") or {}).get("chat_history", []),
-        lang=lang,
-    )
-    if hasattr(intent_result, "model_dump"):
-        intent_result = intent_result.model_dump()
-    elif not isinstance(intent_result, dict):
-        intent_result = {"intent": str(intent_result)}
-
-    intent_type, query_for_search = _map_intent_for_information(intent_result, latest_user_message)
-    state["intent_result"] = intent_result
-    state["intent_type"] = intent_type
-    state["intent_query"] = query_for_search
-
-    # 候補・材料
-    info = InformationService()
-    date_range = _get_date_range_from_state(state)
-    user_location = _get_user_location_from_state(state)
-
-    spots = info.find_spots_by_intent(intent_type=intent_type, query=query_for_search, language=lang)
-    materials = info.find_best_day_and_gather_nudge_data(spots=spots, user_location=user_location, date_range=date_range)
-
-    spot_details_map = {}
-    if intent_type == "specific":
-        for s in spots:
-            try:
-                d = info.get_spot_details(getattr(s, "id"))
-                spot_details_map[getattr(s, "id")] = {
-                    "official_name": getattr(d, "official_name", None),
-                    "description": getattr(d, "description", None),
-                    "social_proof": getattr(d, "social_proof", None),
-                }
-            except Exception:
-                pass
-
-    state["candidate_spots"] = [getattr(s, "id", None) for s in spots]
-    state["nudge_materials"] = materials
-    state["spot_details"] = spot_details_map
-    state["date_range"] = date_range
-    state["user_location"] = user_location
-    state["app_status"] = "information"
-    return state
-
-
-def inject_long_term_context(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    既存互換: 長期記憶のみ注入する段階関数。
-    """
-    lang: str = state.get("lang", "ja")
-    session_id: Optional[str] = state.get("session_id")
-    latest_user_message: str = state.get("latest_user_message", "").strip()
-
-    try:
-        emb = EmbeddingService()
-        long_term = []
-        if session_id and latest_user_message:
-            long_term = emb.knn_messages(
-                session_id=session_id,
-                query_text=latest_user_message,
-                k=5,
-                lang=lang,
-            )
-        state["long_term_context"] = [
-            {"speaker": m.get("speaker"), "text": m.get("text"), "ts": m.get("ts")}
-            for m in long_term
-        ]
-    except Exception:
-        state["long_term_context"] = []
-
-    state["app_status"] = "information"
-    return state
-
-
-def generate_information_reply(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    既存互換: 材料と長期記憶が state に揃っている前提で、最終文面だけを生成。
-    """
-    lang: str = state.get("lang", "ja")
-    llm = LLMInferenceService()
-
-    # 必要なキーを取り出して payload を組む
-    materials = state.get("nudge_materials") or {}
-    spot_details_map = state.get("spot_details") or {}
-    date_range = state.get("date_range") or _default_date_range()
-    user_location = state.get("user_location")
-    latest_user_message = state.get("latest_user_message", "")
-    long_term_context = state.get("long_term_context", [])
-
-    # 可能なら候補の軽量表現も作る（id/official_name 等）
-    compact_spots = []
-    candidate_ids = state.get("candidate_spots") or []
-    # candidate_ids は ID 群のみなので、details から official_name を補う
-    for sid in candidate_ids:
-        details = spot_details_map.get(sid, {})
-        compact_spots.append({
-            "id": sid,
-            "official_name": details.get("official_name"),
-        })
-
-    context_payload = {
-        "spots": compact_spots,
-        "materials": materials,
-        "spot_details": spot_details_map,
-        "long_term_context": long_term_context,
-        "user_query": latest_user_message,
-        "date_range": date_range,
-        "user_location": user_location,
-        "today": _today_str(),
-    }
-
-    try:
-        text = _safe_call_generate_nudge(llm, context_payload, lang=lang)
-        state["final_response"] = text
-    except Exception as e:
-        try:
-            err_text = llm.generate_error_message(
-                context={"phase": "nudge_generation", "error": str(e)},
-                lang=lang,
-            )
-        except Exception:
-            err_text = "最終文面の生成に失敗しました。条件を少し変えてもう一度試しましょう。"
-        state["final_response"] = err_text
-
-    state["app_status"] = "information"
     return state
