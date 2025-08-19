@@ -145,30 +145,33 @@ def _build_short_term(history: List[Dict[str, Any]], turns: int = 5) -> List[Dic
 # 公開: AgentState のロード
 # ------------------------------------------------------------
 
-def load_agent_state(session_id: str) -> Dict[str, Any]:
+def load_agent_state(session_id: str) -> AgentState: # <- 返り値の型アノテーションを AgentState に変更
     """
     DB の Session / ConversationHistory から AgentState を構築して返す。
-    - app_status / active_plan_id / lang をセッションから復元
-    - 直近の履歴（短期記憶素材）を付与
     """
     with SessionLocal() as db:
-        # セッション本体のロード（なければ作成）
         sess = _get_or_create_session(db, session_id)
+        full_recent = get_recent_history(session_id, limit=10) # List[Dict] を取得
 
-        # 直近10メッセージ（=5往復）を取得
-        full_recent = get_recent_history(session_id, limit=10)
-        short_term = _build_short_term(full_recent, turns=5)
+        # DictのリストをChatItemのリストに変換
+        chat_history_items = [
+            ChatItem(
+                role=item.get("role"),
+                content=item.get("text"), # DBの列名'text'を'content'にマッピング
+                created_at=datetime.fromisoformat(item["ts"]) if item.get("ts") else None
+            )
+            for item in full_recent
+        ]
 
-        state: Dict[str, Any] = {
-            "session_id": session_id,
-            "app_status": getattr(sess, "app_status", None),
-            "active_plan_id": getattr(sess, "active_plan_id", None),
-            "lang": getattr(sess, "lang", "ja"),
-            # Graph/N LU 側が参照しやすいキー
-            "chat_history": full_recent,     # 全メッセージ（直近10）
-            "short_term_history": short_term # 直近5往復のみ
-        }
-        return state
+        # 最終的にAgentStateクラスのインスタンスを生成して返す
+        return AgentState(
+            session_id=session_id,
+            app_status=getattr(sess, "app_status", "idle"),
+            active_plan_id=getattr(sess, "active_plan_id", None),
+            lang=getattr(sess, "lang", "ja"),
+            chat_history=chat_history_items, # 変換後のリストをセット
+            # その他のフィールドはデフォルト値で初期化される
+        )
 
 
 def _get_or_create_session(db: Session, session_id: str):

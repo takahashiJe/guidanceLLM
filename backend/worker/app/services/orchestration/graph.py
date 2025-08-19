@@ -10,7 +10,7 @@ from typing import Any, Dict
 
 from langgraph.graph import StateGraph, END
 
-from .state import AgentState, load_state
+from .state import AgentState, load_agent_state
 from .router import route_next
 from .nodes.information_nodes import (
     information_entry,
@@ -108,7 +108,7 @@ def run_orchestration(session_id: str) -> Dict[str, Any]:
       2) LangGraph を 1ターン実行
       3) 最終応答やプレビューGeoJSON等を返却
     """
-    state = load_state(session_id)
+    state = load_agent_state(session_id)
     result_state: AgentState = graph_app.invoke(state)
     return {
         "session_id": result_state.session_id,
