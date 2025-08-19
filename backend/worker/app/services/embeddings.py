@@ -621,3 +621,5 @@ class Embeddings:
             result[idx] = vec
 
         return result
+
+EmbeddingsService = EmbeddingService
