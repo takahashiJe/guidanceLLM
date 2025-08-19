@@ -59,62 +59,47 @@ def reorder_user_plan_stops(
 
 
 def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
-    """
-    指定された計画の現在の状態（訪問地リスト、ルート情報など）を要約して返す。
-    ハイブリッド経路（車+徒歩+AP）をレグごとに組み立てる。
-    """
     plan_summary = crud_plan.summarize_plan_stops(db, plan_id=plan_id) or {}
-    # デフォルト値
     plan_summary.setdefault("route_geojson", None)
     plan_summary.setdefault("total_duration_minutes", 0)
+    plan_summary.setdefault("legs", [])  # ← 追加（形を安定させる）
 
     stops = plan_summary.get("stops") or []
     if len(stops) < 2:
         return plan_summary
 
-    # 使うのは spot_id だけに依存させる（座標や種別はここで引く）
     spot_ids: List[int] = [int(s["spot_id"]) for s in stops if "spot_id" in s]
 
-    # Spot 情報をまとめて取得
     rows = db.execute(
-        select(
-            Spot.id, Spot.latitude, Spot.longitude, Spot.spot_type, Spot.tags
-        ).where(Spot.id.in_(spot_ids))
+        select(Spot.id, Spot.latitude, Spot.longitude, Spot.spot_type, Spot.tags)
+        .where(Spot.id.in_(spot_ids))
     ).all()
 
-    meta = {
-        int(r.id): {
-            "lat": float(r.latitude),
-            "lon": float(r.longitude),
-            "type": (r.spot_type or ""),
-            "tags": r.tags,
-        }
-        for r in rows
-    }
+    meta = {int(r.id): {"lat": float(r.latitude), "lon": float(r.longitude),
+                        "type": (r.spot_type or ""), "tags": r.tags} for r in rows}
 
-    # 並び順にウェイポイントと種別/タグを整列
     waypoints: List[Tuple[float, float]] = []
     kinds_tags: List[Tuple[str, Any]] = []
+    used_spot_ids: List[int] = []   # ← 追加：実際に採用したspot_idを追跡
     for sid in spot_ids:
         m = meta.get(sid)
         if not m:
-            # 片方でも欠けるとレグが作れないので素通り
             continue
         waypoints.append((m["lat"], m["lon"]))
         kinds_tags.append((m["type"], m["tags"]))
+        used_spot_ids.append(sid)  # ← 追加
 
     if len(waypoints) < 2:
         return plan_summary
 
     rs = RoutingService()
     features: List[Dict[str, Any]] = []
+    legs: List[Dict[str, Any]] = []  # ← 追加：レグを貯める
     total_min: float = 0.0
 
-    legs: List[Dict[str, Any]] = []
-    # 隣接ペアごとにハイブリッドルートを取得して積み上げ
     for i in range(len(waypoints) - 1):
         origin = waypoints[i]
-        dest = waypoints[i + 1]
+        dest   = waypoints[i + 1]
         dest_type, dest_tags = kinds_tags[i + 1]
 
         leg = rs.calculate_hybrid_leg(
@@ -123,40 +108,42 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
             dest=dest,
             dest_spot_type=dest_type,
             dest_tags=dest_tags,
-            ap_max_km=20.0,   # 必要なら設定値に
+            ap_max_km=20.0,
         )
-        legs.append(leg)  # ここでlegsに追加
+
+        # まず legs に格納（GeoJSONの有無に関係なくカウントさせる）
+        legs.append({
+            "from_spot_id": used_spot_ids[i],
+            "to_spot_id":   used_spot_ids[i + 1],
+            "distance_meters": leg.get("distance_m") or leg.get("distance_meters"),
+            "duration_minutes": int(round(float(leg.get("duration_min", 0.0)))),
+            "mode": leg.get("mode", "hybrid"),
+        })
 
         total_min += float(leg.get("duration_min", 0.0))
 
+        # 既存のGeoJSON統合ロジックはそのまま
         gj = leg.get("geojson")
         if not gj:
-            # このレグだけスキップ（全体は返す）
             continue
-
-        # Feature / FeatureCollection を吸収して 1本の FC にする
         t = gj.get("type")
         if t == "Feature":
             features.append(gj)
         elif t == "FeatureCollection":
             features.extend(gj.get("features") or [])
         else:
-            # geometry だけなら Feature に包む
             features.append({"type": "Feature", "properties": {}, "geometry": gj})
 
+    plan_summary["legs"] = legs  # ← 追加：まとめて設定
+
     if features:
-        plan_summary["route_geojson"] = {
-            "type": "FeatureCollection",
-            "features": features,
-        }
+        plan_summary["route_geojson"] = {"type": "FeatureCollection", "features": features}
         plan_summary["total_duration_minutes"] = int(round(total_min))
     else:
         plan_summary["route_geojson"] = None
         plan_summary["total_duration_minutes"] = 0
 
-    plan_summary["legs"] = legs
     return plan_summary
-
 
 # --- API for Information Service ---
 
