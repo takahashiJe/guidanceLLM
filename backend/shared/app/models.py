@@ -253,7 +253,21 @@ class AccessPoint(Base):
 
     def __repr__(self) -> str:
         return f"<AccessPoint id={self.id} name={self.name}>"
+    
+    # 追加1: PostGIS の geometry(Point,4326) 列
+    #   ・ST_* 関数や KNN での最近傍探索を可能にする
+    #   ・ALEMBIC で後付けできるよう、null 許容でまず追加し、移行時に埋める運用でも良い
+    geom = Column(Geometry(geometry_type="POINT", srid=4326), nullable=True)
 
+    __table_args__ = (
+        # 追加2: (latitude, longitude) の一意制約
+        #   ・ローダ側の upsert が name ではなく lat/lon をキーにするための裏付け
+        UniqueConstraint("latitude", "longitude", name="uq_access_points_lat_lon"),
+
+        # 追加3: PostGIS GiST インデックス（geom 用）
+        #   ・KNN: ORDER BY geom <-> ST_SetSRID(ST_MakePoint(...),4326) を高速化
+        Index("ix_access_points_geom", "geom", postgresql_using="gist"),
+    )
 
 # ------------------------------------------------------------
 # 計画（Plan）/ 立寄り順序（Stop）
