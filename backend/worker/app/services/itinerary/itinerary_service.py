@@ -1,10 +1,11 @@
 # /app/backend/worker/app/services/itinerary/itinerary_service.py
 
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from worker.app.services.itinerary import crud_plan
 from worker.app.services.routing.routing_service import RoutingService
@@ -12,6 +13,8 @@ from worker.app.services.routing.routing_service import RoutingService
 from worker.app.services.routing.client import OSRMNoRouteError
 from worker.app.services.routing.access_points_repo import find_nearest_access_point
 from worker.app.services.routing.drive_rules import is_car_direct_accessible
+
+from shared.app.models import Spot
 
 # --- Public API for Orchestration Layer ---
 
@@ -58,116 +61,98 @@ def reorder_user_plan_stops(
 def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
     """
     指定された計画の現在の状態（訪問地リスト、ルート情報など）を要約して返す。
-    ここで“ハイブリッド経路（car＋foot）”をレグ単位で構築する。
+    ハイブリッド経路（車+徒歩+AP）をレグごとに組み立てる。
     """
-    # --- Stop一覧（順序付き）を取得（List[Stop]）
-    stops = crud_plan.summarize_plan_stops(db, plan_id=plan_id)
+    plan_summary = crud_plan.summarize_plan_stops(db, plan_id=plan_id) or {}
+    # デフォルト値
+    plan_summary.setdefault("route_geojson", None)
+    plan_summary.setdefault("total_duration_minutes", 0)
 
-    # --- 出力用の stops 配列（UI/LLM向けの軽量辞書）を組み立て
-    stops_out: List[Dict[str, Any]] = []
-    for st in stops:
-        sp = getattr(st, "spot", None)
-        if not sp:
-            # 万一リレーションが無い/参照切れならスキップ
-            continue
+    stops = plan_summary.get("stops") or []
+    if len(stops) < 2:
+        return plan_summary
 
-        # position or order_index のどちらでも拾えるように
-        idx = getattr(st, "position", None)
-        if idx is None:
-            idx = getattr(st, "order_index", None)
+    # 使うのは spot_id だけに依存させる（座標や種別はここで引く）
+    spot_ids: List[int] = [int(s["spot_id"]) for s in stops if "spot_id" in s]
 
-        stops_out.append(
-            {
-                "stop_id": st.id,
-                "spot_id": sp.id,
-                "index": idx,
-                "official_name": getattr(sp, "official_name", None),
-                "spot_type": getattr(sp, "spot_type", None),
-                "tags": getattr(sp, "tags", None),
-                "latitude": float(getattr(sp, "latitude", 0.0)),
-                "longitude": float(getattr(sp, "longitude", 0.0)),
-            }
-        )
+    # Spot 情報をまとめて取得
+    rows = db.execute(
+        select(
+            Spot.id, Spot.latitude, Spot.longitude, Spot.spot_type, Spot.tags
+        ).where(Spot.id.in_(spot_ids))
+    ).all()
 
-    # --- 訪問地が2未満ならルート無しで返す
-    if len(stops_out) < 2:
-        return {
-            "plan_id": plan_id,
-            "stops": stops_out,
-            "route_geojson": None,
-            "total_duration_minutes": 0.0,
-            "total_distance_km": 0.0,
-            "legs": [],
+    meta = {
+        int(r.id): {
+            "lat": float(r.latitude),
+            "lon": float(r.longitude),
+            "type": (r.spot_type or ""),
+            "tags": r.tags,
         }
+        for r in rows
+    }
+
+    # 並び順にウェイポイントと種別/タグを整列
+    waypoints: List[Tuple[float, float]] = []
+    kinds_tags: List[Tuple[str, Any]] = []
+    for sid in spot_ids:
+        m = meta.get(sid)
+        if not m:
+            # 片方でも欠けるとレグが作れないので素通り
+            continue
+        waypoints.append((m["lat"], m["lon"]))
+        kinds_tags.append((m["type"], m["tags"]))
+
+    if len(waypoints) < 2:
+        return plan_summary
 
     rs = RoutingService()
-    legs: List[Dict[str, Any]] = []
-    total_km = 0.0
-    total_min = 0.0
+    features: List[Dict[str, Any]] = []
+    total_min: float = 0.0
 
-    # --- 連続する Stop 間を 1 レグとして、ハイブリッドで構築
-    for i in range(len(stops_out) - 1):
-        a = stops_out[i]
-        b = stops_out[i + 1]
+    # 隣接ペアごとにハイブリッドルートを取得して積み上げ
+    for i in range(len(waypoints) - 1):
+        origin = waypoints[i]
+        dest = waypoints[i + 1]
+        dest_type, dest_tags = kinds_tags[i + 1]
 
-        origin = (a["latitude"], a["longitude"])
-        dest = (b["latitude"], b["longitude"])
-        dest_spot_type = b.get("spot_type")
-        dest_tags = b.get("tags")
+        leg = rs.calculate_hybrid_leg(
+            db,
+            origin=origin,
+            dest=dest,
+            dest_spot_type=dest_type,
+            dest_tags=dest_tags,
+            ap_max_km=20.0,   # 必要なら設定値に
+        )
 
-        # 目的地が車で直行可能か？
-        car_ok = is_car_direct_accessible(dest_spot_type, dest_tags)
+        total_min += float(leg.get("duration_min", 0.0))
 
-        try:
-            if car_ok:
-                # 直行可 → car 一本（ダメなら foot フォールバック）
-                leg = rs.calculate_full_itinerary_route([origin, dest], profile="car")
-            else:
-                # 直行不可 → 最近傍 AP（駐車場/登山口）を探索
-                ap = find_nearest_access_point(db, lat=dest[0], lon=dest[1], max_km=20.0)
-                if ap:
-                    _, ap_name, ap_type, ap_lat, ap_lon = ap
-                    ap_pt = (ap_lat, ap_lon)
+        gj = leg.get("geojson")
+        if not gj:
+            # このレグだけスキップ（全体は返す）
+            continue
 
-                    car_seg = rs.calculate_full_itinerary_route([origin, ap_pt], profile="car")
-                    foot_seg = rs.calculate_full_itinerary_route([ap_pt, dest], profile="foot")
+        # Feature / FeatureCollection を吸収して 1本の FC にする
+        t = gj.get("type")
+        if t == "Feature":
+            features.append(gj)
+        elif t == "FeatureCollection":
+            features.extend(gj.get("features") or [])
+        else:
+            # geometry だけなら Feature に包む
+            features.append({"type": "Feature", "properties": {}, "geometry": gj})
 
-                    merged = _merge_feature_collections([car_seg["geojson"], foot_seg["geojson"]])
-                    leg = {
-                        "geojson": merged,
-                        "distance_km": float(car_seg["distance_km"]) + float(foot_seg["distance_km"]),
-                        "duration_min": float(car_seg["duration_min"]) + float(foot_seg["duration_min"]),
-                        "used_ap": {
-                            "name": ap_name,
-                            "type": ap_type,
-                            "latitude": ap_lat,
-                            "longitude": ap_lon,
-                        },
-                    }
-                else:
-                    # APが見つからない → car 試行（ダメなら foot）
-                    leg = rs.calculate_full_itinerary_route([origin, dest], profile="car")
+    if features:
+        plan_summary["route_geojson"] = {
+            "type": "FeatureCollection",
+            "features": features,
+        }
+        plan_summary["total_duration_minutes"] = int(round(total_min))
+    else:
+        plan_summary["route_geojson"] = None
+        plan_summary["total_duration_minutes"] = 0
 
-        except OSRMNoRouteError:
-            # car が失敗した等 → foot で最後のフォールバック
-            leg = rs.calculate_full_itinerary_route([origin, dest], profile="foot")
-
-        # legs 集計
-        legs.append(leg)
-        total_km += float(leg["distance_km"])
-        total_min += float(leg["duration_min"])
-
-    # --- ルート（GeoJSON）全結合
-    route_geojson = _merge_feature_collections([leg["geojson"] for leg in legs])
-
-    return {
-        "plan_id": plan_id,
-        "stops": stops_out,
-        "route_geojson": route_geojson,
-        "total_duration_minutes": total_min,
-        "total_distance_km": total_km,
-        "legs": legs,  # used_ap が入るのでデバッグ/LLM提示に便利
-    }
+    return plan_summary
 
 
 # --- API for Information Service ---

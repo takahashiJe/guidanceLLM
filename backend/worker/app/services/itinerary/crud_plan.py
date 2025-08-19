@@ -6,7 +6,7 @@
 - レースコンディションに強い実装（position の再採番・ギャップ解消）
 """
 
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from datetime import date
 from sqlalchemy import select, func, update, delete, text, and_
 from sqlalchemy.orm import Session
@@ -25,18 +25,20 @@ def _get_db() -> Session:
 
 def _normalize_positions(db: Session, plan_id: int) -> None:
     """
-    position を 1..N に詰め直す（隙間・重複排除）。
+    order_index を 1..N に詰め直す（隙間・重複排除）。
     """
     stops = (
         db.execute(
-            select(Stop).where(Stop.plan_id == plan_id).order_by(Stop.position.asc(), Stop.id.asc())
+            select(Stop)
+            .where(Stop.plan_id == plan_id)
+            .order_by(Stop.order_index.asc(), Stop.id.asc())
         )
         .scalars()
         .all()
     )
     for i, st in enumerate(stops, start=1):
-        if st.position != i:
-            st.position = i
+        if st.order_index != i:
+            st.order_index = i
     db.flush()
 
 
@@ -79,7 +81,6 @@ def add_spot_to_plan(db: Session, *, plan_id: int, spot_id: int, position: Optio
     if position is None:
         new_index = next_idx
     else:
-        # シフト（position 以上を +1）→ order_index に変更
         db.execute(
             update(Stop)
             .where(Stop.plan_id == plan_id, Stop.order_index >= position)
@@ -89,6 +90,7 @@ def add_spot_to_plan(db: Session, *, plan_id: int, spot_id: int, position: Optio
 
     st = Stop(plan_id=plan_id, spot_id=spot_id, order_index=new_index)
     db.add(st)
+    db.flush()   # ← 追加
     return st
 
 
