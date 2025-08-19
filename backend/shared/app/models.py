@@ -128,6 +128,8 @@ class Session(Base):
 
     def __repr__(self) -> str:
         return f"<Session id={self.id} user_id={self.user_id} app_status={self.app_status}>"
+    
+    # plans = relationship("Plan", back_populates="session")
 
 
 class ConversationHistory(Base):
@@ -288,6 +290,13 @@ class Plan(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    
+    session_id = Column(
+        String(64),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
     start_date = Column(Date, nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
