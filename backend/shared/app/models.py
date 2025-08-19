@@ -36,6 +36,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
+from geoalchemy2 import Geometry 
 
 # ------------------------------------------------------------
 # Base
@@ -180,12 +181,12 @@ class ConversationEmbedding(Base):
         embedding = Column(Vector(EMBEDDING_DIM), nullable=False)
         __table_args__ = (
             Index("ix_convemb_session_ts", "session_id", "ts"),
-            # pgvector 専用のインデックス（IVFFlat）。初回は Alembic 側で CREATE INDEX ... USING ivfflat を推奨
+            # pgvector 専用のインデックス（IVFFlat）。初回は Alembic 側で CREATE INDEX USING ivfflat を推奨
             # ここでは btree 以外の作成は Alembic/SQL 側で行うことを前提とし、モデル側では通常 Index のみ。
         )
     else:
         # フォールバック（JSON の float 配列）
-        embedding = Column(JSON, nullable=False)  # 例: [0.01, -0.23, ...]
+        embedding = Column(JSON, nullable=False)  # 例: [0.01, -0.23,]
         __table_args__ = (
             Index("ix_convemb_session_ts", "session_id", "ts"),
         )
@@ -291,7 +292,7 @@ class Stop(Base):
     plan_id = Column(Integer, ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, index=True)
     spot_id = Column(Integer, ForeignKey("spots.id", ondelete="CASCADE"), nullable=False, index=True)
 
-    # 訪問順序（0,1,2,...）
+    # 訪問順序（0,1,2,）
     order_index = Column(Integer, nullable=False, index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
