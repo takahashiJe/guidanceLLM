@@ -265,7 +265,7 @@ class AccessPoint(Base):
         UniqueConstraint("latitude", "longitude", name="uq_access_points_lat_lon"),
 
         # 追加3: PostGIS GiST インデックス（geom 用）
-        #   ・KNN: ORDER BY geom <-> ST_SetSRID(ST_MakePoint(...),4326) を高速化
+        #   ・KNN: ORDER BY geom <-> ST_SetSRID(ST_MakePoint(),4326) を高速化
         Index("ix_access_points_geom", "geom", postgresql_using="gist"),
     )
 
