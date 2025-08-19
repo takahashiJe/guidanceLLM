@@ -115,9 +115,10 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
         legs.append({
             "from_spot_id": used_spot_ids[i],
             "to_spot_id":   used_spot_ids[i + 1],
-            "distance_meters": leg.get("distance_m") or leg.get("distance_meters"),
+            "distance_km": leg.get("distance_m") or leg.get("distance_meters") / 1000.0,
             "duration_minutes": int(round(float(leg.get("duration_min", 0.0)))),
             "mode": leg.get("mode", "hybrid"),
+            "used_ap": leg.get("used_ap")  # ← ここで追加
         })
 
         total_min += float(leg.get("duration_min", 0.0))
