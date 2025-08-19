@@ -8,6 +8,7 @@
 
 from typing import List, Optional, Any, Dict
 from datetime import date
+import pprint
 from sqlalchemy import select, func, update, delete, text, and_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -145,7 +146,7 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
         "features": all_features,
     }
     summary["total_duration_minutes"] = int(round(total_min))
-
+    pprint.pprint(summary)
     return summary
 
 
@@ -253,3 +254,7 @@ def reorder_stops(db: Session, *, plan_id: int, ordered_stop_ids: list[int]) -> 
             .where(Stop.id == sid, Stop.plan_id == plan_id)
             .values(order_index=i)
         )
+
+def add_spot_to_plan(db: Session, *, plan_id: int, spot_id: int, position: Optional[int] = None) -> Stop:
+    """Backward-compatible wrapper for tests."""
+    return add_spot(db, plan_id=plan_id, spot_id=spot_id, position=position)
