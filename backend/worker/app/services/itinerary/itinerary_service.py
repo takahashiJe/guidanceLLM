@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from worker.app.services.itinerary import crud_plan
-from worker.app.services.routing.routing_service import calculate_full_itinerary_route
+from worker.app.services.routing.routing_service import RoutingService
 
 # --- Public API for Orchestration Layer ---
 
@@ -22,7 +22,6 @@ def create_plan_for_user(
     )
     # 作成直後だが、将来的な拡張性のためサマリー関数経由で返す
     return summarize_plan(db, plan_id=new_plan.id)
-
 
 def add_spot_to_user_plan(
     db: Session, *, plan_id: int, spot_id: int, position: Optional[int] = None
@@ -59,6 +58,7 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
     """
     # 1. DBから訪問地の基本情報を取得
     plan_summary = crud_plan.summarize_plan_stops(db, plan_id=plan_id)
+    routingService = RoutingService()
 
     if not plan_summary or not plan_summary.get("stops"):
         plan_summary["route_geojson"] = None
@@ -70,7 +70,7 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
         try:
             # routing_serviceはspot_idのリストを要求する
             spot_ids = [stop["spot_id"] for stop in plan_summary["stops"]]
-            route_info = calculate_full_itinerary_route(db, spot_ids)
+            route_info = routingService.calculate_full_itinerary_route(db, spot_ids)
             plan_summary["route_geojson"] = route_info["geojson"]
             plan_summary["total_duration_minutes"] = route_info["total_duration_minutes"]
         except Exception as e:

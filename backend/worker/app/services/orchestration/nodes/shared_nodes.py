@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from worker.app.services.llm.llm_service import LLMInferenceService
-from ..state import AgentState, save_message
+from worker.app.services.orchestration.state import AgentState, save_message
 
 
 def safe_set_final_response(state: AgentState, text: str) -> None:
