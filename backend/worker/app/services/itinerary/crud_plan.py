@@ -63,35 +63,90 @@ def create_new_plan(db: Session, *, user_id: int, session_id: str, start_date: d
     return new_plan
 
 
-def add_spot_to_plan(db: Session, *, plan_id: int, spot_id: int, position: Optional[int] = None) -> Stop:
-    plan = db.get(Plan, plan_id)
-    if not plan:
-        raise ValueError("plan not found")
+def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
+    """
+    指定された計画の現在の状態（訪問地リスト、レグ、合成GeoJSONなど）を要約して返す。
+    - stops: Stop行の要約（spot情報を含む）
+    - legs:  隣接スポット間のハイブリッド区間（AP経由情報などを含む）
+    - route_geojson: 全legsのFeatureを合成したFeatureCollection
+    - total_duration_minutes: legsの合計所要時間（分）
+    """
+    # 1) 並び順のStop取得（ORMオブジェクトの配列）
+    stops_orm = crud_plan.summarize_plan_stops(db, plan_id=plan_id)
 
-    spot = db.get(Spot, spot_id)
-    if not spot:
-        raise ValueError("spot not found")
-
-    # 末尾インデックスを取得（position → order_index に変更）
-    max_idx = db.execute(
-        select(func.coalesce(func.max(Stop.order_index), 0)).where(Stop.plan_id == plan_id)
-    ).scalar_one()
-    next_idx = (max_idx or 0) + 1
-
-    if position is None:
-        new_index = next_idx
-    else:
-        db.execute(
-            update(Stop)
-            .where(Stop.plan_id == plan_id, Stop.order_index >= position)
-            .values(order_index=Stop.order_index + 1)
+    # 2) 正規化したstops（フロント返却用のdict配列）を作る
+    stops: List[Dict[str, Any]] = []
+    for st in stops_orm:
+        # Spot情報を取得（リレーションが無ければ direct get でOK）
+        sp: Optional[Spot] = db.get(Spot, st.spot_id)
+        stops.append(
+            {
+                "stop_id": st.id,
+                "spot_id": st.spot_id,
+                "order_index": getattr(st, "order_index", getattr(st, "position", None)),
+                # spotサマリ（存在すれば）
+                "official_name": getattr(sp, "official_name", None),
+                "spot_type": getattr(sp, "spot_type", None),
+                "latitude": getattr(sp, "latitude", None),
+                "longitude": getattr(sp, "longitude", None),
+                "tags": getattr(sp, "tags", None),
+            }
         )
-        new_index = position
 
-    st = Stop(plan_id=plan_id, spot_id=spot_id, order_index=new_index)
-    db.add(st)
-    db.flush()   # ← 追加
-    return st
+    # 空や単点ならそのまま返す
+    summary: Dict[str, Any] = {
+        "plan_id": plan_id,
+        "stops": stops,
+        "route_geojson": None,
+        "legs": [],
+        "total_duration_minutes": 0,
+    }
+    if len(stops) < 2:
+        return summary
+
+    # 3) 隣接ペアごとにハイブリッドレグを計算して合成
+    rs = RoutingService()
+    legs: List[Dict[str, Any]] = []
+    all_features: List[Dict[str, Any]] = []
+    total_min = 0.0
+
+    for i in range(len(stops) - 1):
+        a = stops[i]
+        b = stops[i + 1]
+
+        origin = (a["latitude"], a["longitude"])
+        dest = (b["latitude"], b["longitude"])
+        dest_spot_type = b.get("spot_type")
+        dest_tags = b.get("tags")
+
+        # AP上限距離は必要に応じて調整（テストの安定性重視で広めに）
+        leg = rs.calculate_hybrid_leg(
+            db,
+            origin=origin,
+            dest=dest,
+            dest_spot_type=dest_spot_type,
+            dest_tags=dest_tags,
+            ap_max_km=20.0,
+        )
+        # leg の標準化（key名揺れ対策）
+        duration_min = leg.get("duration_min") or leg.get("duration_minutes") or 0
+        total_min += float(duration_min) if duration_min is not None else 0.0
+
+        gj = leg.get("geojson")
+        if gj and isinstance(gj, dict) and gj.get("type") == "FeatureCollection":
+            all_features.extend(gj.get("features", []))
+
+        legs.append(leg)
+
+    # 4) 合成GeoJSONと合計時間を格納
+    summary["legs"] = legs
+    summary["route_geojson"] = {
+        "type": "FeatureCollection",
+        "features": all_features,
+    }
+    summary["total_duration_minutes"] = int(round(total_min))
+
+    return summary
 
 
 def remove_spot_from_plan(db: Session, *, plan_id: int, stop_id: int) -> None:
