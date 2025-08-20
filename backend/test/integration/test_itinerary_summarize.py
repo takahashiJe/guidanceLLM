@@ -23,6 +23,10 @@ def test_itinerary_summarize_hybrid_path(monkeypatch, db_session: Session, osrm_
     # --- 目的地の座標を AP 近傍に上書き（竜ヶ原湿原） ---
     dest_lat, dest_lon = 39.1303513, 140.0660516
     db_session.execute(
+        text("DELETE FROM spots WHERE latitude = :lat AND longitude = :lon AND id != :sid"),
+        {"lat": dest_lat, "lon": dest_lon, "sid": spot_b},
+    )
+    db_session.execute(
         text("UPDATE spots SET latitude = :lat, longitude = :lon WHERE id = :sid"),
         {"lat": dest_lat, "lon": dest_lon, "sid": spot_b},
     )
