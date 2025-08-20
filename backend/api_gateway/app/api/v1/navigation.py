@@ -60,22 +60,22 @@ def haversine_m(a: Tuple[float,float], b: Tuple[float,float]) -> float:
 
 def _project_local_m(lat0: float, lon0: float, lat: float, lon: float) -> Tuple[float,float]:
     # 近傍での等角円筒近似（ローカル投影）：WGS84度→メートル
-    x = math.radians(lon - lon0) * EAR_radius_m * math.cos(math.radians(lat0))
-    y = math.radians(lat - lat0) * EAR_radius_m
+    x = math.radians(lon - lon0) * EARTH_RADIUS_M * math.cos(math.radians(lat0))
+    y = math.radians(lat - lat0) * EARTH_RADIUS_M
     return x, y
 
 def point_segment_distance_m(lat: float, lon: float, a: Tuple[float,float], b: Tuple[float,float]) -> float:
     # 線分ABに対する点Pの最短距離（ローカル投影でユークリッド計算）
-    lat0 = (a[0]  b[0]) / 2.0
+    lat0 = (a[0] + b[0]) / 2.0
     x1, y1 = _project_local_m(lat0, lon, a[0], a[1])
     x2, y2 = _project_local_m(lat0, lon, b[0], b[1])
     xp, yp = _project_local_m(lat0, lon, lat, lon)
     dx = x2 - x1; dy = y2 - y1
     if dx == 0 and dy == 0:
         return math.hypot(xp - x1, yp - y1)
-    t = ((xp - x1)*dx  (yp - y1)*dy) / (dx*dx  dy*dy)
+    t = ((xp - x1)*dx + (yp - y1)*dy) / (dx*dx + dy*dy)
     t = max(0.0, min(1.0, t))
-    xn = x1  t*dx; yn = y1  t*dy
+    xn = x1 + t*dx; yn = y1 + t*dy
     return math.hypot(xp - xn, yp - yn)
 
 def distance_to_polyline_m(point: Tuple[float,float], route_geojson: Optional[dict]) -> Optional[float]:
@@ -223,7 +223,12 @@ def location_update(
             spot_name = next_stop.spot.official_name if (next_stop and next_stop.spot) else "次の目的地"
             guide_text = f"{spot_name} が近づいてきました。"
             audio_b64 = tts_base64(guide_text, voice="ja-JP")
-            actions["tts"].append({ "stop_id": e.get("stop_id"), "voice": "ja-JP", "mime": "audio/wav", "audio_base64": audio_b64 })
+            actions["tts"].append({
+                "stop_id": e.get("stop_id"),
+                "voice": "ja-JP",
+                "mime": "audio/wav",
+                "audio_base64": audio_b64
+            })
 
     db.commit()
 

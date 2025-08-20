@@ -2,7 +2,6 @@
 # API 入出力で使う Pydantic スキーマ（Gateway / Worker 共有）
 from __future__ import annotations
 from datetime import date, datetime
-from typing import Optional, List
 from pydantic import BaseModel, Field, validator
 from typing import List, Literal, Optional
 
@@ -198,7 +197,7 @@ class ConversationEmbeddingRead(BaseModel):
     class Config:
         from_attributes = True
 
-========== Navigation v2 I/O (Step2) ==========
+# ========== Navigation v2 I/O (Step2) ==========
 # [ADDED] 新しい位置更新 I/O とサマリー応答を追加（既存の NavigationLocationRequest は互換で残す）
 
 class RerouteAction(BaseModel):
