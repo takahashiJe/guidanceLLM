@@ -19,10 +19,12 @@ from __future__ import annotations
 import base64
 import traceback
 from typing import Any, Dict, Optional
+from pydantic import ValidationError
 
 from shared.app.celery_app import celery_app
 from shared.app import models, schemas
 from shared.app.database import SessionLocal
+
 
 # タスク名の定数は shared 側のものを唯一の参照元とする
 from shared.app.tasks import (
@@ -32,18 +34,21 @@ from shared.app.tasks import (
     TASK_PREGENERATE_GUIDES,
     TASK_STT_TRANSCRIBE,
     TASK_TTS_SYNTHESIZE,
+    TASK_NAV_REROUTE,
+    RerouteTaskPayload
 )
 
 # 各サービス（Worker 側）
 from worker.app.services.voice.voice_service import VoiceService
 from worker.app.services.orchestration import state as orch_state
 from worker.app.services.orchestration.graph import build_graph  # LangGraph 構築
-from worker.app.services.navigation.navigation_service import NavigationService
+from worker.app.services.navigation.navigation_service import NavigationService, reroute 
 
 # 必要に応じて利用（ナッジ・距離/時間などは内部で他サービスへ連携）
 from worker.app.services.information.information_service import InformationService
 # from worker.app.services.itinerary.itinerary_service import ItineraryService
 from worker.app.services.routing.routing_service import RoutingService
+
 
 
 # ------------------------------------------------------------
@@ -317,3 +322,34 @@ def tts_synthesize(self, payload: dict) -> dict:
         sample_rate=meta.get("sample_rate", 22050),
         lang=req.lang,
     ).model_dump()
+
+@celery_app.task(name=TASK_NAV_REROUTE, acks_late=True, max_retries=3, retry_backoff=True)
+def navigation_reroute(payload: dict) -> dict:
+    """
+    [ADDED] 現在地→次の未到達 Stop へのリルートを計算し、Plan.route_geojson を楽観ロックで更新する。
+    - payload は shared 側の RerouteTaskPayload でバリデーション
+    - エラーは retry（3回、指数バックオフ）
+    - 成功時: {"updated": bool, "new_version": int|None, ...}
+    """
+    try:
+        data = RerouteTaskPayload.model_validate(payload)
+    except ValidationError as e:
+        # 不正payloadは再試行せず終了（呼び出し元で整合性を担保）
+        return {"updated": False, "reason": "invalid_payload", "detail": e.errors()}
+
+    db = SessionLocal()
+    try:
+        result = reroute(
+            db,
+            session_id=data.session_id,
+            origin_lat=data.origin_lat,
+            origin_lon=data.origin_lon,
+            target_stop_id=data.target_stop_id,
+            base_route_version=data.base_route_version,
+        )
+        return result
+    except Exception as exc:
+        # 一時的エラーはリトライ
+        raise navigation_reroute.retry(exc=exc)
+    finally:
+        db.close()

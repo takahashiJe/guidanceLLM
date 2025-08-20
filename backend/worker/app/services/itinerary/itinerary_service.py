@@ -155,6 +155,71 @@ def summarize_plan(db: Session, *, plan_id: int) -> Dict[str, Any]:
 CONGESTION_THRESHOLDS = {"low_max": 10, "mid_max": 30}
 MV_NAME = "congestion_by_date_spot"  # マテリアライズドビュー名
 
+def compute_hybrid_polyline_from_origin(
+    db: OrmSession,
+    *,
+    origin: Tuple[float, float],
+    stops: List[Stop],
+) -> Tuple[Dict[str, Any], float, float]:
+    """
+    [ADDED] 任意起点 origin から stops を順に辿るハイブリッド経路（car+foot）を算出。
+      - 各 leg: P(i) -> P(i+1)
+      - 車で到達できない場合は AccessPoint を自動選定して car→AP, AP→dest を連結
+    返り値: (FeatureCollection, total_distance_m, total_duration_s)
+    """
+    fc: Dict[str, Any] = {"type": "FeatureCollection", "features": [], "properties": {}}
+    total_dist_m: float = 0.0
+    total_dur_s: float = 0.0
+
+    routing = RoutingService()  # [KEPT] 既存のOSRMクライアント／タイムアウト等の設定を内部で持つ前提
+    ap_repo = AccessPointsRepository(db)
+
+    # P0 は origin、P1..Pn は stops のスポット座標
+    prev_lat, prev_lon = origin
+
+    for idx, stop in enumerate(stops):
+        latlon = _as_point(stop)
+        if not latlon or latlon[0] is None or latlon[1] is None:
+            # Spot に座標がない場合はスキップ（未知データ）
+            continue
+        dest_lat, dest_lon = latlon
+
+        if can_drive_to_spot(stop):
+            # [KEPT] 既存ルール：車で直接行けるスポット
+            feat, dist_m, dur_s = routing.route_car((prev_lat, prev_lon), (dest_lat, dest_lon))
+            _append_feature(fc, feat)
+            total_dist_m += dist_m or 0.0
+            total_dur_s += dur_s or 0.0
+        else:
+            # [KEPT] 車では到達不可：最寄り AP を探索して car→AP, AP→dest(foot) で分割
+            ap = ap_repo.find_nearest_access_point_for_spot(stop)
+            if ap is None:
+                # フォールバック：全足（foot）で直結（短距離向け）
+                feat, dist_m, dur_s = routing.route_foot((prev_lat, prev_lon), (dest_lat, dest_lon))
+                _append_feature(fc, feat)
+                total_dist_m += dist_m or 0.0
+                total_dur_s += dur_s or 0.0
+            else:
+                # car leg: prev -> AP
+                feat1, dist1, dur1 = routing.route_car((prev_lat, prev_lon), (ap.latitude, ap.longitude))
+                _append_feature(fc, feat1)
+                total_dist_m += dist1 or 0.0
+                total_dur_s += dur1 or 0.0
+
+                # foot leg: AP -> dest
+                feat2, dist2, dur2 = routing.route_foot((ap.latitude, ap.longitude), (dest_lat, dest_lon))
+                _append_feature(fc, feat2)
+                total_dist_m += dist2 or 0.0
+                total_dur_s += dur2 or 0.0
+
+        # 次 leg の出発点はこの目的地
+        prev_lat, prev_lon = dest_lat, dest_lon
+
+    # properties に合計値を格納
+    fc["properties"]["distance_m"] = float(total_dist_m)
+    fc["properties"]["duration_s"] = float(total_dur_s)
+
+    return fc, total_dist_m, total_dur_s
 
 def get_congestion_info(*, db: Session, spot_id: int, visit_date: date) -> Dict[str, Any]:
     """
@@ -219,3 +284,14 @@ def _merge_feature_collections(collections: List[Dict[str, Any]]) -> Dict[str, A
         feats = col.get("features") or []
         merged["features"].extend(feats)
     return merged
+
+def _as_point(stop: Stop) -> Tuple[float, float]:
+    """[ADDED] Stop→(lat,lon)。Spot の緯度経度を利用。"""
+    sp: Optional[Spot] = stop.spot
+    return (sp.latitude, sp.longitude) if sp else (None, None)
+
+
+def _append_feature(fc: Dict[str, Any], feat: Dict[str, Any]) -> None:
+    fc.setdefault("type", "FeatureCollection")
+    fc.setdefault("features", [])
+    fc["features"].append(feat)

@@ -5,12 +5,14 @@
 - 滞在時間の概念は持たず、訪問順序（position）のみを管理
 - レースコンディションに強い実装（position の再採番・ギャップ解消）
 """
+from __future__ import annotations
 
-from typing import List, Optional, Any, Dict
-from datetime import date
+from typing import List, Optional, Any, Tuple, Dict
+from datetime import date, datetime
 import pprint
 from sqlalchemy import select, func, update, delete, text, and_
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.exc import IntegrityError
 
 from shared.app.models import Plan, Stop, Spot, Session as UserSession
@@ -287,3 +289,54 @@ def add_spot_to_plan(
     db.add(st)
     db.flush()  # id 採番
     return st
+
+def update_plan_route_with_version(
+    db: OrmSession,
+    *,
+    plan_id: int,
+    base_version: Optional[int],
+    new_geojson: Dict[str, Any],
+    updated_at: datetime,
+) -> Tuple[bool, int]:
+    """
+    [ADDED] 楽観ロック更新：
+      - base_version が None の場合は無条件更新（初回設定など）
+      - base_version が指定されていれば WHERE route_version=base_version で更新し、route_version = route_version + 1
+    戻り値: (updated: bool, new_version: int)
+    """
+    if base_version is None:
+        # 無条件更新（既存データがない/不整合時の初期設定など）
+        stmt = (
+            update(Plan)
+            .where(Plan.id == plan_id)
+            .values(
+                route_geojson=new_geojson,
+                route_updated_at=updated_at,
+                route_version=Plan.route_version + 1,
+            )
+            .returning(Plan.route_version)
+        )
+        res = db.execute(stmt).first()
+        db.commit()
+        # returning は更新後の値なので、そのまま返す
+        return True, int(res[0]) if res and res[0] is not None else 0
+
+    # base_version がある場合は楽観ロック
+    stmt = (
+        update(Plan)
+        .where(and_(Plan.id == plan_id, Plan.route_version == base_version))
+        .values(
+            route_geojson=new_geojson,
+            route_updated_at=updated_at,
+            route_version=Plan.route_version + 1,
+        )
+        .returning(Plan.route_version)
+    )
+    res = db.execute(stmt).first()
+    if res is None:
+        db.rollback()
+        # 競合（古い結果）：更新は反映しない
+        current = db.query(Plan.route_version).filter(Plan.id == plan_id).scalar() or base_version
+        return False, int(current)
+    db.commit()
+    return True, int(res[0])

@@ -20,8 +20,13 @@ import os
 from typing import Any, Dict, List, Tuple, Optional
 
 from sqlalchemy import create_engine, text
+from pydantic import BaseModel, Field, ValidationError
 
-from shared.app.celery_app import celery_app
+# 既存の Celery アプリ（shared 内）を再利用
+try:
+    from shared.app.celery_app import celery_app  # [KEPT]
+except Exception as _:
+    celery_app = None  # 単体テスト時など Celery が未初期化の場合に備える
 
 # =========================================================
 # タスク名の定数（ここを唯一の真実源にする）
@@ -32,6 +37,7 @@ TASK_ORCHESTRATE_CONVERSATION: str = "orchestration.orchestrate_conversation"
 TASK_PREGENERATE_GUIDES: str = "orchestration.pregenerate_guides"
 TASK_START_NAVIGATION: str = "navigation.start"
 TASK_UPDATE_LOCATION: str = "navigation.location_update"
+TASK_NAV_REROUTE: str = "navigation.reroute"
 
 # --- Voice (STT/TTS) ---
 TASK_STT_TRANSCRIBE: str = "voice.stt_transcribe"
@@ -54,6 +60,53 @@ TASK_REFRESH_CONGESTION_MV: str = "worker.app.tasks.refresh_congestion_mv_task"
 DB_URL = os.getenv("DATABASE_URL")
 _engine = create_engine(DB_URL, future=True)
 
+# =========================================================
+# payload スキーマ
+# =========================================================
+class RerouteTaskPayload(BaseModel):
+    """[ADDED] navigation.reroute 用の共通 payload スキーマ（shared に置く）"""
+    session_id: str = Field(..., min_length=1)
+    origin_lat: float
+    origin_lon: float
+    target_stop_id: Optional[int] = None
+    base_route_version: Optional[int] = None
+  
+# =========================================================
+# enqueue 用ユーティリティ
+# =========================================================
+def enqueue_reroute(
+    *,
+    session_id: str,
+    origin_lat: float,
+    origin_lon: float,
+    target_stop_id: Optional[int],
+    base_route_version: Optional[int],
+) -> bool:
+    """
+    [ADDED] API や他コンポーネントから呼ばれる enqueue 用ユーティリティ。
+    - shared 側で payload バリデーションを行い（Pydantic）
+    - Celery ブローカーへ送信する
+    - ブローカー未接続 / Celery 未初期化時は False を返す（呼び出し元でデバウンス済みのため影響最小）
+    """
+    try:
+        payload = RerouteTaskPayload(
+            session_id=session_id,
+            origin_lat=origin_lat,
+            origin_lon=origin_lon,
+            target_stop_id=target_stop_id,
+            base_route_version=base_route_version,
+        ).model_dump()
+    except ValidationError:
+        return False
+
+    if celery_app is None:
+        return False
+
+    try:
+        celery_app.send_task(TASK_NAV_REROUTE, args=[payload])
+        return True
+    except Exception:
+        return False
 
 # =========================================================
 # Maintenance: マテビュー更新タスク
