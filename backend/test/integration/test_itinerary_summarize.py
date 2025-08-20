@@ -20,8 +20,15 @@ def test_itinerary_summarize_hybrid_path(monkeypatch, db_session: Session, osrm_
     spot_a = int(rows[0][0])
     spot_b = int(rows[1][0])
 
+    # --- 目的地の座標を AP 近傍に上書き（竜ヶ原湿原） ---
+    dest_lat, dest_lon = 39.1303513, 140.0660516
+    db_session.execute(
+        text("UPDATE spots SET latitude = :lat, longitude = :lon WHERE id = :sid"),
+        {"lat": dest_lat, "lon": dest_lon, "sid": spot_b},
+    )
+    db_session.commit()
+
     # --- セッションを1件用意（user_id は NULL でOK） ---
-    #   ※sessions.id は文字列（UUID/ULID想定）なので任意の固定文字列でOK
     db_session.execute(
         text(
             """
@@ -41,11 +48,10 @@ def test_itinerary_summarize_hybrid_path(monkeypatch, db_session: Session, osrm_
     from worker.app.services.itinerary import crud_plan
     from worker.app.services.itinerary import itinerary_service
 
-    # create_new_plan の返り値が int（plan_id）か Plan オブジェクトかに対応
     created = crud_plan.create_new_plan(
         db_session,
-        user_id=None,              # models的に NULL 許容
-        session_id="test-e2e",     # 直上で作ったセッションID
+        user_id=None,
+        session_id="test-e2e",
         start_date=date.today(),
     )
     plan_id = getattr(created, "id", created)
@@ -64,5 +70,4 @@ def test_itinerary_summarize_hybrid_path(monkeypatch, db_session: Session, osrm_
     leg = summary["legs"][0]
     assert leg["distance_km"] > 0
     assert leg["duration_min"] > 0
-    # 直行不可を強制しているので AP が使われる前提
     assert leg.get("used_ap") is not None
