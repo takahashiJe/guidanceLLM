@@ -40,6 +40,7 @@ from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import text
+from sqlalchemy.sql.expression import text
 from geoalchemy2 import Geometry 
 
 # ------------------------------------------------------------
@@ -131,7 +132,7 @@ class Session(Base):
     route_geojson = Column(JSONB, nullable=True)
     route_version = Column(Integer, nullable=False, server_default=text("1"))
     route_updated_at = Column(DateTime(timezone=True), nullable=True)
-    
+
     def __repr__(self) -> str:
         return f"<Session id={self.id} user_id={self.user_id} app_status={self.app_status}>"
     
@@ -142,7 +143,7 @@ class Session(Base):
     )
 
     __table_args__ = (
-         Index("ix_plans_user_date", "user_id", "start_date"),
+         Index("ix_plans_user_date", "user_id"),
      )
 
 

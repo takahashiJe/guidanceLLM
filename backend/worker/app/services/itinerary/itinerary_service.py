@@ -14,7 +14,7 @@ from worker.app.services.routing.client import OSRMNoRouteError
 from worker.app.services.routing.access_points_repo import find_nearest_access_point
 from worker.app.services.routing.drive_rules import is_car_direct_accessible
 
-from shared.app.models import Spot
+from shared.app.models import Spot, Stop
 
 # --- Public API for Orchestration Layer ---
 
@@ -156,7 +156,7 @@ CONGESTION_THRESHOLDS = {"low_max": 10, "mid_max": 30}
 MV_NAME = "congestion_by_date_spot"  # マテリアライズドビュー名
 
 def compute_hybrid_polyline_from_origin(
-    db: OrmSession,
+    db: Session,
     *,
     origin: Tuple[float, float],
     stops: List[Stop],

@@ -30,7 +30,7 @@
 # - guide_spots は spot_type='tourist_spot' のみを想定（呼び出し側で絞り込み推奨）
 # - 接近は同じスポットに対して重複通知しないための already_triggered セットを受け取り可能
 # =========================================================
-
+from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 import math
 
@@ -40,9 +40,24 @@ from worker.app.services.navigation.geospatial_utils import (
     get_env_distance_thresholds,
 )
 
+from datetime import datetime, timezone
+
+# [ADDED] 既存 import に無ければ追加してください
+from sqlalchemy.orm import Session as OrmSession, joinedload
+
+# [ADDED] 既存モデルの再利用
+from shared.app.models import Session as DbSession, Plan, Stop
+
+# [ADDED] ハイブリッド経路計算（任意起点）＆ 楽観ロック更新のCRUD
+from worker.app.services.itinerary.itinerary_service import compute_hybrid_polyline_from_origin
+from worker.app.services.itinerary.crud_plan import update_plan_route_with_version
+
 LatLon = Tuple[float, float]
 GeoJSON = Dict[str, Any]
 
+def _utcnow() -> datetime:
+    """[ADDED] tz-aware 現在時刻（楽観ロックの更新時刻に使用）"""
+    return datetime.now(timezone.utc)
 
 def _collect_linestring_coords(geojson: GeoJSON) -> List[List[LatLon]]:
     """
@@ -73,6 +88,23 @@ def _collect_linestring_coords(geojson: GeoJSON) -> List[List[LatLon]]:
     # それ以外は非対応
     return []
 
+def reorder_from_target(stops: List[Stop], target_stop_id: Optional[int]) -> List[Stop]:
+    """
+    [ADDED] target_stop_id を起点に、そこで切って末尾までの残区間を返す。
+    - target_stop_id が None、または見つからない場合は stops 全体を返す。
+    - 空 or None に対しては空配列を返す。
+    """
+    if not stops:
+        return []
+    if target_stop_id is None:
+        return list(stops)
+
+    id_to_idx = {s.id: i for i, s in enumerate(stops)}
+    if target_stop_id not in id_to_idx:
+        return list(stops)
+
+    start = id_to_idx[target_stop_id]
+    return stops[start:]
 
 class NavigationService:
     """逸脱検知・接近検知の軽量ロジックを提供するサービス層。"""
@@ -188,3 +220,87 @@ class NavigationService:
                     already_triggered.add(spot_id)
 
         return fired
+
+def reroute(
+    db: Session,
+    *,
+    session_id: str,
+    origin_lat: float,
+    origin_lon: float,
+    target_stop_id: Optional[int],
+    base_route_version: Optional[int],
+) -> Dict[str, Any]:
+    """
+    [ADDED] 現在地を“仮想先頭”として差し込み、残区間に対してハイブリッド経路を再計算。
+    計算結果は Plan.route_geojson を CAS（route_version の楽観ロック）で更新する。
+
+    Returns:
+        {
+          "updated": bool,           # 反映できたか（CAS成功）
+          "new_version": int|None,   # 更新後の route_version（CAS失敗時は現行版）
+          "reason": str|None,        # 失敗理由（no_active_plan / no_stops / empty_rest 等）
+        }
+    """
+    # 1) セッション → アクティブプラン取得
+    sess: Optional[DbSession] = (
+        db.query(DbSession)
+        .filter(DbSession.id == session_id)
+        .first()
+    )
+    if not sess or not sess.active_plan_id:
+        return {"updated": False, "new_version": None, "reason": "no_active_plan"}
+
+    # stops と spot を同時ロード（順序は relationship 定義の order_by に従う）
+    plan: Optional[Plan] = (
+        db.query(Plan)
+        .options(joinedload(Plan.stops).joinedload(Stop.spot))
+        .filter(Plan.id == sess.active_plan_id)
+        .first()
+    )
+    if plan is None:
+        return {"updated": False, "new_version": None, "reason": "plan_not_found"}
+
+    if not plan.stops:
+        return {"updated": False, "new_version": plan.route_version if hasattr(plan, "route_version") else None, "reason": "no_stops"}
+
+    # 念のため Python 側でも order を安定化（order_index が無い場合は id で代用）
+    try:
+        plan.stops.sort(key=lambda s: getattr(s, "order_index"))
+    except Exception:
+        plan.stops.sort(key=lambda s: getattr(s, "id"))
+
+    # 2) 残区間（target_stop_id 以降）を決める
+    rest: List[Stop] = reorder_from_target(plan.stops, target_stop_id)
+    if not rest:
+        return {"updated": False, "new_version": plan.route_version, "reason": "empty_rest"}
+
+    # 3) 任意起点（現在地）からハイブリッド経路を構築
+    #    - 既存の Step1 実装に依存：車で到達不可のスポットは AP 自動選定して car→AP, AP→dest(foot)
+    route_fc, total_dist_m, total_dur_s = compute_hybrid_polyline_from_origin(
+        db,
+        origin=(origin_lat, origin_lon),
+        stops=rest,
+    )
+
+    # FeatureCollection.properties に合計距離/時間を格納（なければ）
+    props = route_fc.get("properties") or {}
+    if "distance_m" not in props and total_dist_m is not None:
+        props["distance_m"] = float(total_dist_m)
+    if "duration_s" not in props and total_dur_s is not None:
+        props["duration_s"] = float(total_dur_s)
+    route_fc["properties"] = props
+
+    # 4) CAS（楽観ロック）で Plan を更新：WHERE route_version = base_route_version
+    updated, new_version = update_plan_route_with_version(
+        db,
+        plan_id=plan.id,
+        base_version=base_route_version,
+        new_geojson=route_fc,
+        updated_at=_utcnow(),
+    )
+
+    return {
+        "updated": updated,
+        "new_version": new_version,
+        "reason": None if updated else "cas_conflict" if base_route_version is not None else "unknown",
+    }
