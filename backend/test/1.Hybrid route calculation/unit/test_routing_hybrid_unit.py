@@ -7,9 +7,9 @@ pytestmark = pytest.mark.db  # DBは読むだけ（APは使わないがSession�
 
 def test_hybrid_leg_composes_car_and_foot(monkeypatch, db_session: Session):
     # --- arrange: ダミーAPを返す
-    from worker.app.services.routing import access_points_repo
+    from worker.app.services.routing import routing_service
     monkeypatch.setattr(
-        access_points_repo,
+        routing_service,
         "find_nearest_access_point",
         lambda db, lat, lon, max_km=20.0: (999, "DUMMY-AP", "parking", lat, lon),
     )

@@ -10,6 +10,7 @@ from api_gateway.app.api.v1.sessions import router as sessions_router
 from api_gateway.app.api.v1.auth import router as auth_router
 from api_gateway.app.health import router as health_router
 from api_gateway.app.api.v1.navigation import router as navigation_router
+from api_gateway.app.api.v1.plans import router as plans_router
 
 API_PREFIX = "/api/v1"
 
@@ -33,6 +34,7 @@ app.include_router(auth_router,    prefix=API_PREFIX,   tags=["auth"])
 app.include_router(sessions_router, prefix=API_PREFIX, tags=["sessions"])
 app.include_router(chat_router,    prefix=API_PREFIX,   tags=["chat"])
 app.include_router(navigation_router, prefix=API_PREFIX, tags=["navigation"])
+app.include_router(plans_router, prefix=API_PREFIX, tags=["plans"])
 
 @app.get("/")
 def root():

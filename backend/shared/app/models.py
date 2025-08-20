@@ -118,6 +118,8 @@ class Session(Base):
     app_status = Column(String(64), nullable=True)
     # アクティブな計画（存在しない場合は None）
     active_plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
+    last_reroute_at = Column(DateTime(timezone=True), nullable=True)
+    reroute_cooldown_sec = Column(Integer, nullable=False, server_default=text("20"))
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -126,6 +128,10 @@ class Session(Base):
     active_plan = relationship("Plan", foreign_keys=[active_plan_id])
     histories = relationship("ConversationHistory", back_populates="session", cascade="all, delete-orphan")
 
+    route_geojson = Column(JSONB, nullable=True)
+    route_version = Column(Integer, nullable=False, server_default=text("1"))
+    route_updated_at = Column(DateTime(timezone=True), nullable=True)
+    
     def __repr__(self) -> str:
         return f"<Session id={self.id} user_id={self.user_id} app_status={self.app_status}>"
     
@@ -134,6 +140,10 @@ class Session(Base):
         back_populates="session",
         foreign_keys="[Plan.session_id]",
     )
+
+    __table_args__ = (
+         Index("ix_plans_user_date", "user_id", "start_date"),
+     )
 
 
 class ConversationHistory(Base):

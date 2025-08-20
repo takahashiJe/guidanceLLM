@@ -152,7 +152,7 @@ class STTRequest(BaseModel):
 
 
 class STTResult(BaseModel):
-    """STT の出力（文+メタ）"""
+    """STT の出力（文メタ）"""
     text: str
     detected_language: Optional[str] = None
     duration: Optional[float] = None
@@ -197,3 +197,46 @@ class ConversationEmbeddingRead(BaseModel):
 
     class Config:
         from_attributes = True
+
+========== Navigation v2 I/O (Step2) ==========
+# [ADDED] 新しい位置更新 I/O とサマリー応答を追加（既存の NavigationLocationRequest は互換で残す）
+
+class RerouteAction(BaseModel):
+    started: bool = False
+    debounced: bool = False
+
+class TTSItem(BaseModel):
+    stop_id: int
+    voice: str = "ja-JP"
+    mime: str = "audio/wav"
+    audio_base64: str
+
+class NavLocationUpdateIn(BaseModel):
+    session_id: str
+    lat: float
+    lon: float  # NOTE: 既存の NavigationLocationRequest は `lng`。本I/Oでは一般的な `lon` を採用。
+    heading: float | None = None
+    speed_mps: float | None = None
+    ts: datetime | None = None
+
+class NavLocationUpdateOut(BaseModel):
+    events: list[dict]
+    actions: dict
+    plan_version: int | None = None
+
+class PlanSummaryStop(BaseModel):
+    stop_id: int
+    order_index: int
+    spot_id: int
+    name: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+
+class PlanSummaryResponse(BaseModel):
+    plan_id: int
+    plan_version: int
+    route_geojson: dict | None = None
+    route_updated_at: datetime | None = None
+    stops: list[PlanSummaryStop] = []
+    distance_km: float | None = None
+    duration_min: float | None = None
